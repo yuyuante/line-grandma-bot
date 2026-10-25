@@ -1,0 +1,63 @@
+# 對方在 LINE 上的顯示名稱（要和通知、聊天視窗標題上看到的一模一樣）
+friend_name: "對方的顯示名稱"
+
+# true：只打開聊天室、判斷、挑圖，不會真的送出（先用這個模式測試）
+dry_run: true
+
+# 收到照片後，隨機等待幾秒再回（模擬真人）
+delay_range_sec: [60, 480]
+
+# 每天最多回幾次
+daily_limit: 5
+
+# 勿擾時段 [開始小時, 結束小時]，這段時間收到的照片會等到結束後才回
+quiet_hours: [23, 7]
+
+# CLIP 判斷為長輩圖的門檻（0~1，越高越嚴格）
+clip_threshold: 0.6
+
+# 回傳的圖和收到的圖，pHash 差距至少要多少（越大越不像）
+phash_min_distance: 12
+
+# 最近傳過的 N 張不重複使用
+recent_exclude: 30
+
+# 使用者最近 N 秒內有動滑鼠或鍵盤，就延後操作
+user_idle_sec: 60
+
+# 每幾秒檢查一次通知
+poll_interval_sec: 3
+
+# 通知內容含有這些字，就當作對方傳了照片
+photo_keywords: ["傳送了照片", "傳送了圖片", "傳送了相片", "張照片", "sent a photo", "sent photos"]
+
+# 通知來源的 App ID 含有這段文字，就當作是 LINE（用 notify_watch --verbose 可以查實際值）
+line_app_id_contains: "line"
+
+library_dir: data/library
+db_path: data/grandma.db
+templates_dir: templates
+debug_dir: data/debug
+
+ui:
+  main_window_title: "LINE"
+  match_threshold: 0.8
+  # 在搜尋框貼上名稱後，要按哪些鍵打開聊天室
+  open_chat_keys: ["enter"]
+  # 貼上圖片後，要按哪些鍵送出（LINE 有跳出預覽視窗的話，可以改成 ["enter", "enter"]）
+  send_keys: ["enter"]
+  # 聊天室不是獨立視窗時，用哪些鍵關閉
+  close_keys: ["esc"]
+  # 回完圖後把 LINE 主視窗縮小，避免聊天室一直開著
+  minimize_after: true
+  # 聊天視窗上方標題列的高度（px），截圖時會切掉
+  chat_header_px: 70
+  # 聊天區域左邊要切掉的寬度（px）；聊天室開在主視窗右側時，填入左側好友列表的寬度
+  chat_left_px: 0
+  # 輸入框上方要切掉的高度（px）
+  input_margin_px: 20
+
+crawler:
+  keywords: ["早安圖", "早安 長輩圖", "午安圖", "晚安圖", "平安喜樂 圖", "週一早安圖", "祝福 長輩圖", "花 早安 問候圖"]
+  min_side: 300
+  dup_distance: 6

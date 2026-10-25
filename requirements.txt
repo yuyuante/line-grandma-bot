@@ -1,0 +1,11 @@
+open_clip_torch
+torch
+pillow
+imagehash
+numpy
+icrawler
+pyautogui
+opencv-python
+pywin32; sys_platform == "win32"
+pyyaml
+pytest
