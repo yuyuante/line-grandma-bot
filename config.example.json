@@ -1,7 +1,7 @@
 {
   "targets": [
-    "林如婷",
-    "媽媽"
+    "媽媽",
+    "爸爸"
   ],
   "images_dir": "images",
   "trigger_mode": "photo_only",

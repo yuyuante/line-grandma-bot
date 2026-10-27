@@ -88,7 +88,7 @@ def atomic_save_json(file_path, data):
         return False
 
 DEFAULT_CONFIG = {
-    "targets": ["林如婷"],
+    "targets": ["媽媽"],
     "images_dir": "images",
     "trigger_mode": "photo_only",       # "photo_only" (只回照片) 或 "all" (照片與文字皆回)
     "min_delay_seconds": 5,             # 隨機延遲下限 (秒)
@@ -748,9 +748,8 @@ def check_for_incoming_messages(config):
                 if candidate in targets:
                     target_to_reply = candidate
                     log_v(f" -> [目錄指紋匹配] 鎖定快取頻道「{detected_chat_hash[:8]}...」對應好友:「{target_to_reply}」！")
-            elif detected_chat_hash and "游東宇（小白）" in targets and detected_chat_hash != "67fa03ef897657d0c21b02ceec0a55fa9c65ef56":
-                # 非 Peter Yu 頻道且目標有名單，動態綁定為游東宇
-                target_to_reply = "游東宇（小白）"
+            elif detected_chat_hash and len(targets) == 1:
+                target_to_reply = targets[0]
                 chat_dirs_map[detected_chat_hash] = target_to_reply
                 try:
                     with open(chat_map_path, "w", encoding="utf-8") as f:
@@ -797,7 +796,7 @@ def check_for_incoming_messages(config):
 def main():
     parser = argparse.ArgumentParser(description=f"LINE 自動回覆長輩圖工具 v{VERSION}")
     parser.add_argument("-v", "--version", action="version", version=f"LINE Grandma Bot v{VERSION}")
-    parser.add_argument("--test", metavar="NAME", help="手動測試發送一次給指定對象 (例如: --test 林如婷)")
+    parser.add_argument("--test", metavar="NAME", help="手動測試發送一次給指定對象 (例如: --test 媽媽)")
     parser.add_argument("--crawl", type=int, metavar="COUNT", help="立刻上網抓取指定數量的長輩圖儲存備用 (例如: --crawl 20)")
     parser.add_argument("--list-images", action="store_true", help="列出當前讀取到的長輩圖清單")
     parser.add_argument("--clear-history", action="store_true", help="清空已發送長輩圖的歷史記錄")

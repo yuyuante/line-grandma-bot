@@ -82,8 +82,8 @@ copy config.example.json config.json
 {
   "targets": [
     "媽媽",
-    "Peter Yu",
-    "舅舅"
+    "爸爸",
+    "大舅舅"
   ],
   "images_dir": "images",
   "trigger_mode": "photo_only",
@@ -103,7 +103,7 @@ copy config.example.json config.json
 #### ⚙️ 設定參數詳解
 | 參數名稱 | 預設值 | 說明 |
 | :--- | :---: | :--- |
-| `targets` | `["林如婷"]` | 監控回覆的好友名稱陣列（支援多位好友，需與 LINE 上顯示名稱完全相符）。 |
+| `targets` | `["媽媽"]` | 監控回覆的好友名稱陣列（支援多位好友，需與 LINE 上顯示名稱完全相符）。 |
 | `images_dir` | `"images"` | 長輩圖存放資料夾路徑。 |
 | `trigger_mode` | `"photo_only"` | `"photo_only"`（僅對方發照片時回覆長輩圖；對方傳文字不回覆且維持未讀）；`"all"`（文字與照片皆回）。 |
 | `min_delay_seconds` | `5` | 模擬真人延遲回覆**最短秒數**。 |
