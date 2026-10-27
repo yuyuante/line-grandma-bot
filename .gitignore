@@ -1,12 +1,12 @@
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.log
+.env
 .venv/
 .pytest_cache/
 
-# 執行時產生：圖庫、資料庫、記錄、除錯截圖
-data/
-STOP
-
-# 個人截圖與樣本（可能含聊天內容）
-templates/*.png
-tests/samples/
+# 個人設定與即時動態歷史（保護真實聯絡人隱私）
+config.json
+contact_history.json
+chat_dirs.json

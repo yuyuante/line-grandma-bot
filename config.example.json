@@ -1,0 +1,18 @@
+{
+  "targets": [
+    "林如婷",
+    "媽媽"
+  ],
+  "images_dir": "images",
+  "trigger_mode": "photo_only",
+  "min_delay_seconds": 5,
+  "max_delay_seconds": 25,
+  "cooldown_seconds": 30,
+  "history_rounds": 100,
+  "replace_after_send": true,
+  "collect_incoming_images": true,
+  "image_ttl_days": 7,
+  "min_image_pool": 10,
+  "auto_crawl_images": true,
+  "close_window_after_send": true
+}
