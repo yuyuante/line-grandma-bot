@@ -131,7 +131,7 @@ DEFAULT_CONFIG = {
     "images_dir": "images",
     "trigger_mode": "photo_and_sticker", # "photo_and_sticker" (照片與貼圖皆回)、"photo_only" (只回照片) 或 "all" (文字、貼圖與照片皆回)
     "min_delay_seconds": 5,             # 隨機延遲下限 (秒)
-    "max_delay_seconds": 25,            # 隨機延遲上限 (秒)
+    "max_delay_seconds": 900,           # 隨機延遲上限 (秒，最長 15 分鐘)
     "cooldown_seconds": 30,             # 防洗版冷卻時間 (秒)
     "history_rounds": 100,              # 百輪內不重複送同一張圖或對方曾送過的圖
     "replace_after_send": True,
@@ -172,7 +172,7 @@ def load_config():
             sanitized["trigger_mode"] = cfg["trigger_mode"]
         try:
             min_d = max(1, int(cfg.get("min_delay_seconds", 5)))
-            max_d = max(min_d, int(cfg.get("max_delay_seconds", 25)))
+            max_d = max(min_d, int(cfg.get("max_delay_seconds", 900)))
             sanitized["min_delay_seconds"] = min_d
             sanitized["max_delay_seconds"] = max_d
         except Exception:
@@ -1894,7 +1894,7 @@ def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_f
 
     # 隨機延遲時間 (避免固定規律被看穿是機器人)
     min_d = max(1, config.get("min_delay_seconds", 5))
-    max_d = max(min_d, config.get("max_delay_seconds", 25))
+    max_d = max(min_d, config.get("max_delay_seconds", 900))
     delay = random.randint(min_d, max_d)
     log_v(f" -> 為了模擬真人自然反應，本次隨機等待 {delay} 秒後發送...")
     time.sleep(delay)
@@ -2780,7 +2780,7 @@ def main():
     t_mode = config.get('trigger_mode', 'photo_and_sticker')
     mode_desc = "照片與貼圖皆回" if t_mode == "photo_and_sticker" else ("只回照片" if t_mode == "photo_only" else "文字照片貼圖皆回")
     print(f"觸發模式 (trigger_mode)  : {t_mode} ({mode_desc})")
-    print(f"隨機延遲範圍 (delay)     : {config.get('min_delay_seconds', 5)} ~ {config.get('max_delay_seconds', 25)} 秒")
+    print(f"隨機延遲範圍 (delay)     : {config.get('min_delay_seconds', 5)} ~ {config.get('max_delay_seconds', 900)} 秒")
     print(f"每位聯絡人記憶輪數       : {config.get('history_rounds', 100)} 輪 (不重複發送或回送對方發過的圖)")
     print(f"自動收納對方圖片 (借花獻佛): {config.get('collect_incoming_images', True)}")
     print(f"發送後自動汰換新圖       : {config.get('replace_after_send', True)}")

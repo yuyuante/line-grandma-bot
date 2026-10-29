@@ -6,7 +6,7 @@
   "images_dir": "images",
   "trigger_mode": "photo_and_sticker",
   "min_delay_seconds": 5,
-  "max_delay_seconds": 25,
+  "max_delay_seconds": 900,
   "cooldown_seconds": 30,
   "history_rounds": 100,
   "replace_after_send": true,

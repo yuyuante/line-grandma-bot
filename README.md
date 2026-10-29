@@ -99,7 +99,7 @@ copy config.example.json config.json
   "images_dir": "images",
   "trigger_mode": "photo_and_sticker",
   "min_delay_seconds": 5,
-  "max_delay_seconds": 25,
+  "max_delay_seconds": 900,
   "cooldown_seconds": 30,
   "history_rounds": 100,
   "replace_after_send": true,
@@ -118,7 +118,7 @@ copy config.example.json config.json
 | `images_dir` | `"images"` | 長輩圖存放資料夾路徑。 |
 | `trigger_mode` | `"photo_and_sticker"` | 回覆觸發模式：`"photo_and_sticker"`（預設，對方發照片或貼圖時回覆長輩圖；對方傳純文字時保持沉默維持未讀）；`"photo_only"`（僅限對方傳照片時回覆）；`"all"`（文字、貼圖與照片皆回覆）。 |
 | `min_delay_seconds` | `5` | 模擬真人延遲回覆**最短秒數**。 |
-| `max_delay_seconds` | `25` | 模擬真人延遲回覆**最長秒數**（每次會在此區間內隨機擲出秒數）。 |
+| `max_delay_seconds` | `900` | 模擬真人延遲回覆**最長秒數**（預設 900 秒 = 15 分鐘，每次會在此區間內隨機擲出秒數）。 |
 | `cooldown_seconds` | `30` | 防洗版全域冷卻安全間隔（秒）。 |
 | `history_rounds` | `100` | 每位好友獨立記憶輪數（100 輪內不發送相同圖片，也不把對方曾傳給你的圖片回傳）。 |
 | `collect_incoming_images` | `true` | 是否透過原生 OCR 自動辨識並收納對方傳來的長輩圖進入圖庫（借花獻佛）。 |
