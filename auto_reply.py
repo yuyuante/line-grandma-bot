@@ -2434,6 +2434,9 @@ def check_for_incoming_messages(config):
                 target_to_reply = chosen_target
                 new_image_found = chosen_candidate
                 log_v(f"\n[即時偵測] 鎖定快取頻道「{extract_chat_hash_from_path(new_image_found)[:8]}...」對應好友「{target_to_reply}」收到新貼圖/照片！(檔案: {os.path.basename(new_image_found)})")
+            else:
+                remain = int(cooldown - (current_time - last_reply_times.get(chosen_target, 0)))
+                log_v(f"[冷卻中]「{chosen_target}」距上次回覆未滿 {int(cooldown)} 秒 (剩餘 {remain} 秒)，本次新圖不回覆。")
 
     # 3. 執行發送前的斷路器 (Circuit Breaker) 與發送
     if target_to_reply:
