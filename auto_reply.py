@@ -1003,7 +1003,7 @@ def parse_unread_count(raw_val):
     統一解析 LINE 視窗標題未讀訊息數：
     - 若為 '99+' 等溢位標記，統一映射為邊緣數值 100
     - 一般數字字串轉為對應整數
-    - 確保全系統邊緣觸發與基準線更新 100% 嚴格一致，徹底杜絕 99+ 冷卻後死循環重複發送
+    - 確保全系統邊緣觸發與基準線更新 100% 嚴格一致，徹底杜絕 99+ 冷卻後無窮迴圈重複發送
     """
     if not raw_val:
         return 0
@@ -1604,7 +1604,7 @@ def check_circuit_breaker(target, max_replies=2, window_seconds=300, lockout_sec
         if len(valid_timestamps) >= max_replies:
             CIRCUIT_BREAKER_BLOCKED_UNTIL[target] = now + lockout_seconds
             save_circuit_breaker_state()
-            log_v(f"[致命告警 / 斷路器鎖定]「{target}」在 5 分鐘內連續回覆達 {max_replies} 次上限！已啟動斷路器，暫停回覆該對象 30 分鐘以徹底杜絕死循環！")
+            log_v(f"[致命告警 / 斷路器鎖定]「{target}」在 5 分鐘內連續回覆達 {max_replies} 次上限！已啟動斷路器，暫停回覆該對象 30 分鐘以徹底杜絕無窮迴圈！")
             return False
     return True
 
@@ -2062,7 +2062,7 @@ def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_f
                         pyautogui.press('backspace')
                 except Exception:
                     pass
-            # 回傳 NOT_SENT 讓外層計入重試次數並執行指數退避，徹底杜絕無上限高頻死循環重試
+            # 回傳 NOT_SENT 讓外層計入重試次數並執行指數退避，徹底杜絕無上限高頻無窮迴圈重試
             return "NOT_SENT"
         else:
             # Enter 已送出：若尚未記帳，補全發送記帳與百輪記錄，杜絕二次重複記帳與重複發送
@@ -2437,7 +2437,7 @@ def check_for_incoming_messages(config):
         # 斷路器檢查：5 分鐘內最多 2 次，超標則啟動 30 分鐘防禦退避鎖定
         if not check_circuit_breaker(target_to_reply, max_replies=2, window_seconds=300, lockout_seconds=1800):
             last_reply_times[target_to_reply] = current_time + 300
-            # 推進該目標之未讀基準線，防止退避期間或鎖定解除後對同一筆未讀訊息死循環重試
+            # 推進該目標之未讀基準線，防止退避期間或鎖定解除後對同一筆未讀訊息無窮迴圈重試
             matched_cb = find_target_chat_window(target_to_reply)
             if matched_cb:
                 m_cb = re.search(r"[\(\uFF08](\d+\+?)[\)\uFF09]\s*$", matched_cb[0][1])
@@ -2478,7 +2478,7 @@ def check_for_incoming_messages(config):
                 PENDING_RETRY_MEDIA[target_to_reply] = new_image_found
 
             if current_fails >= 3:
-                log_v(f"⚠️ [重試達上限]「{target_to_reply}」連續發送失敗達 3 次，更新基準線以防死循環。")
+                log_v(f"⚠️ [重試達上限]「{target_to_reply}」連續發送失敗達 3 次，更新基準線以防無窮迴圈。")
                 PENDING_RETRY_MEDIA.pop(target_to_reply, None)
                 if new_image_found:
                     try:
