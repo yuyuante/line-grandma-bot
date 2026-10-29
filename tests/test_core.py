@@ -285,7 +285,7 @@ class TestLineGrandmaBotCore(unittest.TestCase):
         auto_reply.LAST_PROCESSED_UNREAD["ActiveUser"] = 100
         auto_reply.save_circuit_breaker_state()
 
-        # 模擬程序重新啟動，從磁碟重新載入
+        # 模擬程式重新啟動，從磁碟重新載入
         loaded = auto_reply.load_circuit_breaker_state()
         self.assertIn("LockedUser", loaded.get("blocked_until", {}))
         self.assertAlmostEqual(loaded["blocked_until"]["LockedUser"], now + 600, delta=2)
@@ -1293,7 +1293,7 @@ class TestLineGrandmaBotCore(unittest.TestCase):
         self.assertAlmostEqual(last_seen_cache_mtime, cand_unbound_m - 0.001, places=3)
 
     def test_sliding_window_unknown_channel_dedup_and_pop_on_bound(self):
-        # 測試中度 #1 滑動視窗不重複刷新時間戳，且綁定成功後即刻移出未知清單
+        # 測試中度 #1 滑動視窗不重複更新時間戳，且綁定成功後即刻移出未知清單
         auto_reply._RECENT_UNKNOWN_CHANNELS.clear()
         base_t = 1000.0
 
@@ -1303,7 +1303,7 @@ class TestLineGrandmaBotCore(unittest.TestCase):
             auto_reply._RECENT_UNKNOWN_CHANNELS[ch1] = base_t
         self.assertEqual(auto_reply._RECENT_UNKNOWN_CHANNELS[ch1], base_t)
 
-        # 輪詢 2 (t=base_t+2.0): 不重複刷新初次記錄時間戳
+        # 輪詢 2 (t=base_t+2.0): 不重複更新初次記錄時間戳
         if ch1 not in auto_reply._RECENT_UNKNOWN_CHANNELS:
             auto_reply._RECENT_UNKNOWN_CHANNELS[ch1] = base_t + 2.0
         self.assertEqual(auto_reply._RECENT_UNKNOWN_CHANNELS[ch1], base_t)
@@ -1990,7 +1990,7 @@ class TestLineGrandmaBotCore(unittest.TestCase):
             auto_reply._TARGET_WINDOW_STATE.pop("TargetOldImg", None)
 
     def test_check_for_incoming_messages_auto_bind_pipeline(self):
-        # 測試整合管線：調用 check_for_incoming_messages 完成真實快取掃描與自動綁定
+        # 測試整合管線：呼叫 check_for_incoming_messages 完成真實快取掃描與自動綁定
         test_cache = os.path.join(self.temp_dir.name, "pipeline_cache")
         fake_hash = "666603ef1234567890abcdef1234567890abcdef"
         chat_mo_dir = os.path.join(test_cache, fake_hash, "m")
@@ -2479,7 +2479,7 @@ class TestLineGrandmaBotCore(unittest.TestCase):
             self.assertIn(fake_hash, disk_content["_provisional"])
             self.assertEqual(disk_content["_provisional"][fake_hash]["target"], "TargetPersist")
 
-            # 模擬進程重啟：清空記憶體中的狀態，透過 load_provisional_bindings 重新載入
+            # 模擬行程重啟：清空記憶體中的狀態，透過 load_provisional_bindings 重新載入
             auto_reply._PROVISIONAL_BINDINGS.clear()
             reloaded_prov = auto_reply.load_provisional_bindings()
             self.assertIn(fake_hash, reloaded_prov)

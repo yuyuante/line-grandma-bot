@@ -55,7 +55,7 @@ def ensure_single_instance():
         sys.exit(1)
     ERROR_ALREADY_EXISTS = 183
     if last_err == ERROR_ALREADY_EXISTS:
-        log_v("❌ [致命衝突] 偵測到已有另一個 auto_reply 程式在運行中！為防重複發送與繞過斷路器，本實例立即安全退出。")
+        log_v("❌ [致命衝突] 偵測到已有另一個 auto_reply 程式在執行中！為防重複發送與繞過斷路器，本實例立即安全退出。")
         sys.exit(1)
     _app_mutex_handle = handle
 
@@ -113,7 +113,7 @@ def atomic_save_json(file_path, data):
                 os.replace(temp_name, file_path)
                 return True
             except OSError:
-                # Windows 上其他進程讀取目標檔時 os.replace 會暫時拋出 PermissionError (WinError 5/32)
+                # Windows 上其他行程讀取目標檔時 os.replace 會暫時拋出 PermissionError (WinError 5/32)
                 if attempt == 2:
                     raise
                 time.sleep(0.1 * (attempt + 1))
@@ -841,7 +841,7 @@ IGNORED_CACHE_FILES = {}       # {file_path: (timestamp, mtime, size)} 本機發
 PROCESSED_CACHE_FILES = set()  # {(file_path, mtime)} 同 mtime 候選多檔案安全追蹤集合
 SEND_FAIL_COUNTS = {}          # {target_name: fail_count} 暫時發送失敗次數計數器
 PENDING_RETRY_MEDIA = {}       # {target_name: file_path} 發送暫時失敗待重試之媒體
-_state_lock = threading.RLock() # 使用可重入鎖 (RLock) 徹底避免重入死鎖
+_state_lock = threading.RLock() # 使用可重入鎖 (RLock) 徹底避免重入死結
 
 CIRCUIT_BREAKER_PATH = os.path.join(SCRIPT_DIR, "circuit_breaker.json")
 
@@ -1102,7 +1102,7 @@ def save_chat_dirs_map(chat_map):
 
 @contextlib.contextmanager
 def locked_chat_dirs(timeout_ms=5000):
-    """跨進程具名 Mutex 上下文管理器，完整包覆 load -> mutate -> save 整個讀寫循環，支援暫定綁定持久化 (Fail-Closed)"""
+    """跨行程具名 Mutex 上下文管理器，完整包覆 load -> mutate -> save 整個讀寫循環，支援暫定綁定持久化 (Fail-Closed)"""
     h = acquire_chat_dirs_mutex(timeout_ms)
     if not h:
         raise TimeoutError("無法取得 chat_dirs 互斥鎖 (等待逾時或鎖建立失敗)")
@@ -1431,7 +1431,7 @@ def try_auto_bind_channel(ch, cand_path, cand_m, targets, chat_dirs_map, competi
     has_media = state.get("has_media")
     is_incoming = state.get("is_incoming")
     if not has_media:
-        # 指紋已在上方經 Fail-Closed 核驗無誤，此處安全調用 UIA 重測
+        # 指紋已在上方經 Fail-Closed 核驗無誤，此處安全呼叫 UIA 重測
         has_media, is_incoming = get_chat_latest_media_info(hwnd)
         # 關閉 TOCTOU 空隙：重測後再次比對指紋，確保 UIA 讀取期間無新訊息插入
         post_fp = get_chat_window_fingerprint(hwnd)
@@ -1617,7 +1617,7 @@ def record_reply_sent(target):
         timestamps.append(now)
         valid_timestamps = [t for t in timestamps if now - t < 300]
         REPLY_HISTORY_TIMESTAMPS[target] = valid_timestamps
-        # 若發送成功後在 5 分鐘內累計已達 2 次，立刻預先設置斷路器鎖定 30 分鐘
+        # 若發送成功後在 5 分鐘內累計已達 2 次，立刻預先設定斷路器鎖定 30 分鐘
         if len(valid_timestamps) >= 2:
             CIRCUIT_BREAKER_BLOCKED_UNTIL[target] = now + 1800
             log_v(f"[斷路器就地鎖定]「{target}」在 5 分鐘內已達 2 次上限，立即啟動 30 分鐘冷卻保護！")
@@ -1883,7 +1883,7 @@ def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_f
     # 依據百輪記憶挑選一張不重複的長輩圖
     selected_image = pick_unique_image(images, target_name, config)
     if not selected_image:
-        log_v(f"⚠️ [百輪保護安全攔截] 無可用之未重複合規長輩圖，安全終止回覆程序。")
+        log_v(f"⚠️ [百輪保護安全攔截] 無可用之未重複合規長輩圖，安全終止回覆流程。")
         return "NOT_SENT"
     log_v(f"\n偵測到「{target_name}」發來訊息！")
     log_v(f" -> 隨機挑選一張合格且百輪不重複長輩圖: {os.path.basename(selected_image)}")
@@ -2238,7 +2238,7 @@ def check_for_incoming_messages(config):
                 chat_dirs_map = load_chat_dirs_map()
 
                 # 維護 15 秒滑動視窗未知頻道活動記錄 (中度 #1 跨輪詢多頻道併發隔離防禦)
-                # 僅在新未知頻道初次出現時記錄時間戳，不於每輪重複刷新；已綁定頻道即刻移出
+                # 僅在新未知頻道初次出現時記錄時間戳，不於每輪重複更新；已綁定頻道即刻移出
                 for _, p in candidate_files:
                     h = extract_chat_hash_from_path(p)
                     if h:
@@ -2604,7 +2604,7 @@ def main():
         log_v("=== 正在掃描桌面上的 LINE 視窗 ===")
         wins = get_all_line_windows()
         if not wins:
-            log_v("目前桌面上沒有偵測到任何 LINE 視窗，請確認 LINE 是否在運行。")
+            log_v("目前桌面上沒有偵測到任何 LINE 視窗，請確認 LINE 是否正在執行。")
         for h, t, c, v in wins:
             print(f"HWND: {h} | Title: {t!r} | Class: {c!r} | Visible: {v}")
         return
@@ -2616,12 +2616,12 @@ def main():
 
         win_candidates = find_target_chat_window(target)
         if not win_candidates:
-            log_v(f"❌ [校準中止] 尚未偵測到「{target}」的獨立對話視窗！請先在 LINE 好友名單連點兩下打開「{target}」的獨立視窗後再執行校準。")
+            log_v(f"❌ [校準中止] 尚未偵測到「{target}」的獨立對話視窗！請先在 LINE 好友名單連點兩下開啟「{target}」的獨立視窗後再執行校準。")
             return
 
         active_c = get_active_line_cache_dir()
         if not active_c:
-            log_v("❌ [錯誤] 找不到 LINE 本機快取目錄，請確認 LINE 電腦版是否正在運行。")
+            log_v("❌ [錯誤] 找不到 LINE 本機快取目錄，請確認 LINE 電腦版是否正在執行。")
             return
 
         before_f = get_all_cache_files(active_c)

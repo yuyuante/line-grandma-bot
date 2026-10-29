@@ -45,7 +45,7 @@
 
 ```text
 line-grandma-bot/
-├── auto_reply.py        # 核心自動回覆守護進程 (v2.3.0)
+├── auto_reply.py        # 核心自動回覆常駐程式 (v2.3.0)
 ├── crawl_images.py      # 台塑貼圖酷長輩圖抓取與過期清理模組
 ├── config.example.json  # 設定檔範本
 ├── config.json          # 個人實際設定檔 (已列入 .gitignore 保護隱私)
@@ -72,12 +72,12 @@ line-grandma-bot/
 
 ### 2. 標準操作流程 (SOP)
 為確保自動化運作 100% 穩定且絕不干擾其他對話，建議採用以下極簡標準流程：
-1. **開啟目標獨立聊天室**：在 LINE 電腦版的好友清單中，對 `config.json` 內設定的目標好友（例如「媽媽」）連點兩下打開**獨立聊天室視窗**（直接最小化至工作列即可）。
+1. **開啟目標獨立聊天室**：在 LINE 電腦版的好友清單中，對 `config.json` 內設定的目標好友（例如「媽媽」）連點兩下開啟**獨立聊天室視窗**（直接最小化至工作列即可）。
 2. **零設定全自動守護 (Zero-Config)**：直接啟動 `run_auto_reply.bat`。程式具備動態頻道自動學習技術，當目標好友傳來長輩圖或貼圖時，背景全自動完成頻道綁定與回覆，**完全無需任何手動校準指令**。
 3. **安全回覆與自動最小化**：程式喚醒視窗、驗證視窗身分與訊息方向後貼圖送出，並自動重新最小化維持未讀狀態，完全不干擾您在 LINE 主視窗與其他親友交談。
 
 ### 3. 安裝相依套件
-在專案根目錄打開 PowerShell，執行：
+在專案根目錄開啟 PowerShell，執行：
 ```powershell
 pip install -r requirements.txt
 ```
@@ -87,7 +87,7 @@ pip install -r requirements.txt
 ```powershell
 copy config.example.json config.json
 ```
-使用任何文字編輯器打開 `config.json`，在 `targets` 陣列填入欲監控回覆的好友 LINE 顯示名稱：
+使用任何文字編輯器開啟 `config.json`，在 `targets` 陣列填入欲監控回覆的好友 LINE 顯示名稱：
 ```json
 {
   "targets": [
@@ -180,7 +180,7 @@ python auto_reply.py --clear-history
 - **多層深層防自循環架構 (Multi-Tier Self-Reply Defense)**：
   - **實體快取三元組差集快照**：發送前後自動對快取檔案進行路徑、修改時間（mtime）與檔案大小（size）全量差集快照，本機發送產生的新檔案或就地更新均自動記入黑名單。
   - **Windows DWM 像素物理方向校驗 (Fail-Closed)**：發送前核驗目標聊天室為前景視窗，透過 DWM 精準擴展客戶區邊界與動態 DPI 感知取樣，雙欄模式嚴密隔離側欄；最底部訊息若位於右側或無法判斷時一律安全攔截中止發送。
-  - **跨重啟雙重持久化斷路器 (Circuit Breaker)**：同一對象 5 分鐘內最多回覆 2 次，超標啟動 30 分鐘退避鎖定；鎖定期、時間戳與 5 秒發送防抖保護全量持久化至 `circuit_breaker.json`，重啟守護進程不失效。
+  - **跨重啟雙重持久化斷路器 (Circuit Breaker)**：同一對象 5 分鐘內最多回覆 2 次，超標啟動 30 分鐘退避鎖定；鎖定期、時間戳與 5 秒發送防抖保護全量持久化至 `circuit_breaker.json`，重啟常駐程式不失效。
   - **未讀視窗交叉驗證之頻道關聯**：底層媒體快取雜湊不盲目自動綁定單一好友，僅在該好友視窗出現實體未讀訊息時才安全關聯，徹底防止群組貼圖誤判。
   - **全方位多語系發送排除**：嚴格排除「您傳送了」、「You sent」、「写真を送信しました」等本機發送通知與文字。
 - **全面支援 LINE 貼圖 (Sticker)**：
@@ -197,7 +197,7 @@ python auto_reply.py --clear-history
 - **Windows 原生繁中 OCR**：內建整合 `Windows.Media.Ocr`，自動核對問候關鍵字，自動過濾生活照、發票收據等非長輩圖。
 - **動態名單熱更新 (Hot Reload)**：背景常駐期間修改 `config.json` 好友名單秒級生效，無需重啟程式。
 
-#### 健全度與效能優化
+#### 健全度與效能最佳化
 - **Per-Monitor V2 DPI 感知**：支援高解析度螢幕縮放（125%、150% 等），避免滑鼠座標偏移。
 - **檔案原子寫入 (Atomic Write)**：使用暫存檔與 `os.replace` 儲存 JSON，杜絕斷電或非預期中斷造成資料損壞。
 - **全域日誌與版本號標記**：所有控制台輸出與日誌均自動附帶時間戳記與版本號標籤 `[v2.2.0]`。
@@ -241,7 +241,7 @@ python auto_reply.py --clear-history
 1. **意見分級規範**：審查工具（Reviewer）產出的審查意見必須嚴格分為三級：
    - **🔴 高度嚴重意見 (High / P1)**：邏輯死循環、誤傳至非目標對象、程式崩潰、未釋放資源、或核心安全漏洞。
    - **🟡 中度嚴重意見 (Medium / P2)**：邊界條件不嚴謹、可能遺漏事件、狀態持久化不同步、文件與實作矛盾。
-   - **🟢 低度嚴重意見 (Low / P3)**：代碼風格優化、註解潤飾、微小相容性建議、未追蹤檔案整理等。
+   - **🟢 低度嚴重意見 (Low / P3)**：程式碼風格最佳化、註解潤飾、微小相容性建議、未追蹤檔案整理等。
 2. **高／中度嚴重意見強制循環修復 (Mandatory Re-Review Loop)**：
    - 被審查者（Developer）**必須強制全數修復所有高度（High）與中度（Medium）嚴重意見**。
    - 修復完成後，**必須再次送回原審查 AI 工具進行第二輪審查**。
@@ -251,9 +251,9 @@ python auto_reply.py --clear-history
    - 僅修復低度意見後，**不必再次送審**。
 
 #### 執行標準作業程序：
-1. **補丁匯出**：代碼撰寫完成並通過單元測試 (`python -m unittest discover -s tests`) 後，匯出最新 `git diff` 補丁。
+1. **補丁匯出**：程式碼撰寫完成並通過單元測試 (`python -m unittest discover -s tests`) 後，匯出最新 `git diff` 補丁。
 2. **三方獨立送審**：非本體的其餘三款 AI 工具各自啟動獨立工作階段進行審查：
-   - `claude.cmd -p -` (Claude Code 深度代碼審查)
+   - `claude.cmd -p -` (Claude Code 深度程式碼審查)
    - `copilot.cmd -p ...` (GitHub Copilot 架構安全審查)
    - `codex.cmd exec` (OpenAI Codex 推理審查)
 3. **報告存檔與閉環迭代**：各工具輸出之獨立審查報告存檔至本機，確認達成「零高、中度嚴重意見」之驗證標準。
