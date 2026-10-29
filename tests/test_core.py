@@ -936,7 +936,7 @@ class TestLineGrandmaBotCore(unittest.TestCase):
             auto_reply._TARGET_WINDOW_STATE["TargetA"] = {"fp": "8_abc123", "changed_at": now - 0.5, "consumed": False}
 
             m_map = {}
-            # 傳入 competing_unknown_count = 2 (表示當前批次有 2 個不同未知頻道)
+            # 傳入 competing_unknown_count = 2 (表示目前批次有 2 個不同未知頻道)
             bound = auto_reply.try_auto_bind_channel(fake_hash, fake_path, now, ["TargetA"], m_map, competing_unknown_count=2)
             self.assertIsNone(bound)
             self.assertNotIn(fake_hash, m_map)
@@ -1683,7 +1683,7 @@ class TestLineGrandmaBotCore(unittest.TestCase):
         try:
             auto_reply.find_target_chat_window = lambda t: [(9948, t, "ChatWnd", True)] if t == "TargetDrift" else []
             auto_reply.verify_is_not_group_window_uia = lambda h: True
-            # 當前視窗指紋已漂移為新指紋
+            # 目前視窗指紋已漂移為新指紋
             auto_reply.get_chat_window_fingerprint = lambda h: "20_new_interrupted_fp"
             auto_reply.get_chat_latest_media_info = lambda h: (True, True)
 
@@ -1885,7 +1885,7 @@ class TestLineGrandmaBotCore(unittest.TestCase):
 
     def test_equal_counts_different_hashes_scroll_resets_time(self):
         # 測試 🟡 中度防禦：項目數飽和 (count 相同) 但次末項名稱不同 (非縮圖安定化，實為滾動或新訊息替換舊訊息) 時，
-        # 嚴格重置時間為當前時間，杜絕保留過期之文字時間
+        # 嚴格重置時間為目前時間，杜絕保留過期之文字時間
         fake_hash = "454503ef1234567890abcdef1234567890abcdef"
         fake_path = os.path.join(self.temp_dir.name, "mo", fake_hash, "test.eimg")
         t0 = time.time()
@@ -1973,7 +1973,7 @@ class TestLineGrandmaBotCore(unittest.TestCase):
             auto_reply.update_target_window_fingerprints(["TargetOldImg"])
 
             st = auto_reply._TARGET_WINDOW_STATE["TargetOldImg"]
-            # 🟡 核心驗證：保持 consumed=True，changed_at 依然為 30 秒前，未被洗成當前時間！
+            # 🟡 核心驗證：保持 consumed=True，changed_at 依然為 30 秒前，未被洗成目前時間！
             self.assertTrue(st["consumed"])
             self.assertEqual(st["changed_at"], now - 30.0)
             self.assertEqual(st["fp"], "10_fp_new")

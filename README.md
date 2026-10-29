@@ -139,7 +139,7 @@ copy config.example.json config.json
 # 1. 啟動常駐自動回覆監聽 (圖庫不足會自動連網補圖)
 python auto_reply.py
 
-# 2. 查看當前程式版本號
+# 2. 查看目前程式版本號
 python auto_reply.py --version
 
 # 3. 馬上連網抓取 20 張正統長輩圖進圖庫備用
@@ -154,7 +154,7 @@ python auto_reply.py --calibrate "媽媽"
 # 6. 查看現有圖庫清單與每張圖在各位好友百輪記憶庫中的使用狀態
 python auto_reply.py --list-images
 
-# 7. 掃描當前桌面上所有 LINE 視窗控制代碼與標題
+# 7. 掃描目前桌面上所有 LINE 視窗控制代碼與標題
 python auto_reply.py --scan-windows
 
 # 8. 清空所有聯絡人的百輪歷史記憶
@@ -205,7 +205,7 @@ python auto_reply.py --clear-history
 
 #### 隱私與安全防護
 - **個人隱私防護**：將 `config.json`、`contact_history.json`、`chat_dirs.json` 列入 `.gitignore`，徹底杜絕真實好友名單上傳公開儲存庫。
-- **文件去識別化**：所有公開說明文件、程式範例與日誌輸出均全面去除真實個人姓名，一律採用「媽媽」、「爸爸」、「大舅舅」等通用尊稱佔位符。
+- **說明文件去識別化**：所有公開說明文件、程式範例與日誌輸出均全面去除真實個人姓名，一律採用「媽媽」、「爸爸」、「大舅舅」等通用尊稱佔位符。
 
 ---
 
@@ -251,7 +251,7 @@ python auto_reply.py --clear-history
    - 僅修復低度意見後，**不必再次送審**。
 
 #### 執行標準作業程序：
-1. **補丁匯出**：程式碼撰寫完成並通過單元測試 (`python -m unittest discover -s tests`) 後，匯出最新 `git diff` 補丁。
+1. **修補檔匯出**：程式碼撰寫完成並通過單元測試 (`python -m unittest discover -s tests`) 後，匯出最新 `git diff` 修補檔。
 2. **三方獨立送審**：非本體的其餘三款 AI 工具各自啟動獨立工作階段進行審查：
    - `claude.cmd -p -` (Claude Code 深度程式碼審查)
    - `copilot.cmd -p ...` (GitHub Copilot 架構安全審查)

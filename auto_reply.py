@@ -112,7 +112,7 @@ def atomic_save_json(file_path, data):
             try:
                 os.replace(temp_name, file_path)
                 return True
-            except OSError:
+            except PermissionError:
                 # Windows 上其他行程讀取目標檔時 os.replace 會暫時拋出 PermissionError (WinError 5/32)
                 if attempt == 2:
                     raise
@@ -651,7 +651,7 @@ def find_target_chat_window(target_name):
         # 嚴格排除 LINE 主視窗本身 (主視窗標題通常為 'LINE' 或其 HWND 與 main_hwnd 相符)
         if hwnd == main_hwnd or title.strip() == 'LINE':
             continue
-        # 若視窗當前處於前景焦點卻仍帶有括號，100% 為群組成員數視窗 (1:1 視窗在前景時未讀數已自動清除而無括號)，嚴格排除
+        # 若視窗目前處於前景焦點卻仍帶有括號，100% 為群組成員數視窗 (1:1 視窗在前景時未讀數已自動清除而無括號)，嚴格排除
         if hwnd == win32gui.GetForegroundWindow() and re.search(r'[\(\uFF08]\d+\+?[\)\uFF09]', title):
             continue
         # 嚴格排除多括號群組視窗 (如 '群組名稱 (3) (1)')
@@ -731,7 +731,7 @@ def get_window_true_rect(hwnd):
     return win32gui.GetWindowRect(hwnd)
 
 def get_system_dpi_scale(hwnd=None):
-    """計算視窗或系統當前 DPI 縮放係數 (基準 96 DPI = 1.0)"""
+    """計算視窗或系統目前 DPI 縮放係數 (基準 96 DPI = 1.0)"""
     try:
         if hwnd and win32gui.IsWindow(hwnd):
             dpi = ctypes.windll.user32.GetDpiForWindow(hwnd)
@@ -1126,10 +1126,10 @@ def locked_chat_dirs(timeout_ms=5000):
     finally:
         release_chat_dirs_mutex(h)
 
-AUTOBIND_TIMEOUT = 15.0       # 自動學習綁定超時統一常數 (涵蓋滑動視窗併發隔離、暫緩重試與延遲渲染重測，15.0s)
+AUTOBIND_TIMEOUT = 15.0       # 自動學習綁定超時統一常數 (涵蓋滑動視窗並行隔離、暫緩重試與延遲渲染重測，15.0s)
 AUTOBIND_TIME_WINDOW = 6.0    # 快取檔案寫入時間 (cand_m) 與視窗訊息異動時間之容許時間差範圍 (±6.0s)
 _TARGET_WINDOW_STATE = {}     # {target_name: {"fp": str, "changed_at": float, "consumed": bool, "has_media": bool, "is_incoming": bool}}
-_RECENT_UNKNOWN_CHANNELS = {} # {chat_hash: timestamp} 用於 15 秒滑動視窗多頻道併發隔離防禦
+_RECENT_UNKNOWN_CHANNELS = {} # {chat_hash: timestamp} 用於 15 秒滑動視窗多頻道並行隔離防禦
 _PROVISIONAL_BINDINGS = load_provisional_bindings() # 跨重啟持久化暫定綁定狀態
 
 def _fetch_chat_window_items_info(hwnd):
@@ -1296,7 +1296,7 @@ def update_target_window_fingerprints(targets):
                         continue
 
                     # 🟡 核心防禦 2：精確判定同訊息縮圖安定化：
-                    # 僅在「先前無媒體且未消費、當前解析出媒體、且最末項名稱同為同一則訊息」時才保留 first_changed_at；
+                    # 僅在「先前無媒體且未消費、目前解析出媒體、且最末項名稱同為同一則訊息」時才保留 first_changed_at；
                     # 若最末項名稱改變或項目數增加 (如文字後傳圖)，一律嚴格視為新訊息抵達重置時間！
                     is_thumbnail_settle = (
                         not state.get("consumed")
@@ -1346,7 +1346,7 @@ def try_auto_bind_channel(ch, cand_path, cand_m, targets, chat_dirs_map, competi
     對未知快取頻道進行高置信度自動學習綁定：
     1. 必須有且僅有 1 位目標好友視窗在線
     2. 該視窗必須通過 UIA 1:1 核驗
-    3. 近 15 秒滑動視窗不可有 2 個以上不同之未知頻道同時活動 (中度 #1 併發滑動視窗防禦)
+    3. 近 15 秒滑動視窗不可有 2 個以上不同之未知頻道同時活動 (中度 #1 並行滑動視窗防禦)
     4. 該視窗近期必須剛發生未消費之內容指紋異動 (杜絕拿舊歷史誤認他人頻道)
     5. 快取檔案寫入時間 (cand_m) 與視窗異動時間 (changed_at) 差距在容許範圍內 (-6.0s ~ +6.0s)
     6. 該視窗最末訊息必須為真實照片/貼圖 (高 DPI 動態門檻，排除純文字與大頭貼，延遲載入自適應重測)
@@ -1401,7 +1401,7 @@ def try_auto_bind_channel(ch, cand_path, cand_m, targets, chat_dirs_map, competi
     # 防漂移核驗 (Fail-Closed)：取不到指紋 (None) 或指紋改變，一律拒絕！杜絕插入新訊息套用舊快照
     current_fp = get_chat_window_fingerprint(hwnd)
     if current_fp is None or current_fp != state.get("fp"):
-        log_v(f"[安全隔離] 目標好友「{target_name}」當前視窗指紋與異動狀態不符或無法讀取 (防漂移 Fail-Closed)，拒絕自動綁定！")
+        log_v(f"[安全隔離] 目標好友「{target_name}」目前視窗指紋與異動狀態不符或無法讀取 (防漂移 Fail-Closed)，拒絕自動綁定！")
         return None
 
     first_t = state.get("first_changed_at", state["changed_at"])
@@ -1542,7 +1542,7 @@ def prune_ignored_cache_files(ttl_seconds=3600):
             IGNORED_CACHE_FILES.pop(p, None)
 
 def get_all_cache_files(cache_dir=None):
-    """快照當前快取目錄內所有的媒體檔案 (路徑、mtime、檔案大小)，支援內容改寫偵測"""
+    """快照目前快取目錄內所有的媒體檔案 (路徑、mtime、檔案大小)，支援內容改寫偵測"""
     if cache_dir is None:
         cache_dir = get_active_line_cache_dir()
     files_dict = {}
@@ -1558,7 +1558,7 @@ def get_all_cache_files(cache_dir=None):
     return files_dict
 
 def advance_cache_mtime_to_current():
-    """將監聽時間戳記更新為當前快取目錄中最晚的檔案時間，防止觸發過去的舊圖或剛發送的圖"""
+    """將監聽時間戳記更新為目前快取目錄中最晚的檔案時間，防止觸發過去的舊圖或剛發送的圖"""
     global last_seen_cache_mtime
     active_cache = get_active_line_cache_dir()
     newest = time.time()
@@ -1648,7 +1648,7 @@ def is_last_message_from_self_in_chat(chat_hwnd):
         if w < 200 or h < 200:
             return True
 
-        # 計算視窗當前 DPI 縮放係數
+        # 計算視窗目前 DPI 縮放係數
         scale = 1.0
         try:
             dpi = ctypes.windll.user32.GetDpiForWindow(chat_hwnd)
@@ -2185,7 +2185,7 @@ def check_for_incoming_messages(config):
                         LAST_PROCESSED_UNREAD[target] = current_unread
                         save_circuit_breaker_state()
             elif title.strip().lower() == target.lower():
-                # 視窗標題無未讀數字且精確相符，代表當前為已讀狀態
+                # 視窗標題無未讀數字且精確相符，代表目前為已讀狀態
                 if target in LAST_PROCESSED_UNREAD and LAST_PROCESSED_UNREAD[target] > 0:
                     LAST_PROCESSED_UNREAD[target] = 0
                     save_circuit_breaker_state()
@@ -2237,7 +2237,7 @@ def check_for_incoming_messages(config):
                 candidate_files.sort(key=lambda x: x[0])
                 chat_dirs_map = load_chat_dirs_map()
 
-                # 維護 15 秒滑動視窗未知頻道活動記錄 (中度 #1 跨輪詢多頻道併發隔離防禦)
+                # 維護 15 秒滑動視窗未知頻道活動記錄 (中度 #1 跨輪詢多頻道並行隔離防禦)
                 # 僅在新未知頻道初次出現時記錄時間戳，不於每輪重複更新；已綁定頻道即刻移出
                 for _, p in candidate_files:
                     h = extract_chat_hash_from_path(p)
@@ -2305,9 +2305,8 @@ def check_for_incoming_messages(config):
                                             )
 
                                             # 視窗完全閒置判定 (以快取檔案時間 cand_m 與時鐘雙重防禦，杜絕輪詢延遲誤撤銷)：
-                                            # 1. 當前視窗指紋已與已登記狀態完全同步 (無新抵達未處理指紋)
-                                            # 2. cand_m 發生時目標視窗處於閒置 (距離最近異動已超過 AUTOBIND_TIMEOUT=15s，或異動時間與 cand_m 完全無關)
-                                            # 3. 目標視窗距最近異動已超過 AUTOBIND_TIMEOUT (縮圖渲染考驗期已渡過)
+                                            # 1. 目前視窗指紋已與已登記狀態完全同步 (無新抵達未處理指紋)
+                                            # 2. cand_m 與目前時鐘皆距目標視窗最近異動超過 AUTOBIND_TIMEOUT=15s (縮圖渲染考驗期已渡過)
                                             is_window_completely_idle = (
                                                 w_state is not None
                                                 and curr_fp == w_state.get("fp")
@@ -2520,9 +2519,9 @@ def main():
     parser.add_argument("--test", metavar="NAME", help="手動測試發送一次給指定對象 (例如: --test 媽媽)")
     parser.add_argument("--calibrate", metavar="NAME", help="校準指定聯絡人的快取頻道 (例如: --calibrate 媽媽)")
     parser.add_argument("--crawl", type=int, metavar="COUNT", help="立刻上網抓取指定數量的長輩圖儲存備用 (例如: --crawl 20)")
-    parser.add_argument("--list-images", action="store_true", help="列出當前讀取到的長輩圖清單")
+    parser.add_argument("--list-images", action="store_true", help="列出目前讀取到的長輩圖清單")
     parser.add_argument("--clear-history", action="store_true", help="清空已發送長輩圖的歷史記錄")
-    parser.add_argument("--scan-windows", action="store_true", help="掃描並印出當前桌面所有的 LINE 視窗資訊")
+    parser.add_argument("--scan-windows", action="store_true", help="掃描並印出目前桌面所有的 LINE 視窗資訊")
     parser.add_argument("--unbind", metavar="NAME_OR_HASH", help="解除指定聯絡人或雜湊之頻道綁定記錄")
     args = parser.parse_args()
 
