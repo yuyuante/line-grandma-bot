@@ -2943,5 +2943,14 @@ class TestLineGrandmaBotCore(unittest.TestCase):
             os.replace = real_replace
         self.assertEqual([n for n in os.listdir(self.temp_dir.name) if n.startswith("tmp")], [])
 
+    def test_extract_chat_hash_ignores_account_level_tmp_files(self):
+        # Cache\<account>	mp\messageImage_*.jpg 只含帳號層 Hash，不得被當成對話頻道
+        base = os.path.expandvars(r"%LOCALAPPDATA%\LINE\Cache")
+        acct = "b1acf4e02644042b1e22811631a6735b34cd15af"
+        chat = "67fa03ef897657d0c21b02ceec0a55fa9c65ef56"
+        self.assertIsNone(auto_reply.extract_chat_hash_from_path(os.path.join(base, acct, "tmp", "messageImage_1.jpg")))
+        self.assertEqual(auto_reply.extract_chat_hash_from_path(os.path.join(base, acct, chat, "m", "b", "x.eimg")), chat)
+        self.assertEqual(auto_reply.extract_chat_hash_from_path(os.path.join(base, chat, "m", "b", "x.eimg")), chat)
+
 if __name__ == '__main__':
     unittest.main()

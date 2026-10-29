@@ -993,6 +993,9 @@ def extract_chat_hash_from_path(file_path):
         if len(hashes) >= 2:
             return hashes[1]
         elif len(hashes) == 1:
+            # Cache\<account_hash>\tmp\... 只含帳號層 Hash，不屬於任何對話頻道 (例如 tmp\messageImage_*.jpg)
+            if len(parts) >= 2 and parts[1].lower() == "tmp":
+                return None
             return hashes[0]
     norm_parts = os.path.normpath(file_path).split(os.sep)
     hashes = [p for p in norm_parts if len(p) == 40 and re.fullmatch(r"[0-9a-fA-F]{40}", p)]
