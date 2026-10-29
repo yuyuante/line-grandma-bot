@@ -160,6 +160,12 @@ python auto_reply.py --scan-windows
 
 # 8. 清空所有聯絡人的百輪歷史記憶
 python auto_reply.py --clear-history
+
+# 9. 不傳送也不接收訊息的手動綁定 (名稱須已在 targets 內；Hash 前綴至少 8 碼，且只能對應 1 個快取資料夾)
+python auto_reply.py --bind "媽媽" db680a8a
+
+# 10. 解除綁定 (可用名稱或 Hash 前綴)
+python auto_reply.py --unbind "媽媽"
 ```
 
 ---

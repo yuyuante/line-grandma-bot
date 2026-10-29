@@ -2508,6 +2508,43 @@ def check_for_incoming_messages(config):
                 log_v(f"[暫時失敗重試]「{target_to_reply}」第 {current_fails} 次發送失敗，保留未讀水位將於冷卻後重試。")
         return
 
+def bind_channel_manually(name, hash_prefix, targets):
+    """
+    手動綁定：以快取頻道資料夾 Hash 前綴直接建立永久綁定 (不需傳送或接收任何訊息)。
+    Fail-Closed：名稱須在監控名單內、前綴須唯一對應快取資料夾、頻道與名稱皆不可已綁定他人。
+    回傳 (成功與否, 訊息)。
+    """
+    prefix = (hash_prefix or "").strip().lower()
+    if len(prefix) < 8 or not re.fullmatch(r"[0-9a-f]+", prefix):
+        return False, "Hash 前綴須為至少 8 碼的 16 進位字元。"
+    canon = next((t for t in targets if t.lower() == name.strip().lower()), None)
+    if canon is None:
+        return False, f"「{name}」不在 config.json 的 targets 名單內，請先加入。"
+    cache_dir = get_active_line_cache_dir()
+    if not cache_dir or not os.path.isdir(cache_dir):
+        return False, "找不到 LINE 本機快取目錄。"
+    matches = [
+        d for d in os.listdir(cache_dir)
+        if re.fullmatch(r"[0-9a-fA-F]{40}", d) and d.lower().startswith(prefix)
+        and os.path.isdir(os.path.join(cache_dir, d))
+    ]
+    if len(matches) != 1:
+        return False, f"前綴「{prefix}」對應到 {len(matches)} 個快取資料夾，必須剛好 1 個。"
+    ch = matches[0]
+    with locked_chat_dirs() as disk_map:
+        existing = disk_map.get(ch)
+        if isinstance(existing, str):
+            if existing.lower() == canon.lower():
+                return True, f"頻道 {ch[:8]}... 已綁定「{existing}」，無需變更。"
+            return False, f"頻道 {ch[:8]}... 已綁定給「{existing}」，請先用 --unbind 解除。"
+        for k, v in disk_map.items():
+            if k != "_provisional" and isinstance(v, str) and v.lower() == canon.lower():
+                return False, f"「{canon}」已綁定頻道 {k[:8]}...，請先用 --unbind 解除。"
+        disk_map[ch] = canon
+        if isinstance(disk_map.get("_provisional"), dict):
+            disk_map["_provisional"].pop(ch, None)
+    return True, f"已手動綁定: {ch[:8]}... <-> {canon}"
+
 def init_unread_baselines(specific_targets=None):
     """啟動時先掃描所有 LINE 視窗目前的未讀數作為初始基準線，避免啟動時將歷史未讀訊息誤判為新訊息"""
     for hwnd, title, cls, vis in get_all_line_windows():
@@ -2530,6 +2567,7 @@ def main():
     parser.add_argument("--clear-history", action="store_true", help="清空已發送長輩圖的歷史記錄")
     parser.add_argument("--scan-windows", action="store_true", help="掃描並印出目前桌面所有的 LINE 視窗資訊")
     parser.add_argument("--unbind", metavar="NAME_OR_HASH", help="解除指定聯絡人或雜湊之頻道綁定記錄")
+    parser.add_argument("--bind", nargs=2, metavar=("NAME", "HASH_PREFIX"), help="手動綁定聯絡人與快取頻道資料夾 Hash 前綴 (不需傳送或接收訊息)")
     args = parser.parse_args()
 
     if args.unbind:
@@ -2564,6 +2602,14 @@ def main():
         except Exception as e:
             log_v(f"解除綁定失敗: {e}")
             sys.exit(1)
+
+    if args.bind:
+        try:
+            ok, msg = bind_channel_manually(args.bind[0], args.bind[1], load_config().get("targets", []))
+        except Exception as e:
+            ok, msg = False, f"手動綁定失敗: {e}"
+        log_v(msg if ok else f"[綁定中止] {msg}")
+        sys.exit(0 if ok else 1)
 
     # 唯讀或診斷查詢指令 (如 --list-images, --scan-windows, --unbind) 不搶佔單一執行個體互斥鎖
     if not (args.list_images or args.scan_windows):

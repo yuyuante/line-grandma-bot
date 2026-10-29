@@ -2952,5 +2952,34 @@ class TestLineGrandmaBotCore(unittest.TestCase):
         self.assertEqual(auto_reply.extract_chat_hash_from_path(os.path.join(base, acct, chat, "m", "b", "x.eimg")), chat)
         self.assertEqual(auto_reply.extract_chat_hash_from_path(os.path.join(base, chat, "m", "b", "x.eimg")), chat)
 
+    def test_bind_channel_manually_checks_and_writes(self):
+        cache = os.path.join(self.temp_dir.name, "bind_cache")
+        h1 = "aaaa1111" + "0" * 32
+        h2 = "aaaa2222" + "0" * 32
+        h3 = "bbbb3333" + "0" * 32
+        for h in (h1, h2, h3):
+            os.makedirs(os.path.join(cache, h, "m"))
+        orig = auto_reply.get_active_line_cache_dir
+        auto_reply.get_active_line_cache_dir = lambda: cache
+        try:
+            targets = ["FriendA", "FriendB"]
+            # 名稱不在名單、前綴過短、前綴對應多個資料夾：一律拒絕且不寫入
+            self.assertFalse(auto_reply.bind_channel_manually("Stranger", "bbbb3333", targets)[0])
+            self.assertFalse(auto_reply.bind_channel_manually("FriendA", "bbbb", targets)[0])
+            self.assertFalse(auto_reply.bind_channel_manually("FriendA", "aaaa", targets)[0])
+            self.assertEqual(auto_reply.load_chat_dirs_map(), {})
+            # 唯一前綴且名稱不分大小寫：成功寫入
+            ok, _ = auto_reply.bind_channel_manually("frienda", "aaaa1111", targets)
+            self.assertTrue(ok)
+            self.assertEqual(auto_reply.load_chat_dirs_map(), {h1: "FriendA"})
+            # 重複綁定同一組合：視為成功且不變
+            self.assertTrue(auto_reply.bind_channel_manually("FriendA", "aaaa1111", targets)[0])
+            # 頻道已綁他人、名稱已綁其他頻道：拒絕
+            self.assertFalse(auto_reply.bind_channel_manually("FriendB", "aaaa1111", targets)[0])
+            self.assertFalse(auto_reply.bind_channel_manually("FriendA", "bbbb3333", targets)[0])
+            self.assertEqual(auto_reply.load_chat_dirs_map(), {h1: "FriendA"})
+        finally:
+            auto_reply.get_active_line_cache_dir = orig
+
 if __name__ == '__main__':
     unittest.main()
