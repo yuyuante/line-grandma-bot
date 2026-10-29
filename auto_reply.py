@@ -51,11 +51,11 @@ def ensure_single_instance():
     handle = kernel32.CreateMutexW(None, False, mutex_name)
     last_err = ctypes.get_last_error()
     if not handle or handle == 0:
-        log_v("❌ [致命錯誤] 無法建立系統互斥鎖 (CreateMutexW 失敗)！為確保系統安全，本實例立即安全退出。")
+        log_v("❌ [致命錯誤] 無法建立系統互斥鎖 (CreateMutexW 失敗)！為確保系統安全，本程式立即安全退出。")
         sys.exit(1)
     ERROR_ALREADY_EXISTS = 183
     if last_err == ERROR_ALREADY_EXISTS:
-        log_v("❌ [致命衝突] 偵測到已有另一個 auto_reply 程式在執行中！為防重複發送與繞過斷路器，本實例立即安全退出。")
+        log_v("❌ [致命衝突] 偵測到已有另一個 auto_reply 程式在執行中！為防重複發送與繞過斷路器，本程式立即安全退出。")
         sys.exit(1)
     _app_mutex_handle = handle
 
@@ -663,7 +663,7 @@ def find_target_chat_window(target_name):
             log_v(f"[安全攔截] 視窗標題「{title}」含有群組特徵關鍵字，嚴格拒絕作為 1:1 好友發送！")
             continue
 
-        # 優先比對標題：先確認標題與目標相符，再進行深入核驗，大幅降低全視窗遍歷之系統負載
+        # 優先比對標題：先確認標題與目標相符，再進行深入核驗，大幅降低全視窗走訪之系統負載
         is_exact = (title.strip().lower() == target_name.lower())
         m = re.search(r"^(.*?)\s*[\(\uFF08](\d+\+?)[\)\uFF09]\s*$", title)
         is_unread = (m is not None and m.group(1).strip().lower() == target_name.lower())
@@ -1127,7 +1127,7 @@ def locked_chat_dirs(timeout_ms=5000):
         release_chat_dirs_mutex(h)
 
 AUTOBIND_TIMEOUT = 15.0       # 自動學習綁定超時統一常數 (涵蓋滑動視窗併發隔離、暫緩重試與延遲渲染重測，15.0s)
-AUTOBIND_TIME_WINDOW = 6.0    # 快取檔案寫入時間 (cand_m) 與視窗訊息異動時間之容許時間差窗口 (±6.0s)
+AUTOBIND_TIME_WINDOW = 6.0    # 快取檔案寫入時間 (cand_m) 與視窗訊息異動時間之容許時間差範圍 (±6.0s)
 _TARGET_WINDOW_STATE = {}     # {target_name: {"fp": str, "changed_at": float, "consumed": bool, "has_media": bool, "is_incoming": bool}}
 _RECENT_UNKNOWN_CHANNELS = {} # {chat_hash: timestamp} 用於 15 秒滑動視窗多頻道併發隔離防禦
 _PROVISIONAL_BINDINGS = load_provisional_bindings() # 跨重啟持久化暫定綁定狀態
@@ -1323,7 +1323,7 @@ def update_target_window_fingerprints(targets):
                         "is_thumbnail_settle": is_thumbnail_settle,
                     }
                 elif not state.get("consumed") and not state.get("has_media") and (now - state.get("changed_at", 0) <= AUTOBIND_TIMEOUT):
-                    # 🔴 核心防禦：若指紋已變動但縮圖處於非同步延遲載入 (尚未出現 ImageControl)，在超時窗口內節流重測 (至少間隔 1.0s)
+                    # 🔴 核心防禦：若指紋已變動但縮圖處於非同步延遲載入 (尚未出現 ImageControl)，在超時範圍內節流重測 (至少間隔 1.0s)
                     if now - state.get("last_retest_at", 0) >= 1.0:
                         state["last_retest_at"] = now
                         has_media, is_incoming = get_chat_latest_media_info(hwnd)
@@ -1348,7 +1348,7 @@ def try_auto_bind_channel(ch, cand_path, cand_m, targets, chat_dirs_map, competi
     2. 該視窗必須通過 UIA 1:1 核驗
     3. 近 15 秒滑動視窗不可有 2 個以上不同之未知頻道同時活動 (中度 #1 併發滑動視窗防禦)
     4. 該視窗近期必須剛發生未消費之內容指紋異動 (杜絕拿舊歷史誤認他人頻道)
-    5. 快取檔案寫入時間 (cand_m) 與視窗異動時間 (changed_at) 差距在容許窗口內 (-6.0s ~ +6.0s)
+    5. 快取檔案寫入時間 (cand_m) 與視窗異動時間 (changed_at) 差距在容許範圍內 (-6.0s ~ +6.0s)
     6. 該視窗最末訊息必須為真實照片/貼圖 (高 DPI 動態門檻，排除純文字與大頭貼，延遲載入自適應重測)
     7. 該視窗最末照片必須為對方傳入 (量測 ImageControl 左右邊距，寬圖亦精準判定，完全不搶焦點)
     8. 持久化寫入成功後才標記已消費，寫入失敗立即撤銷
@@ -1407,7 +1407,7 @@ def try_auto_bind_channel(ch, cand_path, cand_m, targets, chat_dirs_map, competi
     first_t = state.get("first_changed_at", state["changed_at"])
     ref_media_t = state.get("media_seen_at")
 
-    # 2. 時間窗口相關性驗證 (中度防禦：精準以圖片出現時間 media_seen_at 比對 ±AUTOBIND_TIME_WINDOW)：
+    # 2. 時間範圍相關性驗證 (中度防禦：精準以圖片出現時間 media_seen_at 比對 ±AUTOBIND_TIME_WINDOW)：
     time_diff = cand_m - first_t
     if cand_m < first_t - AUTOBIND_TIME_WINDOW or cand_m > last_t + AUTOBIND_TIME_WINDOW:
         log_v(f"[安全隔離] 快取頻道「{ch[:8]}...」寫入時間 ({cand_m:.1f}) 與視窗變更時間 ({first_t:.1f}) 差距超標 ({time_diff:+.1f}s)，拒絕自動綁定！")
@@ -1444,7 +1444,7 @@ def try_auto_bind_channel(ch, cand_path, cand_m, targets, chat_dirs_map, competi
             now_retest = time.time()
             state["media_seen_at"] = now_retest
             state["is_thumbnail_settle"] = True
-            # 🟡 核心防禦：重測後嚴格核驗時間窗口！延遲縮圖快取檔案時間必須在抵達時間 (first_t) 或重測渲染時間 (now_retest) ±AUTOBIND_TIME_WINDOW (6.0s) 之內
+            # 🟡 核心防禦：重測後嚴格核驗時間範圍！延遲縮圖快取檔案時間必須在抵達時間 (first_t) 或重測渲染時間 (now_retest) ±AUTOBIND_TIME_WINDOW (6.0s) 之內
             if abs(cand_m - now_retest) > AUTOBIND_TIME_WINDOW and abs(cand_m - first_t) > AUTOBIND_TIME_WINDOW:
                 log_v(f"[安全隔離] 快取頻道「{ch[:8]}...」寫入時間 ({cand_m:.1f}) 與延遲重測時間 ({now_retest:.1f}) 及抵達時間 ({first_t:.1f}) 差距超標，拒絕自動綁定！")
                 return None
@@ -1487,7 +1487,7 @@ def is_likely_photo(file_path):
     精確判斷媒體是否為真實照片 (有效排除所有 LINE 貼圖與加密大貼圖)：
     - LINE 貼圖 (包括大貼圖/動態貼圖) 通常為透明 PNG/APNG (RGBA/P 模式) 或 WEBP 格式，尺寸 <= 512x512，且大小普遍小於 100KB
     - 加密貼圖 (.eimg) 亦不超過 100KB；真實相機照片幾乎 100% 超過 250KB (250000 bytes)
-    - 本函數強制要求非加密圖片必須為標準 JPEG/RGB 格式、大於 512x512 尺寸且大小 >= 50KB；.eimg 必須 >= 250KB，杜絕任何貼圖誤觸發 photo_only 模式
+    - 本函式強制要求非加密圖片必須為標準 JPEG/RGB 格式、大於 512x512 尺寸且大小 >= 50KB；.eimg 必須 >= 250KB，杜絕任何貼圖誤觸發 photo_only 模式
     """
     try:
         sz = os.path.getsize(file_path)
@@ -1977,7 +1977,7 @@ def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_f
         # 單次 Enter：送出前瞬間再次核驗前景 HWND (TOCTOU 雙重防禦)
         if win32gui.GetForegroundWindow() != chat_hwnd:
             log_v(f"[安全攔截] 送出長輩圖前焦點已被移轉至其他視窗，注入 Esc 取消預覽並終止發送！")
-            # 激活並發送 Esc 清理輸入框與貼圖預覽，徹底杜絕待送圖片殘留
+            # 啟用並發送 Esc 清理輸入框與貼圖預覽，徹底杜絕待送圖片殘留
             try:
                 win32gui.ShowWindow(chat_hwnd, win32con.SW_RESTORE)
                 activate_window(chat_hwnd)
@@ -2281,7 +2281,7 @@ def check_for_incoming_messages(config):
                                 max_processed_m = max(max_processed_m, cand_m)
                                 continue
 
-                            # 晉升永久嚴格要求實質新事件核驗 (至少相隔 6.0s 獨立事件窗口)，絕不憑空純按時間盲目晉升
+                            # 晉升永久嚴格要求實質新事件核驗 (至少相隔 6.0s 獨立事件間隔)，絕不憑空純按時間盲目晉升
                             promoted = False
                             if cand_m >= bind_time + AUTOBIND_TIME_WINDOW:
                                 wins = find_target_chat_window(prov_target)
@@ -2307,7 +2307,7 @@ def check_for_incoming_messages(config):
                                             # 視窗完全閒置判定 (以快取檔案時間 cand_m 與時鐘雙重防禦，杜絕輪詢延遲誤撤銷)：
                                             # 1. 當前視窗指紋已與已登記狀態完全同步 (無新抵達未處理指紋)
                                             # 2. cand_m 發生時目標視窗處於閒置 (距離最近異動已超過 AUTOBIND_TIMEOUT=15s，或異動時間與 cand_m 完全無關)
-                                            # 3. 目標視窗距最近異動已超過 AUTOBIND_TIMEOUT (縮圖渲染考驗窗口已渡過)
+                                            # 3. 目標視窗距最近異動已超過 AUTOBIND_TIMEOUT (縮圖渲染考驗期已渡過)
                                             is_window_completely_idle = (
                                                 w_state is not None
                                                 and curr_fp == w_state.get("fp")
@@ -2363,14 +2363,14 @@ def check_for_incoming_messages(config):
                                                 changed_at = w_state.get("changed_at", 0) if w_state else 0
                                                 if (abs(cand_m - changed_at) <= AUTOBIND_TIME_WINDOW
                                                         and now_chk - changed_at <= AUTOBIND_TIMEOUT):
-                                                    # 縮圖渲染窗口：暫緩，留待下輪重新核驗
+                                                    # 縮圖渲染期間：暫緩，留待下輪重新核驗
                                                     deferred_mtimes.append(cand_m)
                                                 else:
                                                     PROCESSED_CACHE_FILES.add((cand_path, cand_m))
                                                     max_processed_m = max(max_processed_m, cand_m)
                                                 continue
                             if not promoted:
-                                # Fail-Closed 兜底：暫定頻道未經晉升核驗 (6 秒窗口內的後續檔、視窗缺失/最小化、
+                                # Fail-Closed 保底：暫定頻道未經晉升核驗 (6 秒範圍內的後續檔、視窗缺失/最小化、
                                 # 指紋讀取失敗、晉升寫入磁碟失敗) 一律不放行；檔案尚新則暫緩重驗，逾時才標記已處理
                                 if cand_m >= bind_time + AUTOBIND_TIME_WINDOW and now_chk - cand_m <= AUTOBIND_TIMEOUT:
                                     deferred_mtimes.append(cand_m)
@@ -2559,7 +2559,7 @@ def main():
             log_v(f"解除綁定失敗: {e}")
             sys.exit(1)
 
-    # 唯讀或診斷查詢指令 (如 --list-images, --scan-windows, --unbind) 不搶佔單一實例互斥鎖
+    # 唯讀或診斷查詢指令 (如 --list-images, --scan-windows, --unbind) 不搶佔單一執行個體互斥鎖
     if not (args.list_images or args.scan_windows):
         ensure_single_instance()
 

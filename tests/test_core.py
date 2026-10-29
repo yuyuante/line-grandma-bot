@@ -948,7 +948,7 @@ class TestLineGrandmaBotCore(unittest.TestCase):
             auto_reply._TARGET_WINDOW_STATE.pop("TargetA", None)
 
     def test_try_auto_bind_channel_time_window_boundaries(self):
-        # 測試時間窗口邊界：-3.0s ~ +6.0s 容許窗口 (考量快取檔案下載延遲與主迴圈輪詢延遲)
+        # 測試時間範圍邊界：-3.0s ~ +6.0s 容許範圍 (考量快取檔案下載延遲與主迴圈輪詢延遲)
         fake_hash = "999903ef1234567890abcdef1234567890abcdef"
         fake_path = os.path.join(self.temp_dir.name, "mo", fake_hash, "test.eimg")
         base_t = time.time()
@@ -1743,7 +1743,7 @@ class TestLineGrandmaBotCore(unittest.TestCase):
 
     def test_try_auto_bind_channel_success_when_cache_written_near_last_fp_change(self):
         # 測試 🟡 中度防禦：快取檔案於縮圖完成後才寫入 (cand_m 接近 last_fp_change，但已距 first_changed_at 超過 6s)，
-        # 只要在 [first_t - 6, last_t + 6] 窗口內依然順利放行綁定
+        # 只要在 [first_t - 6, last_t + 6] 範圍內依然順利放行綁定
         fake_hash = "343403ef1234567890abcdef1234567890abcdef"
         fake_path = os.path.join(self.temp_dir.name, "mo", fake_hash, "test.eimg")
         t0 = time.time()
@@ -1788,7 +1788,7 @@ class TestLineGrandmaBotCore(unittest.TestCase):
 
     def test_text_followed_by_image_does_not_expand_window(self):
         # 測試 🟡 中度防禦：文字訊息後緊接傳入圖片訊息時 (LcListView 項目數增加)，嚴格重置時間為圖片時間，
-        # 徹底杜絕時間窗口放寬至 27 秒誤配舊文字時間
+        # 徹底杜絕時間範圍放寬至 27 秒誤配舊文字時間
         fake_hash = "787803ef1234567890abcdef1234567890abcdef"
         fake_path = os.path.join(self.temp_dir.name, "mo", fake_hash, "test.eimg")
         t0 = time.time()
@@ -2071,7 +2071,7 @@ class TestLineGrandmaBotCore(unittest.TestCase):
             f.write(b"\x00" * 300000)
 
         now = time.time()
-        # 快取檔案生成於 20 秒前 (已渡過 AUTOBIND_TIMEOUT=15s 縮圖渲染考驗窗口)
+        # 快取檔案生成於 20 秒前 (已渡過 AUTOBIND_TIMEOUT=15s 縮圖渲染考驗期)
         os.utime(img_path, (now - 20.0, now - 20.0))
 
         # 先手動模擬已存在暫定綁定 (採用標準字典結構)
@@ -2567,7 +2567,7 @@ class TestLineGrandmaBotCore(unittest.TestCase):
             auto_reply.atomic_save_json = orig_save
 
     def test_revoke_does_not_trigger_while_thumbnail_rendering(self):
-        # 測試 🔴 核心防禦：視窗指紋改變但在 15 秒縮圖渲染窗口內 (not is_window_completely_idle)，絕不誤撤銷合法綁定
+        # 測試 🔴 核心防禦：視窗指紋改變但在 15 秒縮圖渲染期間內 (not is_window_completely_idle)，絕不誤撤銷合法綁定
         fake_hash = "777703ef1234567890abcdef1234567890abcdef"
         test_cache = os.path.join(self.temp_dir.name, "thumb_render_cache")
         chat_mo_dir = os.path.join(test_cache, fake_hash, "m")
@@ -2611,7 +2611,7 @@ class TestLineGrandmaBotCore(unittest.TestCase):
             auto_reply.last_seen_cache_mtime = now - 1.0
             auto_reply.check_for_incoming_messages(cfg)
 
-            # 核心驗證：因為視窗仍在渲染窗口內 (未徹底閒置逾 15s)，絕不可將其誤判為錯綁而撤銷！
+            # 核心驗證：因為視窗仍在渲染期間內 (未徹底閒置逾 15s)，絕不可將其誤判為錯綁而撤銷！
             self.assertIn(fake_hash, auto_reply._PROVISIONAL_BINDINGS)
             loaded = auto_reply.load_chat_dirs_map()
             self.assertIn(fake_hash, loaded)
@@ -2891,7 +2891,7 @@ class TestLineGrandmaBotCore(unittest.TestCase):
         self.assertFalse(still_prov)
 
     def test_provisional_unverified_paths_fail_closed(self):
-        # 6 秒窗口內的後續檔、目標視窗缺失：暫定頻道未經核驗，不得回覆，綁定保留
+        # 6 秒範圍內的後續檔、目標視窗缺失：暫定頻道未經核驗，不得回覆，綁定保留
         state = lambda now: {"fp": "1_bind_fp", "changed_at": now - 2.0, "last_fp_change": now - 2.0, "has_media": True, "is_incoming": True}
         sent, still_prov = self._run_provisional_scenario(
             "dddd03ef1234567890abcdef1234567890abcdef", "TargetEarly", 2.0, "1_bind_fp",
