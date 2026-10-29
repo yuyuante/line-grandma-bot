@@ -4,7 +4,7 @@
     "爸爸"
   ],
   "images_dir": "images",
-  "trigger_mode": "photo_only",
+  "trigger_mode": "photo_and_sticker",
   "min_delay_seconds": 5,
   "max_delay_seconds": 25,
   "cooldown_seconds": 30,

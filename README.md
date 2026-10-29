@@ -1,6 +1,6 @@
 # LINE 長輩圖智慧自動回覆機器人 (line-grandma-bot)
 
-[![Version](https://img.shields.io/badge/version-2.2.0-blue.svg)](file:///C:/Users/user/code/line-grandma-bot/auto_reply.py)
+[![Version](https://img.shields.io/badge/version-2.3.0-blue.svg)](auto_reply.py)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D6.svg)](https://microsoft.com)
 [![Python](https://img.shields.io/badge/python-3.10%2B-green.svg)](https://python.org)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey.svg)](LICENSE)
@@ -45,15 +45,19 @@
 
 ```text
 line-grandma-bot/
-├── auto_reply.py        # 核心自動回覆守護進程 (v2.2.0)
+├── auto_reply.py        # 核心自動回覆守護進程 (v2.3.0)
 ├── crawl_images.py      # 台塑貼圖酷長輩圖抓取與過期清理模組
 ├── config.example.json  # 設定檔範本
 ├── config.json          # 個人實際設定檔 (已列入 .gitignore 保護隱私)
 ├── contact_history.json # 每位聯絡人百輪記憶歷史庫 (已列入 .gitignore)
 ├── chat_dirs.json       # LINE 聊天室快取雜湊對應檔 (已列入 .gitignore)
+├── circuit_breaker.json # 斷路器與時間窗持久化狀態檔 (已列入 .gitignore)
 ├── run_auto_reply.bat   # Windows 一鍵啟動批次檔
 ├── requirements.txt     # Python 相依套件清單
+├── LICENSE              # MIT 開源授權協議
 ├── README.md            # 本專案說明文件
+├── tests/               # 核心防護單元測試套件
+│   └── test_core.py     # 回歸安全測試
 └── images/              # 正統長輩圖庫 (內建 20 張高解析度長輩圖備用)
 ```
 
@@ -66,13 +70,19 @@ line-grandma-bot/
 * Python 版本：Python 3.10 或以上（建議 Python 3.12+）
 * 電腦版 LINE：保持登入並正常運作
 
-### 2. 安裝相依套件
+### 2. 標準操作流程 (SOP)
+為確保自動化運作 100% 穩定且絕不干擾其他對話，建議採用以下極簡標準流程：
+1. **開啟目標獨立聊天室**：在 LINE 電腦版的好友清單中，對 `config.json` 內設定的目標好友（例如「媽媽」）連點兩下打開**獨立聊天室視窗**（直接最小化至工作列即可）。
+2. **零設定全自動守護 (Zero-Config)**：直接啟動 `run_auto_reply.bat`。程式具備動態頻道自動學習技術，當目標好友傳來長輩圖或貼圖時，背景全自動完成頻道綁定與回覆，**完全無需任何手動校準指令**。
+3. **安全回覆與自動最小化**：程式喚醒視窗、驗證視窗身分與訊息方向後貼圖送出，並自動重新最小化維持未讀狀態，完全不干擾您在 LINE 主視窗與其他親友交談。
+
+### 3. 安裝相依套件
 在專案根目錄打開 PowerShell，執行：
 ```powershell
 pip install -r requirements.txt
 ```
 
-### 3. 設定監控名單
+### 4. 設定監控名單
 首次使用時，請複製 `config.example.json` 為 `config.json`：
 ```powershell
 copy config.example.json config.json
@@ -86,7 +96,7 @@ copy config.example.json config.json
     "大舅舅"
   ],
   "images_dir": "images",
-  "trigger_mode": "photo_only",
+  "trigger_mode": "photo_and_sticker",
   "min_delay_seconds": 5,
   "max_delay_seconds": 25,
   "cooldown_seconds": 30,
@@ -105,7 +115,7 @@ copy config.example.json config.json
 | :--- | :---: | :--- |
 | `targets` | `["媽媽"]` | 監控回覆的好友名稱陣列（支援多位好友，需與 LINE 上顯示名稱完全相符）。 |
 | `images_dir` | `"images"` | 長輩圖存放資料夾路徑。 |
-| `trigger_mode` | `"photo_only"` | `"photo_only"`（僅對方發照片時回覆長輩圖；對方傳文字不回覆且維持未讀）；`"all"`（文字與照片皆回）。 |
+| `trigger_mode` | `"photo_and_sticker"` | 回覆觸發模式：`"photo_and_sticker"`（預設，對方發照片或貼圖時回覆長輩圖；對方傳純文字時保持沉默維持未讀）；`"photo_only"`（僅限對方傳照片時回覆）；`"all"`（文字、貼圖與照片皆回覆）。 |
 | `min_delay_seconds` | `5` | 模擬真人延遲回覆**最短秒數**。 |
 | `max_delay_seconds` | `25` | 模擬真人延遲回覆**最長秒數**（每次會在此區間內隨機擲出秒數）。 |
 | `cooldown_seconds` | `30` | 防洗版全域冷卻安全間隔（秒）。 |
@@ -138,22 +148,122 @@ python auto_reply.py --crawl 20
 # 4. 手動測試發送一次給指定聯絡人 (驗證發送流程與最小化動作)
 python auto_reply.py --test "媽媽"
 
-# 5. 查看現有圖庫清單與每張圖在各位好友百輪記憶庫中的使用狀態
+# 5. 精確校準指定好友的快取頻道 (例如: --calibrate "媽媽")
+python auto_reply.py --calibrate "媽媽"
+
+# 6. 查看現有圖庫清單與每張圖在各位好友百輪記憶庫中的使用狀態
 python auto_reply.py --list-images
 
-# 6. 掃描當前桌面上所有 LINE 視窗控制代碼與標題
+# 7. 掃描當前桌面上所有 LINE 視窗控制代碼與標題
 python auto_reply.py --scan-windows
 
-# 7. 清空所有聯絡人的百輪歷史記憶
+# 8. 清空所有聯絡人的百輪歷史記憶
 python auto_reply.py --clear-history
 ```
 
 ---
 
+## 📝 版本異動紀錄 (Changelog)
+
+### [v2.3.0] - 2026-10-29
+#### 誤傳防護與對象嚴格隔離 (Accidental Send Prevention & Strict Window Isolation)
+- **徹底廢止主視窗模擬搜尋鍵盤輸入**：完全移除過去在主視窗點擊搜尋框、模擬複製貼上聯絡人名稱與模擬鍵盤 Enter 尋找對話框之邏輯。徹底杜絕因焦點漂移或停留在其他聊天室輸入框時，誤將好友姓名以文字訊息送出給錯誤對象的災難性風險。
+- **微秒級前景視窗標題雙重核驗 (Strict Foreground Whitelist & TOCTOU 防禦)**：發送長輩圖前強制比對 Windows 頂層焦點視窗（Foreground Window）之真實標題。標題若為「LINE」主視窗、群組、或任何非目標好友之名稱，立即觸發 `[致命安全攔截]` 中止發送，絕不在未確認目標身分的視窗執行貼上動作。
+- **三態發送送達確認架構 (NOT_SENT / SENT_CONFIRMED / SENT_UNCERTAIN)**：發送前失焦判定為 `NOT_SENT` 並進入最多 3 次安全重試；Enter 送出後由專屬送達核驗函式驗證右側氣泡，明確送達確立為 `SENT_CONFIRMED`；未見氣泡則判定為 `SENT_UNCERTAIN` 並記入發送歷史且絕不自動重試（若頻率超標則啟動斷路器退避），徹底杜絕重複洗版發送長輩圖。
+- **重名與重複開啟全量攔截**：合併精確與括號候選視窗並去重 HWND，即便一已讀一未讀，只要桌面存在超過 1 個同名視窗一律攔截拒發。
+- **群組名稱關鍵字安全過濾**：為徹底防範將群組誤判為個人對話，名稱若包含「群組、聊天室、成員、專案、公務、同學、家族、group、team、club、project、family」等字樣，程式一律判定為群組並安全攔截（Fail-Closed 拒發）；若目標好友名稱包含上述關鍵字，建議於 LINE 中微調好友備註名稱。
+- **零設定全自動頻道學習綁定 (Zero-Config Auto-Discovery & Auto-Binding)**：徹底廢除強制手動校準要求。單一監控對象或多對象視窗在線時，系統自動識別底層快取頻道並動態完成映射持久化，完全開箱即用；同時原生支援現代電腦版 LINE 獨立視窗標題正常無未讀括號特性，消除等待括號卡死問題。
+- **暫定綁定二次核驗 (Fail-Closed)**：自動學習的綁定先為暫定狀態，需經獨立傳入圖片核驗才轉為永久；核驗通過前一律不回覆，因此綁定後 6 秒內的後續圖片不會被回覆。目標視窗閒置且指紋已轉入其他訊息時自動撤銷錯綁。
+- **跨版本快取目錄雜湊萃取相容**：同時相容 LINE 電腦版不同版本之單層與雙層 40 字元快取子目錄架構，確保監聽指紋精準鎖定目標對象。
+
+#### 核心安全修復與深層防禦 (Critical Hardening & Architecture Upgrade)
+- **多層深層防自循環架構 (Multi-Tier Self-Reply Defense)**：
+  - **實體快取三元組差集快照**：發送前後自動對快取檔案進行路徑、修改時間（mtime）與檔案大小（size）全量差集快照，本機發送產生的新檔案或就地更新均自動記入黑名單。
+  - **Windows DWM 像素物理方向校驗 (Fail-Closed)**：發送前核驗目標聊天室為前景視窗，透過 DWM 精準擴展客戶區邊界與動態 DPI 感知取樣，雙欄模式嚴密隔離側欄；最底部訊息若位於右側或無法判斷時一律安全攔截中止發送。
+  - **跨重啟雙重持久化斷路器 (Circuit Breaker)**：同一對象 5 分鐘內最多回覆 2 次，超標啟動 30 分鐘退避鎖定；鎖定期、時間戳與 5 秒發送防抖保護全量持久化至 `circuit_breaker.json`，重啟守護進程不失效。
+  - **未讀視窗交叉驗證之頻道關聯**：底層媒體快取雜湊不盲目自動綁定單一好友，僅在該好友視窗出現實體未讀訊息時才安全關聯，徹底防止群組貼圖誤判。
+  - **全方位多語系發送排除**：嚴格排除「您傳送了」、「You sent」、「写真を送信しました」等本機發送通知與文字。
+- **全面支援 LINE 貼圖 (Sticker)**：
+  - 關鍵字辨識庫擴充納入 `[貼圖]`、`[照片]`、`\b(photo|image|sticker)\b`。
+  - 新增 `trigger_mode` 設定值 `"photo_and_sticker"`（同時支援長輩圖照片與 LINE 貼圖觸發）。
+
+---
+
+### [v2.2.0] - 2026-10-28
+#### 新增功能
+- **百輪雙向獨立記憶庫**：為每位好友獨立維護 100 輪發送與接收紀錄（`contact_history.json`），確保 100 輪內絕不重複發送相同圖片，亦絕不將對方曾傳來的圖片回送給對方。
+- **借花獻佛大循環**：自動辨識並收納好友傳送之正統長輩圖進中央圖庫，日後可流通發送給其他好友（原發送者百輪內封印不回發）。
+- **台塑貼圖酷官方爬蟲**：直接介接 Formosa「台塑貼圖酷」長輩圖專案，精選上千張每日問候圖，支援連線熔斷保護與 7 天 TTL 自動過期清理。
+- **Windows 原生繁中 OCR**：內建整合 `Windows.Media.Ocr`，自動核對問候關鍵字，自動過濾生活照、發票收據等非長輩圖。
+- **動態名單熱更新 (Hot Reload)**：背景常駐期間修改 `config.json` 好友名單秒級生效，無需重啟程式。
+
+#### 健全度與效能優化
+- **Per-Monitor V2 DPI 感知**：支援高解析度螢幕縮放（125%、150% 等），避免滑鼠座標偏移。
+- **檔案原子寫入 (Atomic Write)**：使用暫存檔與 `os.replace` 儲存 JSON，杜絕斷電或非預期中斷造成資料損壞。
+- **全域日誌與版本號標記**：所有控制台輸出與日誌均自動附帶時間戳記與版本號標籤 `[v2.2.0]`。
+- **命令列工具鏈完善**：提供 `--version`、`--crawl`、`--test`、`--list-images`、`--scan-windows`、`--clear-history` 等豐富除錯與管理參數。
+
+#### 隱私與安全防護
+- **個人隱私防護**：將 `config.json`、`contact_history.json`、`chat_dirs.json` 列入 `.gitignore`，徹底杜絕真實好友名單上傳公開儲存庫。
+- **文件去識別化**：所有公開說明文件、程式範例與日誌輸出均全面去除真實個人姓名，一律採用「媽媽」、「爸爸」、「大舅舅」等通用尊稱佔位符。
+
+---
+
+### [v2.0.0] - 2026-10-27
+#### 重大架構重構 (Breaking Changes)
+- **改採 Windows 原生 GUI 自動化**：全面捨棄早期仰賴 `wpndatabase.db` 讀取 Windows 通知資料庫的不穩定機制，改以 Win32 API 與 UIAutomation 進行視窗焦點控制、剪貼簿圖片貼上與對話框最小化。
+- **精簡依賴套件**：移除笨重且需下載龐大權重檔的本機 CLIP 模型（數百 MB），大幅縮減安裝體積與記憶體佔用。
+- **多對象監聽擴充**：架構由單一對象監聽重構為支援多聯絡人名單並行監控。
+
+---
+
+### [v1.0.0] - 2026-10-25
+#### 初始版本發布
+- **通知監聽自動化**：監控 Windows 推播通知中心，偵測 LINE 照片通知。
+- **AI 圖片分類**：利用本機 CLIP 零樣本圖像分類器鑑別長輩圖。
+- **Bing 爬圖與 pHash 去重**：透過網路搜尋抓圖並使用感知雜湊（pHash）進行去重。
+- **基礎防護機制**：支援隨機延遲秒數回覆、勿擾時段設定、每日發送上限與緊急停止熱鍵。
+
+---
+
+## 🤖 多 AI 交叉審查標準開發規範 (Multi-AI Cross-Review Protocol)
+
+本機環境具備四大頂級 AI 開發工具生態：
+* **Antigravity** (Google DeepMind)
+* **Claude Code** (Anthropic Claude CLI)
+* **OpenAI Codex** (OpenAI Codex CLI)
+* **GitHub Copilot** (GitHub Copilot CLI)
+
+### 核心開發準則 (Golden Rule)
+> **「凡由任一 AI 開發或修改完成之程式碼，必須第一時間主動送交給本機其他不同的 AI 開發工具進行獨立嚴格交叉審查（Cross-Review），徹底消除單一模型之認知盲點，收斂所有重大架構與安全性疑慮後方得視為交付。」**
+
+#### 審查意見嚴重度分級與閉環修復流程 (Severity & Remediation Protocol)：
+1. **意見分級規範**：審查工具（Reviewer）產出的審查意見必須嚴格分為三級：
+   - **🔴 高度嚴重意見 (High / P1)**：邏輯死循環、誤傳至非目標對象、程式崩潰、未釋放資源、或核心安全漏洞。
+   - **🟡 中度嚴重意見 (Medium / P2)**：邊界條件不嚴謹、可能遺漏事件、狀態持久化不同步、文件與實作矛盾。
+   - **🟢 低度嚴重意見 (Low / P3)**：代碼風格優化、註解潤飾、微小相容性建議、未追蹤檔案整理等。
+2. **高／中度嚴重意見強制循環修復 (Mandatory Re-Review Loop)**：
+   - 被審查者（Developer）**必須強制全數修復所有高度（High）與中度（Medium）嚴重意見**。
+   - 修復完成後，**必須再次送回原審查 AI 工具進行第二輪審查**。
+   - 此送審 → 修復 → 覆審之閉環流程**必須持續迭代，直至所有審查 AI 確認「無任何高度與中度嚴重意見」為止**。
+3. **低度嚴重意見處置**：
+   - 低度嚴重意見（Low / P3）由被審查者人工判斷是否修復。
+   - 僅修復低度意見後，**不必再次送審**。
+
+#### 執行標準作業程序：
+1. **補丁匯出**：代碼撰寫完成並通過單元測試 (`python -m unittest discover -s tests`) 後，匯出最新 `git diff` 補丁。
+2. **三方獨立送審**：非本體的其餘三款 AI 工具各自啟動獨立工作階段進行審查：
+   - `claude.cmd -p -` (Claude Code 深度代碼審查)
+   - `copilot.cmd -p ...` (GitHub Copilot 架構安全審查)
+   - `codex.cmd exec` (OpenAI Codex 推理審查)
+3. **報告存檔與閉環迭代**：各工具輸出之獨立審查報告存檔至本機，確認達成「零高、中度嚴重意見」之驗證標準。
+
+---
+
 ## 🛡️ 隱私與安全說明
-1. **本機原生操作**：本工具採用純桌面 GUI 與 Windows 內建輔助功能自動化（Win32 API 與 UIAutomation），**不攔截、不破解、不篡改 LINE 通訊協定與封包**。
-2. **好友個資保護**：個人的聯絡人名單（`config.json`）、聊天歷史記錄（`contact_history.json`）及頻道指紋檔（`chat_dirs.json`）均已由 `.gitignore` 全面排除，**絕不會上傳或同步至 GitHub 公開儲存庫**。
-3. **安全防循環**：內建快取時間戳記前推機制與視窗標題雙重校驗，**保證絕不觸發自己送出的圖片形成死循環**。
+1. **本機原生操作**：本工具採用純桌面 GUI 與 Windows 原生 API 自動化（Win32 API 原生控制與圖形分析），**不攔截、不破解、不篡改 LINE 通訊協定與封包**。
+2. **好友個資保護**：個人的聯絡人名單（`config.json`）、聊天歷史記錄（`contact_history.json`）、頻道指紋檔（`chat_dirs.json`）及斷路器狀態檔（`circuit_breaker.json`）均已由 `.gitignore` 全面排除，**絕不會上傳或同步至 GitHub 公開儲存庫**。
+3. **多層深層防循環**：內建快取三元組差集快照、前景視窗驗證、物理方向校驗與跨重啟雙重斷路器，建立嚴密的層層防禦機制。
 
 ---
 

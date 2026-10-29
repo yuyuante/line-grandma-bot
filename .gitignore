@@ -10,3 +10,8 @@ __pycache__/
 config.json
 contact_history.json
 chat_dirs.json
+circuit_breaker.json
+review_diff.patch
+
+*.emergency_copy
+*.emergency_lock

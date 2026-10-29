@@ -18,7 +18,7 @@ import urllib.request
 import argparse
 from PIL import Image
 
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_IMAGES_DIR = os.path.join(SCRIPT_DIR, "images")
