@@ -1592,6 +1592,7 @@ def check_circuit_breaker(target, max_replies=2, window_seconds=300, lockout_sec
 
         blocked_until = CIRCUIT_BREAKER_BLOCKED_UNTIL.get(target, 0)
         if now < blocked_until:
+            log_v(f"[斷路器鎖定中]「{target}」仍在 30 分鐘防護鎖定內 (剩餘 {int(blocked_until - now)} 秒)，本次不回覆。")
             return False
         elif blocked_until > 0 and now >= blocked_until:
             CIRCUIT_BREAKER_BLOCKED_UNTIL.pop(target, None)
