@@ -2545,6 +2545,31 @@ def bind_channel_manually(name, hash_prefix, targets):
             disk_map["_provisional"].pop(ch, None)
     return True, f"已手動綁定: {ch[:8]}... <-> {canon}"
 
+def bind_channel_by_viewing(name, targets, seconds=30):
+    """
+    觀看綁定：使用者在 LINE 開啟該好友聊天室並點開任一張舊圖片，期間只有一個快取頻道有寫入時，
+    即視為該好友的頻道並綁定 (不需傳送或接收訊息)。Fail-Closed：0 個或多於 1 個頻道有寫入一律中止。
+    回傳 (成功與否, 訊息)。
+    """
+    cache_dir = get_active_line_cache_dir()
+    if not cache_dir or not os.path.isdir(cache_dir):
+        return False, "找不到 LINE 本機快取目錄。"
+    before = get_all_cache_files(cache_dir)
+    changed = set()
+    end = time.time() + seconds
+    while time.time() < end:
+        time.sleep(0.5)
+        cur = get_all_cache_files(cache_dir)
+        for p, meta in cur.items():
+            if before.get(p) != meta:
+                ch = extract_chat_hash_from_path(p)
+                if ch:
+                    changed.add(ch)
+        before = cur
+    if len(changed) != 1:
+        return False, f"觀察期間有 {len(changed)} 個頻道有快取寫入，必須剛好 1 個。請只開啟目標好友的聊天室並點開一張舊圖片後重試。"
+    return bind_channel_manually(name, next(iter(changed))[:8], targets)
+
 def init_unread_baselines(specific_targets=None):
     """啟動時先掃描所有 LINE 視窗目前的未讀數作為初始基準線，避免啟動時將歷史未讀訊息誤判為新訊息"""
     for hwnd, title, cls, vis in get_all_line_windows():
@@ -2567,6 +2592,7 @@ def main():
     parser.add_argument("--clear-history", action="store_true", help="清空已發送長輩圖的歷史記錄")
     parser.add_argument("--scan-windows", action="store_true", help="掃描並印出目前桌面所有的 LINE 視窗資訊")
     parser.add_argument("--unbind", metavar="NAME_OR_HASH", help="解除指定聯絡人或雜湊之頻道綁定記錄")
+    parser.add_argument("--bind-view", metavar="NAME", help="觀看綁定：開啟該好友聊天室並點開一張舊圖片，自動辨識並綁定頻道 (最簡單，不需傳送或接收訊息)")
     parser.add_argument("--bind", nargs=2, metavar=("NAME", "HASH_PREFIX"), help="手動綁定聯絡人與快取頻道資料夾 Hash 前綴 (不需傳送或接收訊息)")
     args = parser.parse_args()
 
@@ -2602,6 +2628,15 @@ def main():
         except Exception as e:
             log_v(f"解除綁定失敗: {e}")
             sys.exit(1)
+
+    if args.bind_view:
+        log_v(f"請在 LINE 開啟「{args.bind_view}」的聊天室，並點開任意一張舊圖片 (30 秒內，其他聊天室請勿操作)...")
+        try:
+            ok, msg = bind_channel_by_viewing(args.bind_view, load_config().get("targets", []))
+        except Exception as e:
+            ok, msg = False, f"觀看綁定失敗: {e}"
+        log_v(msg if ok else f"[綁定中止] {msg}")
+        sys.exit(0 if ok else 1)
 
     if args.bind:
         try:

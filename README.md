@@ -164,6 +164,9 @@ python auto_reply.py --clear-history
 # 9. 不傳送也不接收訊息的手動綁定 (名稱須已在 targets 內；Hash 前綴至少 8 碼，且只能對應 1 個快取資料夾)
 python auto_reply.py --bind "媽媽" db680a8a
 
+# 9-1. 最簡單的綁定：執行後 30 秒內，在 LINE 開啟該好友聊天室並點開任一張舊圖片 (其他聊天室請勿操作)，程式自動辨識並綁定
+python auto_reply.py --bind-view "媽媽"
+
 # 10. 解除綁定 (可用名稱或 Hash 前綴)
 python auto_reply.py --unbind "媽媽"
 ```

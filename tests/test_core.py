@@ -2981,5 +2981,43 @@ class TestLineGrandmaBotCore(unittest.TestCase):
         finally:
             auto_reply.get_active_line_cache_dir = orig
 
+    def test_bind_channel_by_viewing_requires_exactly_one_changed_channel(self):
+        cache = os.path.join(self.temp_dir.name, "view_cache")
+        h1 = "cccc1111" + "0" * 32
+        h2 = "dddd2222" + "0" * 32
+        for h in (h1, h2):
+            os.makedirs(os.path.join(cache, h, "m"))
+        p1 = os.path.join(cache, h1, "m", "x.eimg")
+        p2 = os.path.join(cache, h2, "m", "y.eimg")
+        snapshots = {"seq": []}
+        calls = {"n": 0}
+
+        def fake_files(_dir=None):
+            calls["n"] += 1
+            return snapshots["seq"][min(calls["n"] - 1, len(snapshots["seq"]) - 1)]
+
+        orig = (auto_reply.get_active_line_cache_dir, auto_reply.get_all_cache_files, auto_reply.time.sleep)
+        auto_reply.get_active_line_cache_dir = lambda: cache
+        auto_reply.get_all_cache_files = fake_files
+        auto_reply.time.sleep = lambda s: None
+        try:
+            targets = ["FriendA"]
+            # 無寫入：中止
+            snapshots["seq"] = [{}]
+            calls["n"] = 0
+            self.assertFalse(auto_reply.bind_channel_by_viewing("FriendA", targets, seconds=0.01)[0])
+            # 兩個頻道同時有寫入：中止且不綁定
+            snapshots["seq"] = [{}, {p1: (1, 1), p2: (1, 1)}]
+            calls["n"] = 0
+            self.assertFalse(auto_reply.bind_channel_by_viewing("FriendA", targets, seconds=0.01)[0])
+            self.assertEqual(auto_reply.load_chat_dirs_map(), {})
+            # 剛好一個頻道有寫入：綁定
+            snapshots["seq"] = [{}, {p1: (1, 1)}]
+            calls["n"] = 0
+            self.assertTrue(auto_reply.bind_channel_by_viewing("FriendA", targets, seconds=0.01)[0])
+            self.assertEqual(auto_reply.load_chat_dirs_map(), {h1: "FriendA"})
+        finally:
+            (auto_reply.get_active_line_cache_dir, auto_reply.get_all_cache_files, auto_reply.time.sleep) = orig
+
 if __name__ == '__main__':
     unittest.main()
