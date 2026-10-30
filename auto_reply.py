@@ -13,6 +13,7 @@ import os
 import json
 import time
 import random
+from datetime import datetime
 import glob
 import argparse
 import hashlib
@@ -34,7 +35,8 @@ import psutil
 from PIL import Image, ImageGrab
 import pyautogui
 
-from crawl_images import crawl_grandma_images, clean_expired_images, retire_image
+from crawl_images import (crawl_grandma_images, clean_expired_images, retire_image,
+                          download_and_validate_image, get_existing_md5s, build_candidate_urls)
 
 VERSION = "2.3.0"
 
@@ -96,6 +98,7 @@ def log_v(msg):
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
 HISTORY_PATH = os.path.join(SCRIPT_DIR, "contact_history.json")
+IMAGE_TAGS_PATH = os.path.join(SCRIPT_DIR, "image_tags.json")
 CHAT_MAP_PATH = os.path.join(SCRIPT_DIR, "chat_dirs.json")
 
 def atomic_save_json(file_path, data):
@@ -139,7 +142,8 @@ DEFAULT_CONFIG = {
     "image_ttl_days": 7,
     "min_image_pool": 10,
     "auto_crawl_images": True,
-    "close_window_after_send": True
+    "close_window_after_send": True,
+    "time_aware_images": True           # 依時段挑圖：早上不送晚安圖、晚上不送早安圖 (無時段字樣的祝福圖不受限)
 }
 
 last_reply_times = {}
@@ -157,7 +161,7 @@ def load_config():
         if not isinstance(cfg, dict):
             raise ValueError("config.json 格式錯誤：根節點必須是物件 (dict)")
 
-        # 嚴格 Schema 與型別校驗
+        # 嚴格 Schema 與型別驗證
         sanitized = DEFAULT_CONFIG.copy()
         if "targets" in cfg:
             if isinstance(cfg["targets"], list):
@@ -187,7 +191,7 @@ def load_config():
                     sanitized[k] = max(1, int(cfg[k]))
                 except Exception:
                     pass
-        for k in ("replace_after_send", "collect_incoming_images", "auto_crawl_images", "close_window_after_send"):
+        for k in ("replace_after_send", "collect_incoming_images", "auto_crawl_images", "close_window_after_send", "time_aware_images"):
             if k in cfg and isinstance(cfg[k], bool):
                 sanitized[k] = cfg[k]
         if "images_dir" in cfg and isinstance(cfg["images_dir"], str):
@@ -367,14 +371,10 @@ def get_images(images_dir, auto_replenish=True, min_pool=10):
 
     return images
 
-def is_authentic_grandma_image(image_path):
-    """
-    使用 Windows 內建 OCR 檢驗圖片是否為真正的長輩圖 (早安/平安/祝福/喜樂/問候等)。
-    若為寵物照、生活照、自拍、截圖等非長輩圖，則回傳 False 拒絕收納進長輩圖庫！
-    """
-    try:
-        abs_p = os.path.abspath(image_path)
-        ps_script = """
+def ocr_image_text(image_path):
+    """使用 Windows 內建 OCR 辨識圖片文字 (去除空白與換行)；失敗時擲出例外"""
+    abs_p = os.path.abspath(image_path)
+    ps_script = """
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding = [System.Text.Encoding]::UTF8
 [Windows.Globalization.Language, Windows.Foundation, ContentType = WindowsRuntime] | Out-Null
@@ -408,12 +408,19 @@ try {
     }
 } catch {}
 """
-        cmd = ["powershell", "-NoProfile", "-Command", ps_script]
-        ocr_env = os.environ.copy()
-        ocr_env["LGB_OCR_IMG"] = abs_p
-        proc = subprocess.run(cmd, capture_output=True, timeout=8, env=ocr_env)
-        raw_text = proc.stdout.decode("utf-8", errors="ignore").replace(" ", "").replace("\r", "").replace("\n", "")
+    cmd = ["powershell", "-NoProfile", "-Command", ps_script]
+    ocr_env = os.environ.copy()
+    ocr_env["LGB_OCR_IMG"] = abs_p
+    proc = subprocess.run(cmd, capture_output=True, timeout=8, env=ocr_env)
+    return proc.stdout.decode("utf-8", errors="ignore").replace(" ", "").replace("\r", "").replace("\n", "")
 
+def is_authentic_grandma_image(image_path):
+    """
+    使用 Windows 內建 OCR 檢驗圖片是否為真正的長輩圖 (早安/平安/祝福/喜樂/問候等)。
+    若為寵物照、生活照、自拍、截圖等非長輩圖，則回傳 False 拒絕收納進長輩圖庫！
+    """
+    try:
+        raw_text = ocr_image_text(image_path)
         keywords = [
             "早安", "晚安", "午安", "日安", "晨", "平安", "喜樂", "順心", "問候", "祝",
             "感恩", "幸福", "吉祥", "健康", "如意", "快樂", "笑口常開", "佛", "南無",
@@ -491,6 +498,187 @@ def harvest_line_incoming_images(images_dir, sender_name=None, max_rounds=100, s
 
     return harvested_filenames
 
+def current_time_slot(now=None):
+    """依本機時間回傳時段：morning (05-11 時)、noon (11-17 時)、evening (17-05 時)"""
+    hour = (now or datetime.now()).hour
+    if 5 <= hour < 11:
+        return "morning"
+    if 11 <= hour < 17:
+        return "noon"
+    return "evening"
+
+def _load_image_tags():
+    try:
+        with open(IMAGE_TAGS_PATH, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+        if isinstance(loaded, dict):
+            return loaded
+    except Exception:
+        pass
+    return {}
+
+def is_image_tagged(image_path):
+    """該圖的時段分類是否已快取 (查快取不需 OCR)"""
+    md5 = get_file_md5(image_path)
+    return bool(md5) and isinstance(_load_image_tags().get(md5), list)
+
+def classify_image_slots(image_path):
+    """
+    以 OCR 辨識圖片上的問候語，回傳其適用時段清單 (早安/早上好/晨 -> morning、午安/中午好 -> noon、
+    晚安/晚上好 -> evening)。回傳空清單代表無時段字樣 (任何時段皆可用)。
+    OCR 擲出例外或辨識不出任何文字 (可能是語言包缺失或解碼失敗) 時回傳 None：不快取、不採用 (Fail-Closed)。
+    結果以 MD5 快取於 image_tags.json，每張圖只辨識一次。
+    """
+    md5 = get_file_md5(image_path)
+    if not md5:
+        return None
+    tags = _load_image_tags()
+    cached = tags.get(md5)
+    if isinstance(cached, list):
+        return cached
+    try:
+        text = ocr_image_text(image_path)
+    except Exception:
+        return None
+    if not text:
+        return None
+    text = text.lower()
+    slots = []
+    if "早安" in text or "早上好" in text or "晨" in text or "goodmorning" in text:
+        slots.append("morning")
+    if "午安" in text or "中午好" in text or "下午好" in text or "goodafternoon" in text:
+        slots.append("noon")
+    if "晚安" in text or "晚上好" in text or "夜安" in text or "好夢" in text or "goodnight" in text or "goodevening" in text:
+        slots.append("evening")
+    tags[md5] = slots
+    atomic_save_json(IMAGE_TAGS_PATH, tags)
+    return slots
+
+def filter_images_by_time_slot(candidates, slot, max_ocr=8):
+    """
+    依時段挑圖：優先回傳適用目前時段的圖；沒有時改用無時段字樣的圖代替；兩者皆無回傳 None (Fail-Closed)。
+    隨機順序走訪，最多現場 OCR max_ocr 張未快取的圖。
+    """
+    pool = list(candidates)
+    random.shuffle(pool)
+    ocr_used = 0
+    neutral = None
+    for img in pool:
+        if not is_image_tagged(img):
+            ocr_used += 1
+        slots = classify_image_slots(img)
+        if slots is not None:
+            if slot in slots:
+                return img
+            if not slots and neutral is None:
+                neutral = img
+        if ocr_used >= max_ocr:
+            # OCR 額度用完：只繼續掃已快取的圖 (不需 OCR)，仍有機會找到符合時段的圖
+            for rest in pool[pool.index(img) + 1:]:
+                if not is_image_tagged(rest):
+                    continue
+                rest_slots = classify_image_slots(rest)
+                if rest_slots is not None:
+                    if slot in rest_slots:
+                        return rest
+                    if not rest_slots and neutral is None:
+                        neutral = rest
+            break
+    return neutral
+
+def countdown_sleep(total_seconds):
+    """倒數等待：剩餘時間每跨過 60 秒的倍數、以及 30/10 秒時印出一次，讓長時間等待時看得到進度"""
+    end = time.monotonic() + total_seconds
+    marks = {m for m in set(range(60, int(total_seconds) + 1, 60)) | {30, 10} if m < total_seconds}
+    announced = set()
+    while True:
+        remain = end - time.monotonic()
+        if remain <= 0:
+            break
+        due = [m for m in marks if remain <= m and m not in announced]
+        if due:
+            m = max(due)
+            announced.update(due)
+            label = f"{m // 60} 分 {m % 60} 秒" if m >= 60 else f"{m} 秒"
+            log_v(f" -> [倒數] 距離發送還有約 {label}")
+        time.sleep(min(1.0, remain))
+
+IMAGE_CATEGORIES = ("morning", "noon", "evening", "neutral")
+
+def image_category(image_path):
+    """圖庫分類：morning / noon / evening / neutral (無時段字樣)；OCR 失敗回傳 None"""
+    slots = classify_image_slots(image_path)
+    if slots is None:
+        return None
+    return slots[0] if slots else "neutral"
+
+def fill_image_pool(images_dir, total=30, max_attempts=250):
+    """
+    把圖庫補到 total 張，且早安、午安、晚安、無時段字樣四類平均分配 (30 張 = 8/8/7/7)。
+    既有圖片先分類計數 (超額者保留不刪)；再逐張下載，類別已滿的新圖立即丟棄。
+    回傳 {類別: 張數}。
+    """
+    abs_dir = images_dir if os.path.isabs(images_dir) else os.path.join(SCRIPT_DIR, images_dir)
+    os.makedirs(abs_dir, exist_ok=True)
+    base, extra = divmod(total, len(IMAGE_CATEGORIES))
+    quota = {c: base + (1 if i < extra else 0) for i, c in enumerate(IMAGE_CATEGORIES)}
+    counts = {c: 0 for c in IMAGE_CATEGORIES}
+    for img in _scan_images(abs_dir):
+        cat = image_category(img)
+        if cat:
+            counts[cat] += 1
+    log_v(f"[圖庫分配] 目前 {counts}，目標 {quota}")
+
+    existing_md5s = get_existing_md5s(abs_dir)
+    urls = build_candidate_urls()[:max_attempts]
+    split = int(len(urls) * 0.6)   # 前 60% 網址做分類配額，後 40% 留給補足階段 (兩階段不重複抓同一網址)
+    fails = 0
+    for url in urls[:split]:
+        if all(counts[c] >= quota[c] for c in IMAGE_CATEGORIES):
+            break
+        if fails >= 10:
+            log_v("[網路保護] 連續下載失敗 10 次，停止補圖。")
+            break
+        saved = download_and_validate_image(url, abs_dir, existing_md5s)
+        if not saved:
+            fails += 1
+            continue
+        fails = 0
+        cat = image_category(saved)
+        if cat is None or counts[cat] >= quota[cat]:
+            try:
+                os.remove(saved)
+            except Exception:
+                pass
+            continue
+        counts[cat] += 1
+        log_v(f" -> [圖庫分配] 收納 {os.path.basename(saved)} 為「{cat}」類 ({counts[cat]}/{quota[cat]})")
+    # 來源圖庫的午安、晚安圖稀少：缺額改以無時段字樣的圖補足總數 (挑圖時亦以無時段圖代替)
+    if sum(counts.values()) < total:
+        log_v("[圖庫分配] 午安/晚安圖來源不足，改以無時段字樣的圖補足總數...")
+        fails = 0
+        for url in urls[split:]:
+            if sum(counts.values()) >= total or fails >= 10:
+                break
+            saved = download_and_validate_image(url, abs_dir, existing_md5s)
+            if not saved:
+                fails += 1
+                continue
+            fails = 0
+            if image_category(saved) == "neutral":
+                counts["neutral"] += 1
+                log_v(f" -> [圖庫分配] 補足收納 {os.path.basename(saved)} 為「neutral」類 (共 {sum(counts.values())}/{total})")
+            else:
+                try:
+                    os.remove(saved)
+                except Exception:
+                    pass
+    if sum(counts.values()) >= total:
+        log_v(f"[圖庫分配] 完成，圖庫已達 {total} 張: {counts}")
+    else:
+        log_v(f"[圖庫分配] 嘗試次數用盡，目前 {sum(counts.values())}/{total} 張: {counts}，可稍後再執行一次。")
+    return counts
+
 def pick_unique_image(images, target_name, config):
     """
     從圖庫中隨機挑選一張合格且百輪不重複的長輩圖：
@@ -538,11 +726,18 @@ def pick_unique_image(images, target_name, config):
             return None
 
 
+    if config.get("time_aware_images", False):
+        slot = current_time_slot()
+        selected = filter_images_by_time_slot(candidates, slot)
+        if selected is None:
+            log_v(f"[時段保護] 找不到適合目前時段 ({slot}) 或無時段字樣的長輩圖，為避免送錯問候語，本次不發送。")
+        return selected
+
     selected = random.choice(candidates)
     return selected
 
 def copy_image_to_clipboard(image_path):
-    """使用 Win32 原生 API 將圖片以 CF_DIB (標準設備無關點陣圖) 注入剪貼簿，確保 LINE 100% 識別為真實圖片檔案而非文字"""
+    """使用 Win32 原生 API 將圖片以 CF_DIB (標準設備無關點陣圖) 注入剪貼簿，確保 LINE 100% 辨識為真實圖片檔案而非文字"""
     abs_path = os.path.abspath(image_path)
     try:
         with Image.open(abs_path) as img:
@@ -965,7 +1160,7 @@ def get_active_line_cache_dir():
         return cache_base
     subdirs.sort(key=lambda x: x[0], reverse=True)
     newest_dir = subdirs[0][1]
-    # 智慧識別：檢查是否為雙層結構 (目錄內是否還有 40 字元的子目錄)
+    # 智慧辨識：檢查是否為雙層結構 (目錄內是否還有 40 字元的子目錄)
     has_nested_hash = False
     try:
         for sub in os.listdir(newest_dir):
@@ -1165,7 +1360,7 @@ def get_chat_window_details(hwnd):
 
 def get_chat_latest_media_info(hwnd):
     """
-    透過 UIA 檢測目標視窗最末項目中的多媒體元素 (ImageControl) 與物理方向 (高度嚴重核心防禦)：
+    透過 UIA 偵測目標視窗最末項目中的多媒體元素 (ImageControl) 與實體位置方向 (高度嚴重核心防禦)：
     1. 支援 Per-Monitor 高 DPI 動態縮放門檻 (int(80 * scale))，徹底排除 36x36 / 40x40 之好友大頭貼
     2. 深度遞迴 (depth <= 3) 穿透 Qt 巢狀 Pane 尋找真實 ImageControl
     3. 量測邊距：(ir.left - vr.left) < (vr.right - ir.right) 或 left_margin <= 75*scale，寬圖與窄視窗皆精準判別
@@ -1227,7 +1422,7 @@ def get_chat_latest_media_info(hwnd):
                         left_margin = ir.left - vr.left
                         right_margin = vr.right - ir.right
 
-                        # 判定物理方向：
+                        # 判定實體位置方向：
                         # 依實體 LINE PC (Qt6) 視窗量測：
                         # 1. 對方傳入 (Incoming)：左側有好友頭像 (36~40px) 與邊距，ImageControl 靠左 (left_margin 約 50~75px * scale)。
                         # 2. 本機送出 (Outgoing)：右側貼近視窗邊界 (右邊距約 15~35px * scale，無大頭貼)。
@@ -1261,7 +1456,7 @@ def is_chat_latest_message_incoming(hwnd):
     return is_incoming
 
 def update_target_window_fingerprints(targets):
-    """在主監控迴圈持續輪詢目標視窗指紋，記錄異動時間戳並自適應更新縮圖渲染狀態 (防延遲載入盲點)"""
+    """在主監控迴圈持續輪詢目標視窗指紋，記錄異動時間戳並自動調整更新縮圖渲染狀態 (防延遲載入盲點)"""
     now = time.time()
     for t in targets:
         wins = find_target_chat_window(t)
@@ -1340,19 +1535,19 @@ def update_target_window_fingerprints(targets):
             _TARGET_WINDOW_STATE.pop(t, None)
 
 def init_target_window_fingerprints(specific_targets=None):
-    """初始化監控目標視窗指紋，用於高置信度自動學習綁定"""
+    """初始化監控目標視窗指紋，用於高可信度自動學習綁定"""
     targets = specific_targets or []
     update_target_window_fingerprints(targets)
 
 def try_auto_bind_channel(ch, cand_path, cand_m, targets, chat_dirs_map, competing_unknown_count=1):
     """
-    對未知快取頻道進行高置信度自動學習綁定：
-    1. 必須有且僅有 1 位目標好友視窗在線
+    對未知快取頻道進行高可信度自動學習綁定：
+    1. 必須有且僅有 1 位目標好友視窗上線
     2. 該視窗必須通過 UIA 1:1 核驗
     3. 近 15 秒滑動視窗不可有 2 個以上不同之未知頻道同時活動 (中度 #1 並行滑動視窗防禦)
     4. 該視窗近期必須剛發生未消費之內容指紋異動 (杜絕拿舊歷史誤認他人頻道)
     5. 快取檔案寫入時間 (cand_m) 與視窗異動時間 (changed_at) 差距在容許範圍內 (-6.0s ~ +6.0s)
-    6. 該視窗最末訊息必須為真實照片/貼圖 (高 DPI 動態門檻，排除純文字與大頭貼，延遲載入自適應重測)
+    6. 該視窗最末訊息必須為真實照片/貼圖 (高 DPI 動態門檻，排除純文字與大頭貼，延遲載入自動調整重測)
     7. 該視窗最末照片必須為對方傳入 (量測 ImageControl 左右邊距，寬圖亦精準判定，完全不搶焦點)
     8. 持久化寫入成功後才標記已消費，寫入失敗立即撤銷
     """
@@ -1370,7 +1565,7 @@ def try_auto_bind_channel(ch, cand_path, cand_m, targets, chat_dirs_map, competi
             candidate_targets.append((t, wins[0][0]))
 
     if len(candidate_targets) != 1:
-        # 若無在線目標或有多個在線目標在線，無法唯一判定歸屬，安全隔離拒絕盲目自動綁定
+        # 若無上線目標或有多個上線目標上線，無法唯一判定歸屬，安全隔離拒絕盲目自動綁定
         return None
 
     target_name, hwnd = candidate_targets[0]
@@ -1430,7 +1625,7 @@ def try_auto_bind_channel(ch, cand_path, cand_m, targets, chat_dirs_map, competi
                 log_v(f"[安全隔離] 快取頻道「{ch[:8]}...」寫入時間 ({cand_m:.1f}) 與圖片出現時間 ({ref_media_t:.1f}) 差距超標，拒絕自動綁定！")
                 return None
 
-    # 3. 媒體類型與物理方向核驗 (快照若因延遲載入為 False，在綁定前即時重測一次)：
+    # 3. 媒體類型與實體位置方向核驗 (快照若因延遲載入為 False，在綁定前即時重測一次)：
     has_media = state.get("has_media")
     is_incoming = state.get("is_incoming")
     if not has_media:
@@ -1629,7 +1824,7 @@ def record_reply_sent(target):
 
 def is_last_message_from_self_in_chat(chat_hwnd):
     """
-    物理方向判定 (Fail-Closed)：檢查目標聊天視窗最底部訊息是否位於右側 (本機送出)。
+    實體位置方向判定 (Fail-Closed)：檢查目標聊天視窗最底部訊息是否位於右側 (本機送出)。
     - 若視窗最小化、不可見、或非前景視窗，一律回傳 True (安全攔截，不回覆)。
     - 支援 Windows DWM 精確邊界與動態 DPI 縮放。
     - 雙欄模式以固定側欄寬度 (~320px * scale) 嚴格隔離左側聯絡人清單。
@@ -1732,7 +1927,7 @@ def is_last_message_from_self_in_chat(chat_hwnd):
 
         # 若左右兩側底部垂直高度接近 (abs(diff) <= 25，例如本機訊息泡泡與左側時間標籤，或桌布紋理)，遵循 Fail-Closed 視為自己發送
         if latest_left_y != -1 and latest_right_y != -1 and abs(latest_left_y - latest_right_y) <= 25:
-            log_v(f"[物理方向安全攔截] 左右兩側底部高度接近 (L:{latest_left_y}, R:{latest_right_y})，判定為本機送出訊息或裝飾線，安全攔截！")
+            log_v(f"[實體位置方向安全攔截] 左右兩側底部高度接近 (L:{latest_left_y}, R:{latest_right_y})，判定為本機送出訊息或裝飾線，安全攔截！")
             return True
 
         # 若右側留白 (latest_right_y == -1) 或左側內容比右側更靠近底部 25px 以上，判定為對方送出
@@ -1742,7 +1937,7 @@ def is_last_message_from_self_in_chat(chat_hwnd):
         # 最底部內容出現在右側，左側留白，判定為自己發送
         return True
     except Exception as e:
-        log_v(f"[警告] 物理方向校驗發生例外: {e}，遵循 Fail-Closed 原則視為自己發送以確保安全！")
+        log_v(f"[警告] 實體位置方向核驗發生例外: {e}，遵循 Fail-Closed 原則視為自己發送以確保安全！")
         return True
 
 def get_chat_history_image(chat_hwnd):
@@ -1897,7 +2092,19 @@ def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_f
     max_d = max(min_d, config.get("max_delay_seconds", 900))
     delay = random.randint(min_d, max_d)
     log_v(f" -> 為了模擬真人自然反應，本次隨機等待 {delay} 秒後發送...")
-    time.sleep(delay)
+    countdown_sleep(delay)
+
+    # 等待期間時段可能已跨越 (例如 10:55 挑早安圖、11:10 才送出)：送出前重驗，不符則重新挑圖
+    if config.get("time_aware_images", False):
+        new_slot = current_time_slot()
+        picked_slots = classify_image_slots(selected_image)
+        if picked_slots is None or (picked_slots and new_slot not in picked_slots):
+            log_v(f" -> [時段重驗] 等待後時段已變為 {new_slot}，原圖不再適用，重新挑選...")
+            selected_image = pick_unique_image(images, target_name, config)
+            if not selected_image:
+                log_v("⚠️ [時段保護] 重新挑選後仍無合適長輩圖，安全終止本次發送。")
+                return "NOT_SENT"
+            log_v(f" -> [時段重驗] 改選圖片: {os.path.basename(selected_image)}")
 
     # 尋找現有聊天視窗 (嚴格 Fail-Closed，絕不盲目模擬搜尋或開啟其他視窗)
     matched = find_target_chat_window(target_name)
@@ -1937,7 +2144,7 @@ def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_f
         _minimize_if_configured(chat_hwnd, config)
         return "NOT_SENT"
 
-    # 物理方向校驗 (Fail-Closed)：在貼上圖片發送前核驗聊天室最後一則訊息
+    # 實體位置方向核驗 (Fail-Closed)：在貼上圖片發送前核驗聊天室最後一則訊息
     if is_last_message_from_self_in_chat(chat_hwnd):
         log_v(f"[防自循環保護]「{target_name}」視窗內最後訊息位於右側（本機送出），安全攔截絕不發送！")
         _minimize_if_configured(chat_hwnd, config)
@@ -2028,7 +2235,7 @@ def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_f
         accounting_done = True
 
         if new_count > 0:
-            log_v(f" -> [差集快照] 成功識別 {new_count} 個本機發送快取檔案，加入黑名單！")
+            log_v(f" -> [差集快照] 成功辨識 {new_count} 個本機發送快取檔案，加入黑名單！")
 
         # 安全最小化 (避免維持在前景導致後續持續秒已讀)
         if config.get("close_window_after_send", True):
@@ -2087,7 +2294,7 @@ def check_for_incoming_messages(config):
     1. 視窗標題正規表達式未讀檢查 (嚴格比對字尾括號數字，如 (1) 或 （2）)，排除群組名稱誤判。
     2. 5 秒發送防抖保護與實體快取差集黑名單過濾。
     3. 斷路器保護 (Circuit Breaker)：5 分鐘內同對象最多回覆 2 次，超標啟動 30 分鐘退避鎖定。
-    4. 物理方向校驗 (Fail-Closed)：對話框最後一則在右側或不可見時絕不發送。
+    4. 實體位置方向核驗 (Fail-Closed)：對話框最後一則在右側或不可見時絕不發送。
     """
     global last_seen_cache_mtime, last_global_reply_time, PROCESSED_CACHE_FILES
     new_image_found = None
@@ -2387,7 +2594,7 @@ def check_for_incoming_messages(config):
                     if cand_target and cand_target in targets:
                         matched = find_target_chat_window(cand_target)
                         if matched:
-                            # 電腦版獨立視窗標題正常為好友名稱 (不帶括號未讀數)，視窗在線即刻確認
+                            # 電腦版獨立視窗標題正常為好友名稱 (不帶括號未讀數)，視窗上線即刻確認
                             chosen_candidate = cand_path
                             chosen_target = cand_target
                             PROCESSED_CACHE_FILES.add((cand_path, cand_m))
@@ -2545,17 +2752,26 @@ def bind_channel_manually(name, hash_prefix, targets):
             disk_map["_provisional"].pop(ch, None)
     return True, f"已手動綁定: {ch[:8]}... <-> {canon}"
 
+def foreground_window_title():
+    """目前前景視窗標題 (取不到回傳空字串)"""
+    try:
+        return win32gui.GetWindowText(win32gui.GetForegroundWindow()) or ""
+    except Exception:
+        return ""
+
 def bind_channel_by_viewing(name, targets, seconds=30):
     """
     觀看綁定：使用者在 LINE 開啟該好友聊天室並點開任一張舊圖片，期間只有一個快取頻道有寫入時，
-    即視為該好友的頻道並綁定 (不需傳送或接收訊息)。Fail-Closed：0 個或多於 1 個頻道有寫入一律中止。
-    回傳 (成功與否, 訊息)。
+    即視為該好友的頻道並綁定 (不需傳送或接收訊息)。
+    Fail-Closed：0 個或多於 1 個頻道有寫入一律中止；快取寫入的當下，前景視窗標題必須等於目標名稱
+    (排除群組與其他聊天室背景自動下載縮圖造成的誤綁)，否則中止。回傳 (成功與否, 訊息)。
     """
     cache_dir = get_active_line_cache_dir()
     if not cache_dir or not os.path.isdir(cache_dir):
         return False, "找不到 LINE 本機快取目錄。"
     before = get_all_cache_files(cache_dir)
     changed = set()
+    unverified = False
     end = time.time() + seconds
     while time.time() < end:
         time.sleep(0.5)
@@ -2565,10 +2781,14 @@ def bind_channel_by_viewing(name, targets, seconds=30):
                 ch = extract_chat_hash_from_path(p)
                 if ch:
                     changed.add(ch)
+                    if foreground_window_title().strip().lower() != name.strip().lower():
+                        unverified = True
         before = cur
+    if unverified:
+        return False, f"快取寫入當下，前景視窗不是「{name}」的聊天室，無法確認頻道歸屬，已中止。請把該聊天室放在最上層後重試。"
     if len(changed) != 1:
         return False, f"觀察期間有 {len(changed)} 個頻道有快取寫入，必須剛好 1 個。請只開啟目標好友的聊天室並點開一張舊圖片後重試。"
-    return bind_channel_manually(name, next(iter(changed))[:8], targets)
+    return bind_channel_manually(name, next(iter(changed)), targets)
 
 def init_unread_baselines(specific_targets=None):
     """啟動時先掃描所有 LINE 視窗目前的未讀數作為初始基準線，避免啟動時將歷史未讀訊息誤判為新訊息"""
@@ -2587,6 +2807,7 @@ def main():
     parser.add_argument("-v", "--version", action="version", version=f"LINE Grandma Bot v{VERSION}")
     parser.add_argument("--test", metavar="NAME", help="手動測試發送一次給指定對象 (例如: --test 媽媽)")
     parser.add_argument("--calibrate", metavar="NAME", help="校準指定聯絡人的快取頻道 (例如: --calibrate 媽媽)")
+    parser.add_argument("--fill-pool", nargs="?", const=30, type=int, metavar="TOTAL", help="把圖庫補到指定張數 (預設 30)，早安、午安、晚安、無時段字樣四類平均分配")
     parser.add_argument("--crawl", type=int, metavar="COUNT", help="立刻上網抓取指定數量的長輩圖儲存備用 (例如: --crawl 20)")
     parser.add_argument("--list-images", action="store_true", help="列出目前讀取到的長輩圖清單")
     parser.add_argument("--clear-history", action="store_true", help="清空已發送長輩圖的歷史記錄")
@@ -2666,6 +2887,10 @@ def main():
         log_v("所有聯絡人之百輪發送紀錄與應急複本已徹底重置。")
         return
 
+    if args.fill_pool is not None:
+        fill_image_pool(config.get("images_dir", "images"), total=max(1, args.fill_pool))
+        return
+
     if args.crawl:
         count = args.crawl
         target_dir = os.path.join(SCRIPT_DIR, config.get("images_dir", "images"))
@@ -2728,7 +2953,7 @@ def main():
             fg_start = win32gui.GetForegroundWindow()
             current_f = get_all_cache_files(active_c)
             fg_end = win32gui.GetForegroundWindow()
-            # 增量連續焦點核驗：只有輪詢起點與終點均持續處於目標視窗前景焦點時，才給予雙重置信認可
+            # 增量連續焦點核驗：只有輪詢起點與終點均持續處於目標視窗前景焦點時，才給予雙重確認
             continuous_target_fg = (fg_start in target_hwnds and fg_end in target_hwnds)
             for p, meta in current_f.items():
                 if p not in prev_f or prev_f[p] != meta:

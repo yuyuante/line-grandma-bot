@@ -63,7 +63,7 @@ class TestLineGrandmaBotCore(unittest.TestCase):
             pass
 
     def test_config_validation(self):
-        # 1. 測試預設配置
+        # 1. 測試預設設定
         cfg = auto_reply.load_config()
         self.assertIsInstance(cfg["targets"], list)
         self.assertIn("trigger_mode", cfg)
@@ -380,7 +380,7 @@ class TestLineGrandmaBotCore(unittest.TestCase):
             win32gui.GetWindowText = orig_title
 
     def test_is_likely_photo_sticker_rejection(self):
-        # 測試 is_likely_photo 準確識別合規相機照片 (>512x512, RGB, >=50KB)，並排除小尺寸 JPEG 貼圖與透明貼圖
+        # 測試 is_likely_photo 準確辨識合規相機照片 (>512x512, RGB, >=50KB)，並排除小尺寸 JPEG 貼圖與透明貼圖
         from PIL import Image
 
         # 1. 建立真實合格大尺寸 JPEG 相片 (> 512x512, RGB, >= 50KB)
@@ -594,7 +594,7 @@ class TestLineGrandmaBotCore(unittest.TestCase):
             auto_reply.get_all_line_windows = orig_get_all
 
     def test_zero_config_auto_bind_single_target_success(self):
-        # 測試 try_auto_bind_channel 正常正向綁定 (目標在線、UIA 核驗通過、視窗指紋有新異動且未消費、時間戳吻合、最新訊息非本機送出)
+        # 測試 try_auto_bind_channel 正常正向綁定 (目標上線、UIA 核驗通過、視窗指紋有新異動且未消費、時間戳吻合、最新訊息非本機送出)
         fake_hash = "67fa03ef1234567890abcdef1234567890abcdef"
         fake_path = os.path.join(self.temp_dir.name, "mo", fake_hash, "test.eimg")
         now = time.time()
@@ -785,7 +785,7 @@ class TestLineGrandmaBotCore(unittest.TestCase):
             auto_reply._TARGET_WINDOW_STATE.pop("TargetB", None)
 
     def test_try_auto_bind_channel_reject_if_multiple_targets_active(self):
-        # 負向測試：多目標視窗同時在線時，無法唯一判定歸屬，安全拒絕自動綁定
+        # 負向測試：多目標視窗同時上線時，無法唯一判定歸屬，安全拒絕自動綁定
         fake_hash = "222203ef1234567890abcdef1234567890abcdef"
         fake_path = os.path.join(self.temp_dir.name, "mo", fake_hash, "test.eimg")
 
@@ -1015,7 +1015,7 @@ class TestLineGrandmaBotCore(unittest.TestCase):
             auto_reply.get_chat_window_fingerprint = lambda h: "10_fp_initial"
             auto_reply._fetch_chat_window_items_info = lambda h: (auto_reply.get_chat_window_fingerprint(h), "", "")
 
-            # 1. 視窗在線 -> 建立初始基準
+            # 1. 視窗上線 -> 建立初始基準
             auto_reply.update_target_window_fingerprints(["TargetReopen"])
             self.assertIn("TargetReopen", auto_reply._TARGET_WINDOW_STATE)
             self.assertEqual(auto_reply._TARGET_WINDOW_STATE["TargetReopen"]["changed_at"], 0.0)
@@ -1483,7 +1483,7 @@ class TestLineGrandmaBotCore(unittest.TestCase):
             auto_reply._TARGET_WINDOW_STATE.pop("TargetSnap", None)
 
     def test_delayed_rendering_adaptive_retry_success(self):
-        # 測試 🔴 核心修復：縮圖延遲載入 (初次異動時 ImageControl 尚未出現)，在重測或綁定前完成渲染時自適應放行
+        # 測試 🔴 核心修復：縮圖延遲載入 (初次異動時 ImageControl 尚未出現)，在重測或綁定前完成渲染時自動調整放行
         fake_hash = "dddd03ef1234567890abcdef1234567890abcdef"
         fake_path = os.path.join(self.temp_dir.name, "mo", fake_hash, "test.eimg")
         now = time.time()
@@ -1917,7 +1917,7 @@ class TestLineGrandmaBotCore(unittest.TestCase):
             self.assertEqual(st1["prev_name"], "Initial")
 
             # 2. 10 秒後新圖片訊息抵達 (由於飽和，項目數依然為 10，但最末為 "ImgMsg"，次末為 "TextMsg")
-            # 次末項 "TextMsg" != 之前的次末項 "Initial" -> 成功識別為新訊息而非縮圖安定化！
+            # 次末項 "TextMsg" != 之前的次末項 "Initial" -> 成功辨識為新訊息而非縮圖安定化！
             auto_reply.time.time = lambda: t0 + 10.0
             auto_reply._fetch_chat_window_items_info = lambda h: ("10_img_hash2", "ImgMsg", "TextMsg")
             auto_reply.get_chat_latest_media_info = lambda h: (True, True)
@@ -2411,7 +2411,7 @@ class TestLineGrandmaBotCore(unittest.TestCase):
         orig_find = auto_reply.find_target_chat_window
         try:
             auto_reply.get_active_line_cache_dir = lambda: test_cache
-            # 目標視窗在線，但指紋未改變 (未有新傳入圖片)
+            # 目標視窗上線，但指紋未改變 (未有新傳入圖片)
             auto_reply.find_target_chat_window = lambda t: [(9993, t, "ChatWnd", True)] if t == "TargetGrad" else []
             auto_reply.get_chat_window_fingerprint = lambda h: "1_fp"
 
@@ -2944,7 +2944,7 @@ class TestLineGrandmaBotCore(unittest.TestCase):
         self.assertEqual([n for n in os.listdir(self.temp_dir.name) if n.startswith("tmp")], [])
 
     def test_extract_chat_hash_ignores_account_level_tmp_files(self):
-        # Cache\<account>	mp\messageImage_*.jpg 只含帳號層 Hash，不得被當成對話頻道
+        # Cache\<account>\tmp\messageImage_*.jpg 只含帳號層 Hash，不得被當成對話頻道
         base = os.path.expandvars(r"%LOCALAPPDATA%\LINE\Cache")
         acct = "b1acf4e02644042b1e22811631a6735b34cd15af"
         chat = "67fa03ef897657d0c21b02ceec0a55fa9c65ef56"
@@ -2996,10 +2996,12 @@ class TestLineGrandmaBotCore(unittest.TestCase):
             calls["n"] += 1
             return snapshots["seq"][min(calls["n"] - 1, len(snapshots["seq"]) - 1)]
 
-        orig = (auto_reply.get_active_line_cache_dir, auto_reply.get_all_cache_files, auto_reply.time.sleep)
+        orig = (auto_reply.get_active_line_cache_dir, auto_reply.get_all_cache_files,
+                auto_reply.time.sleep, auto_reply.foreground_window_title)
         auto_reply.get_active_line_cache_dir = lambda: cache
         auto_reply.get_all_cache_files = fake_files
         auto_reply.time.sleep = lambda s: None
+        auto_reply.foreground_window_title = lambda: "FriendA"
         try:
             targets = ["FriendA"]
             # 無寫入：中止
@@ -3011,13 +3013,148 @@ class TestLineGrandmaBotCore(unittest.TestCase):
             calls["n"] = 0
             self.assertFalse(auto_reply.bind_channel_by_viewing("FriendA", targets, seconds=0.01)[0])
             self.assertEqual(auto_reply.load_chat_dirs_map(), {})
-            # 剛好一個頻道有寫入：綁定
+            # 寫入當下前景視窗不是目標聊天室 (例如群組背景下載縮圖)：中止且不綁定
+            auto_reply.foreground_window_title = lambda: "SomeGroup"
+            snapshots["seq"] = [{}, {p1: (1, 1)}]
+            calls["n"] = 0
+            self.assertFalse(auto_reply.bind_channel_by_viewing("FriendA", targets, seconds=0.01)[0])
+            self.assertEqual(auto_reply.load_chat_dirs_map(), {})
+            auto_reply.foreground_window_title = lambda: "friendA"
+            # 剛好一個頻道有寫入且前景正確：綁定
             snapshots["seq"] = [{}, {p1: (1, 1)}]
             calls["n"] = 0
             self.assertTrue(auto_reply.bind_channel_by_viewing("FriendA", targets, seconds=0.01)[0])
             self.assertEqual(auto_reply.load_chat_dirs_map(), {h1: "FriendA"})
         finally:
-            (auto_reply.get_active_line_cache_dir, auto_reply.get_all_cache_files, auto_reply.time.sleep) = orig
+            (auto_reply.get_active_line_cache_dir, auto_reply.get_all_cache_files,
+             auto_reply.time.sleep, auto_reply.foreground_window_title) = orig
+
+    def test_current_time_slot_boundaries(self):
+        from datetime import datetime as dt
+        slot = auto_reply.current_time_slot
+        self.assertEqual(slot(dt(2026, 1, 1, 4, 59)), "evening")
+        self.assertEqual(slot(dt(2026, 1, 1, 5, 0)), "morning")
+        self.assertEqual(slot(dt(2026, 1, 1, 10, 59)), "morning")
+        self.assertEqual(slot(dt(2026, 1, 1, 11, 0)), "noon")
+        self.assertEqual(slot(dt(2026, 1, 1, 17, 0)), "evening")
+
+    def test_time_aware_pick_filters_by_slot_and_caches_ocr(self):
+        imgs = {}
+        for name, text in (("m", "早安"), ("e", "晚安"), ("n", "祝福"), ("fail", None), ("empty", "")):
+            path = os.path.join(self.temp_dir.name, f"slot_{name}.jpg")
+            with open(path, "wb") as f:
+                f.write(name.encode() * 10)
+            imgs[name] = (path, text)
+        by_path = {p: t for p, t in imgs.values()}
+        calls = []
+
+        def fake_ocr(path):
+            calls.append(path)
+            t = by_path[path]
+            if t is None:
+                raise RuntimeError("ocr fail")
+            return t
+
+        orig = (auto_reply.ocr_image_text, auto_reply.IMAGE_TAGS_PATH)
+        auto_reply.ocr_image_text = fake_ocr
+        auto_reply.IMAGE_TAGS_PATH = os.path.join(self.temp_dir.name, "image_tags.json")
+        try:
+            paths = [p for p, _ in imgs.values()]
+            for _ in range(20):
+                pick = auto_reply.filter_images_by_time_slot(paths, "morning")
+                self.assertEqual(pick, imgs["m"][0])
+                pick = auto_reply.filter_images_by_time_slot(paths, "evening")
+                self.assertEqual(pick, imgs["e"][0])
+            # OCR 失敗的圖不快取也不採用；只有它時回傳 None
+            self.assertIsNone(auto_reply.filter_images_by_time_slot([imgs["fail"][0]], "morning"))
+            # OCR 辨識不出文字 (空字串)：視為失敗，不快取、不採用
+            self.assertIsNone(auto_reply.filter_images_by_time_slot([imgs["empty"][0]], "morning"))
+            self.assertFalse(auto_reply.is_image_tagged(imgs["empty"][0]))
+            # 只剩不符時段的圖：Fail-Closed 回傳 None
+            self.assertIsNone(auto_reply.filter_images_by_time_slot([imgs["e"][0]], "morning"))
+            # 沒有該時段的圖時，改用無時段字樣的圖代替
+            self.assertEqual(auto_reply.filter_images_by_time_slot([imgs["e"][0], imgs["n"][0]], "noon"), imgs["n"][0])
+            # 成功的圖各只辨識一次
+            self.assertEqual(len([c for c in calls if c == imgs["m"][0]]), 1)
+        finally:
+            auto_reply.ocr_image_text, auto_reply.IMAGE_TAGS_PATH = orig
+
+    def test_countdown_sleep_logs_marks_without_initial_spam(self):
+        clock = {"t": 1000.0}
+        logs = []
+        orig = (auto_reply.time.monotonic, auto_reply.time.sleep, auto_reply.log_v)
+        auto_reply.time.monotonic = lambda: clock["t"]
+        auto_reply.time.sleep = lambda s: clock.__setitem__("t", clock["t"] + s)
+        auto_reply.log_v = lambda m, *a, **k: logs.append(m)
+        try:
+            auto_reply.countdown_sleep(100)
+        finally:
+            auto_reply.time.monotonic, auto_reply.time.sleep, auto_reply.log_v = orig
+        text = " ".join(logs)
+        self.assertIn("1 分 0 秒", text)
+        self.assertIn("30 秒", text)
+        self.assertIn("10 秒", text)
+        self.assertNotIn("2 分", text)
+
+    def test_fill_image_pool_balances_categories(self):
+        d = os.path.join(self.temp_dir.name, "pool")
+        os.makedirs(d)
+        cats = ["morning", "noon", "evening", "neutral"]
+        state = {"n": 0}
+
+        def fake_download(url, save_dir, md5s):
+            state["n"] += 1
+            path = os.path.join(save_dir, f"grandma_{state['n']}.jpg")
+            with open(path, "wb") as f:
+                f.write(b"x")
+            return path
+
+        orig = (auto_reply.download_and_validate_image, auto_reply.get_existing_md5s,
+                auto_reply.build_candidate_urls, auto_reply.image_category)
+        order = {"i": 0}
+
+        def fake_category(path):
+            c = cats[order["i"] % 4] if state["n"] else None
+            order["i"] += 1
+            return c
+
+        auto_reply.download_and_validate_image = fake_download
+        auto_reply.get_existing_md5s = lambda _d: set()
+        auto_reply.build_candidate_urls = lambda: ["u"] * 200
+        auto_reply.image_category = fake_category
+        try:
+            counts = auto_reply.fill_image_pool(d, total=30, max_attempts=200)
+        finally:
+            (auto_reply.download_and_validate_image, auto_reply.get_existing_md5s,
+             auto_reply.build_candidate_urls, auto_reply.image_category) = orig
+        self.assertEqual(counts, {"morning": 8, "noon": 8, "evening": 7, "neutral": 7})
+        self.assertEqual(len(os.listdir(d)), 30)
+
+    def test_fill_image_pool_second_phase_tops_up_with_neutral(self):
+        d = os.path.join(self.temp_dir.name, "pool2")
+        os.makedirs(d)
+        state = {"n": 0}
+
+        def fake_download(url, save_dir, md5s):
+            state["n"] += 1
+            path = os.path.join(save_dir, f"grandma_{state['n']}.jpg")
+            with open(path, "wb") as f:
+                f.write(b"x")
+            return path
+
+        orig = (auto_reply.download_and_validate_image, auto_reply.get_existing_md5s,
+                auto_reply.build_candidate_urls, auto_reply.image_category)
+        auto_reply.download_and_validate_image = fake_download
+        auto_reply.get_existing_md5s = lambda _d: set()
+        auto_reply.build_candidate_urls = lambda: ["u"] * 200
+        auto_reply.image_category = lambda p: "neutral"   # 來源只有無時段圖
+        try:
+            counts = auto_reply.fill_image_pool(d, total=30, max_attempts=200)
+        finally:
+            (auto_reply.download_and_validate_image, auto_reply.get_existing_md5s,
+             auto_reply.build_candidate_urls, auto_reply.image_category) = orig
+        self.assertEqual(counts["neutral"], 30)
+        self.assertEqual(len([f for f in os.listdir(d)]), 30)
 
 if __name__ == '__main__':
     unittest.main()

@@ -14,5 +14,6 @@
   "image_ttl_days": 7,
   "min_image_pool": 10,
   "auto_crawl_images": true,
-  "close_window_after_send": true
+  "close_window_after_send": true,
+  "time_aware_images": true
 }

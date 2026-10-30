@@ -138,6 +138,17 @@ def download_and_validate_image(url, save_dir, existing_md5s):
                 pass
         return None
 
+def build_candidate_urls():
+    """隨機混合攝影類 (1~750) 與插畫類 (30~245) 長輩圖候選網址"""
+    photo_ids = list(range(100, 750))
+    random.shuffle(photo_ids)
+    illust_ids = list(range(30, 245))
+    random.shuffle(illust_ids)
+    urls = [f"https://sticker.fpg.com.tw/sticker/daily-photo/daily-photo-{i}.jpg" for i in photo_ids]
+    urls += [f"https://sticker.fpg.com.tw/sticker/daily-illustration/daily-illustration-{i}.jpg" for i in illust_ids]
+    random.shuffle(urls)
+    return urls
+
 def crawl_grandma_images(target_count=10, keywords=None, save_dir=DEFAULT_IMAGES_DIR):
     """
     從正統台灣長輩圖專屬圖庫隨機抓取全新長輩圖：
@@ -150,19 +161,7 @@ def crawl_grandma_images(target_count=10, keywords=None, save_dir=DEFAULT_IMAGES
     log_crawl(f"\n=== 開始下載正統台灣長輩圖 (目標新增: {target_count} 張) ===")
     log_crawl(f"儲存目錄: {save_dir}")
 
-    # 隨機產生候選 ID 序列
-    photo_ids = list(range(100, 750))
-    random.shuffle(photo_ids)
-    illust_ids = list(range(30, 245))
-    random.shuffle(illust_ids)
-
-    candidate_urls = []
-    # 交叉混合攝影類與插畫類長輩圖
-    for p_id in photo_ids:
-        candidate_urls.append(f"https://sticker.fpg.com.tw/sticker/daily-photo/daily-photo-{p_id}.jpg")
-    for i_id in illust_ids:
-        candidate_urls.append(f"https://sticker.fpg.com.tw/sticker/daily-illustration/daily-illustration-{i_id}.jpg")
-    random.shuffle(candidate_urls)
+    candidate_urls = build_candidate_urls()
 
     # 限制單次最大嘗試數，避免無網路時長時間卡死阻塞
     candidate_urls = candidate_urls[:max(target_count * 4, 30)]
