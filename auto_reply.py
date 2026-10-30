@@ -38,7 +38,7 @@ import pyautogui
 from crawl_images import (crawl_grandma_images, clean_expired_images, retire_image,
                           download_and_validate_image, get_existing_md5s, build_candidate_urls)
 
-VERSION = "2.4.1"
+VERSION = "2.4.2"
 
 # 0. 全系統單一執行個體鎖 (Windows Named Mutex)，防止重複啟動繞過斷路器
 _app_mutex_handle = None
@@ -143,7 +143,7 @@ DEFAULT_CONFIG = {
     "min_image_pool": 10,
     "auto_crawl_images": True,
     "close_window_after_send": True,
-    "time_aware_images": True           # 依時段挑圖：早上不送晚安圖、晚上不送早安圖 (無時段字樣的祝福圖不受限)
+    "time_aware_images": True           # 依時段挑圖：早上不送晚安圖、晚上不送早安圖 (標記為 neutral 的無時段字樣圖不受限)
 }
 
 last_reply_times = {}
@@ -520,21 +520,36 @@ def _load_image_tags():
 def is_image_tagged(image_path):
     """該圖的時段分類是否已快取 (查快取不需 OCR)"""
     md5 = get_file_md5(image_path)
-    return bool(md5) and isinstance(_load_image_tags().get(md5), list)
+    cached = _load_image_tags().get(md5) if md5 else None
+    return isinstance(cached, list) and bool(cached)
+
+def set_image_slots(image_path, slots):
+    """手動標記圖片適用時段 (morning / noon / evening / neutral)，寫入 image_tags.json。回傳是否成功。"""
+    valid = [x for x in slots if x in ("morning", "noon", "evening", "neutral")]
+    md5 = get_file_md5(image_path)
+    if not md5 or not valid or ("neutral" in valid and len(valid) > 1):
+        return False
+    tags = _load_image_tags()
+    tags[md5] = valid
+    return atomic_save_json(IMAGE_TAGS_PATH, tags)
 
 def classify_image_slots(image_path):
     """
-    以 OCR 辨識圖片上的問候語，回傳其適用時段清單 (早安/早上好/晨 -> morning、午安/中午好 -> noon、
-    晚安/晚上好 -> evening)。回傳空清單代表無時段字樣 (任何時段皆可用)。
-    OCR 擲出例外或辨識不出任何文字 (可能是語言包缺失或解碼失敗) 時回傳 None：不快取、不採用 (Fail-Closed)。
-    結果以 MD5 快取於 image_tags.json，每張圖只辨識一次。
+    回傳圖片適用時段清單 (morning / noon / evening；["neutral"] 表示已確認無時段字樣，任何時段皆可用)；
+    未知回傳 None (Fail-Closed，不被挑選)。
+    - 先查 image_tags.json 快取 (以 MD5 為鍵；舊版留下的空清單視為未知)。
+    - 未快取時以 OCR 找問候語 (早安/早上好/晨 -> morning、午安/中午好 -> noon、晚安/晚上好 -> evening)，
+      命中才快取。OCR 沒找到問候語不代表無時段字樣 (藝術字常辨識不出)，一律視為未知，
+      必須用 `--tag-image` 手動標記為 neutral 才會被當成無時段字樣。
     """
     md5 = get_file_md5(image_path)
     if not md5:
         return None
     tags = _load_image_tags()
     cached = tags.get(md5)
-    if isinstance(cached, list):
+    valid_slots = ("morning", "noon", "evening", "neutral")
+    if (isinstance(cached, list) and cached and all(x in valid_slots for x in cached)
+            and not ("neutral" in cached and len(cached) > 1)):
         return cached
     try:
         text = ocr_image_text(image_path)
@@ -550,13 +565,15 @@ def classify_image_slots(image_path):
         slots.append("noon")
     if "晚安" in text or "晚上好" in text or "夜安" in text or "好夢" in text or "goodnight" in text or "goodevening" in text:
         slots.append("evening")
+    if not slots:
+        return None
     tags[md5] = slots
     atomic_save_json(IMAGE_TAGS_PATH, tags)
     return slots
 
 def filter_images_by_time_slot(candidates, slot, max_ocr=8):
     """
-    依時段挑圖：優先回傳適用目前時段的圖；沒有時改用無時段字樣的圖代替；兩者皆無回傳 None (Fail-Closed)。
+    依時段挑圖：優先回傳適用目前時段的圖；沒有時改用已標記為 neutral (無時段字樣) 的圖代替；兩者皆無回傳 None (Fail-Closed)。未知的圖不會被選。
     隨機順序走訪，最多現場 OCR max_ocr 張未快取的圖。
     """
     pool = list(candidates)
@@ -570,7 +587,7 @@ def filter_images_by_time_slot(candidates, slot, max_ocr=8):
         if slots is not None:
             if slot in slots:
                 return img
-            if not slots and neutral is None:
+            if "neutral" in slots and neutral is None:
                 neutral = img
         if ocr_used >= max_ocr:
             # OCR 額度用完：只繼續掃已快取的圖 (不需 OCR)，仍有機會找到符合時段的圖
@@ -581,7 +598,7 @@ def filter_images_by_time_slot(candidates, slot, max_ocr=8):
                 if rest_slots is not None:
                     if slot in rest_slots:
                         return rest
-                    if not rest_slots and neutral is None:
+                    if "neutral" in rest_slots and neutral is None:
                         neutral = rest
             break
     return neutral
@@ -606,34 +623,36 @@ def countdown_sleep(total_seconds):
 IMAGE_CATEGORIES = ("morning", "noon", "evening", "neutral")
 
 def image_category(image_path):
-    """圖庫分類：morning / noon / evening / neutral (無時段字樣)；OCR 失敗回傳 None"""
+    """圖庫分類：morning / noon / evening / neutral (已標記為無時段字樣)；未知回傳 None"""
     slots = classify_image_slots(image_path)
-    if slots is None:
+    if not slots:
         return None
-    return slots[0] if slots else "neutral"
+    return slots[0]
 
 def fill_image_pool(images_dir, total=30, max_attempts=250):
     """
-    把圖庫補到 total 張，且早安、午安、晚安、無時段字樣四類平均分配 (30 張 = 8/8/7/7)。
+    把圖庫補到 total 張：已手動標記為 neutral (無時段字樣) 的圖照單計入，其餘名額由早安、午安、晚安平均分配。
+    只收 OCR 找得到問候語的圖 (未知的圖丟棄)，所以不會自動新增 neutral 圖，須以 `--tag-image` 手動標記。
     既有圖片先分類計數 (超額者保留不刪)；再逐張下載，類別已滿的新圖立即丟棄。
     回傳 {類別: 張數}。
     """
     abs_dir = images_dir if os.path.isabs(images_dir) else os.path.join(SCRIPT_DIR, images_dir)
     os.makedirs(abs_dir, exist_ok=True)
-    base, extra = divmod(total, len(IMAGE_CATEGORIES))
-    quota = {c: base + (1 if i < extra else 0) for i, c in enumerate(IMAGE_CATEGORIES)}
     counts = {c: 0 for c in IMAGE_CATEGORIES}
     for img in _scan_images(abs_dir):
         cat = image_category(img)
         if cat:
             counts[cat] += 1
+    slot_cats = [c for c in IMAGE_CATEGORIES if c != "neutral"]
+    base, extra = divmod(max(0, total - counts["neutral"]), len(slot_cats))
+    quota = {c: base + (1 if i < extra else 0) for i, c in enumerate(slot_cats)}
+    quota["neutral"] = counts["neutral"]
     log_v(f"[圖庫分配] 目前 {counts}，目標 {quota}")
 
     existing_md5s = get_existing_md5s(abs_dir)
     urls = build_candidate_urls()[:max_attempts]
-    split = int(len(urls) * 0.6)   # 前 60% 網址做分類配額，後 40% 留給補足階段 (兩階段不重複抓同一網址)
     fails = 0
-    for url in urls[:split]:
+    for url in urls:
         if all(counts[c] >= quota[c] for c in IMAGE_CATEGORIES):
             break
         if fails >= 10:
@@ -653,26 +672,6 @@ def fill_image_pool(images_dir, total=30, max_attempts=250):
             continue
         counts[cat] += 1
         log_v(f" -> [圖庫分配] 收納 {os.path.basename(saved)} 為「{cat}」類 ({counts[cat]}/{quota[cat]})")
-    # 來源圖庫的午安、晚安圖稀少：缺額改以無時段字樣的圖補足總數 (挑圖時亦以無時段圖代替)
-    if sum(counts.values()) < total:
-        log_v("[圖庫分配] 午安/晚安圖來源不足，改以無時段字樣的圖補足總數...")
-        fails = 0
-        for url in urls[split:]:
-            if sum(counts.values()) >= total or fails >= 10:
-                break
-            saved = download_and_validate_image(url, abs_dir, existing_md5s)
-            if not saved:
-                fails += 1
-                continue
-            fails = 0
-            if image_category(saved) == "neutral":
-                counts["neutral"] += 1
-                log_v(f" -> [圖庫分配] 補足收納 {os.path.basename(saved)} 為「neutral」類 (共 {sum(counts.values())}/{total})")
-            else:
-                try:
-                    os.remove(saved)
-                except Exception:
-                    pass
     if sum(counts.values()) >= total:
         log_v(f"[圖庫分配] 完成，圖庫已達 {total} 張: {counts}")
     else:
@@ -2205,7 +2204,7 @@ def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_f
     if config.get("time_aware_images", False):
         new_slot = current_time_slot()
         picked_slots = classify_image_slots(selected_image)
-        if picked_slots is None or (picked_slots and new_slot not in picked_slots):
+        if picked_slots is None or ("neutral" not in picked_slots and new_slot not in picked_slots):
             log_v(f" -> [時段重驗] 等待後時段已變為 {new_slot}，原圖不再適用，重新挑選...")
             selected_image = pick_unique_image(images, target_name, config)
             if not selected_image:
@@ -2929,7 +2928,8 @@ def main():
     parser.add_argument("-v", "--version", action="version", version=f"LINE Grandma Bot v{VERSION}")
     parser.add_argument("--test", metavar="NAME", help="手動測試發送一次給指定對象 (例如: --test 媽媽)")
     parser.add_argument("--calibrate", metavar="NAME", help="校準指定聯絡人的快取頻道 (例如: --calibrate 媽媽)")
-    parser.add_argument("--fill-pool", nargs="?", const=30, type=int, metavar="TOTAL", help="把圖庫補到指定張數 (預設 30)，早安、午安、晚安、無時段字樣四類平均分配")
+    parser.add_argument("--tag-image", nargs=2, metavar=("FILE", "SLOT"), help="手動標記圖片時段：morning、noon、evening 或 neutral (無時段字樣，任何時段皆可用)")
+    parser.add_argument("--fill-pool", nargs="?", const=30, type=int, metavar="TOTAL", help="把圖庫補到指定張數 (預設 30)：已標記 neutral 的圖先計入，其餘名額由早安、午安、晚安平均分配")
     parser.add_argument("--crawl", type=int, metavar="COUNT", help="立刻上網抓取指定數量的長輩圖儲存備用 (例如: --crawl 20)")
     parser.add_argument("--list-images", action="store_true", help="列出目前讀取到的長輩圖清單")
     parser.add_argument("--clear-history", action="store_true", help="清空已發送長輩圖的歷史記錄")
@@ -3008,6 +3008,20 @@ def main():
         _LAST_VALID_CONTACT_HISTORY.clear()
         log_v("所有聯絡人之百輪發送紀錄與應急複本已徹底重置。")
         return
+
+    if args.tag_image:
+        # 只接受圖庫資料夾內的檔名 (不含路徑)，避免指向圖庫以外的檔案
+        name = args.tag_image[0]
+        path = os.path.join(SCRIPT_DIR, config.get("images_dir", "images"), os.path.basename(name))
+        if os.path.basename(name) != name:
+            log_v("[標記失敗] 請只輸入圖庫資料夾內的檔名，不要包含路徑。")
+            sys.exit(1)
+        old_slots = classify_image_slots(path) if os.path.isfile(path) else None
+        if old_slots and old_slots != [args.tag_image[1]]:
+            log_v(f"[提醒] 此圖原本標記為 {old_slots}，將改為 {args.tag_image[1]}。")
+        ok = os.path.isfile(path) and set_image_slots(path, [args.tag_image[1]])
+        log_v(f"已標記 {os.path.basename(path)} 為 {args.tag_image[1]}" if ok else "[標記失敗] 檔案不存在或時段名稱不正確 (morning/noon/evening/neutral)。")
+        sys.exit(0 if ok else 1)
 
     if args.fill_pool is not None:
         fill_image_pool(config.get("images_dir", "images"), total=max(1, args.fill_pool))

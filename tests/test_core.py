@@ -3060,6 +3060,12 @@ class TestLineGrandmaBotCore(unittest.TestCase):
         auto_reply.IMAGE_TAGS_PATH = os.path.join(self.temp_dir.name, "image_tags.json")
         try:
             paths = [p for p, _ in imgs.values()]
+            # OCR 沒找到問候語 (藝術字常辨識不出) 不等於無時段字樣：視為未知，不會被挑選
+            self.assertIsNone(auto_reply.classify_image_slots(imgs["n"][0]))
+            self.assertIsNone(auto_reply.filter_images_by_time_slot([imgs["n"][0]], "morning"))
+            # 手動標記為 neutral 後才可作為無時段圖
+            self.assertTrue(auto_reply.set_image_slots(imgs["n"][0], ["neutral"]))
+            self.assertFalse(auto_reply.set_image_slots(imgs["n"][0], ["neutral", "morning"]))
             for _ in range(20):
                 pick = auto_reply.filter_images_by_time_slot(paths, "morning")
                 self.assertEqual(pick, imgs["m"][0])
@@ -3127,10 +3133,11 @@ class TestLineGrandmaBotCore(unittest.TestCase):
         finally:
             (auto_reply.download_and_validate_image, auto_reply.get_existing_md5s,
              auto_reply.build_candidate_urls, auto_reply.image_category) = orig
-        self.assertEqual(counts, {"morning": 8, "noon": 8, "evening": 7, "neutral": 7})
+        # 無既有 neutral 圖：30 張平均分配給早安、午安、晚安，neutral 不自動新增
+        self.assertEqual(counts, {"morning": 10, "noon": 10, "evening": 10, "neutral": 0})
         self.assertEqual(len(os.listdir(d)), 30)
 
-    def test_fill_image_pool_second_phase_tops_up_with_neutral(self):
+    def test_fill_image_pool_keeps_only_quota_and_never_pads_unknown(self):
         d = os.path.join(self.temp_dir.name, "pool2")
         os.makedirs(d)
         state = {"n": 0}
@@ -3147,14 +3154,15 @@ class TestLineGrandmaBotCore(unittest.TestCase):
         auto_reply.download_and_validate_image = fake_download
         auto_reply.get_existing_md5s = lambda _d: set()
         auto_reply.build_candidate_urls = lambda: ["u"] * 200
-        auto_reply.image_category = lambda p: "neutral"   # 來源只有無時段圖
+        auto_reply.image_category = lambda p: "neutral"   # 來源只有已標記的 neutral 圖
         try:
             counts = auto_reply.fill_image_pool(d, total=30, max_attempts=200)
         finally:
             (auto_reply.download_and_validate_image, auto_reply.get_existing_md5s,
              auto_reply.build_candidate_urls, auto_reply.image_category) = orig
-        self.assertEqual(counts["neutral"], 30)
-        self.assertEqual(len([f for f in os.listdir(d)]), 30)
+        # 來源只有 neutral 圖：neutral 不計入自動配額，全部丟棄；不會用無法確認的圖補足總數
+        self.assertEqual(counts["neutral"], 0)
+        self.assertEqual(len(os.listdir(d)), 0)
 
     def test_last_left_message_is_media_distinguishes_text_from_media(self):
         from PIL import Image, ImageDraw
@@ -3247,6 +3255,27 @@ class TestLineGrandmaBotCore(unittest.TestCase):
         finally:
             (auto_reply.get_active_line_cache_dir, auto_reply.find_target_chat_window,
              auto_reply.send_grandma_image, auto_reply.is_valid_image_or_eimg) = orig
+
+    def test_filter_returns_tagged_neutral_after_ocr_quota_exhausted(self):
+        fail_path = os.path.join(self.temp_dir.name, "q_fail.jpg")
+        neutral_path = os.path.join(self.temp_dir.name, "q_neutral.jpg")
+        for pth, data in ((fail_path, b"fail" * 10), (neutral_path, b"neut" * 10)):
+            with open(pth, "wb") as f:
+                f.write(data)
+        orig = (auto_reply.ocr_image_text, auto_reply.IMAGE_TAGS_PATH, auto_reply.random.shuffle)
+        auto_reply.IMAGE_TAGS_PATH = os.path.join(self.temp_dir.name, "image_tags.json")
+        auto_reply.random.shuffle = lambda x: None   # 固定順序：先遇到 OCR 失敗的圖，再遇到 neutral 圖
+
+        def failing_ocr(path):
+            raise RuntimeError("ocr fail")
+
+        auto_reply.ocr_image_text = failing_ocr
+        try:
+            self.assertTrue(auto_reply.set_image_slots(neutral_path, ["neutral"]))
+            # OCR 額度只有 1：用在失敗的圖之後，仍要掃已標記的 neutral 圖當備援
+            self.assertEqual(auto_reply.filter_images_by_time_slot([fail_path, neutral_path], "evening", max_ocr=1), neutral_path)
+        finally:
+            auto_reply.ocr_image_text, auto_reply.IMAGE_TAGS_PATH, auto_reply.random.shuffle = orig
 
 if __name__ == '__main__':
     unittest.main()

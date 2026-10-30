@@ -1,6 +1,6 @@
 # LINE 長輩圖智慧自動回覆機器人 (line-grandma-bot)
 
-[![Version](https://img.shields.io/badge/version-2.4.1-blue.svg)](auto_reply.py)
+[![Version](https://img.shields.io/badge/version-2.4.2-blue.svg)](auto_reply.py)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D6.svg)](https://microsoft.com)
 [![Python](https://img.shields.io/badge/python-3.10%2B-green.svg)](https://python.org)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey.svg)](LICENSE)
@@ -45,7 +45,7 @@
 
 ```text
 line-grandma-bot/
-├── auto_reply.py        # 核心自動回覆常駐程式 (v2.4.1)
+├── auto_reply.py        # 核心自動回覆常駐程式 (v2.4.2)
 ├── crawl_images.py      # 台塑貼圖酷長輩圖抓取與過期清理模組
 ├── config.example.json  # 設定檔範本
 ├── config.json          # 個人實際設定檔 (已列入 .gitignore 保護隱私)
@@ -128,7 +128,7 @@ copy config.example.json config.json
 | `min_image_pool` | `10` | 圖庫最低儲備數量，低於此數量時自動連網補充。 |
 | `auto_crawl_images` | `true` | 是否允許圖庫不足時自動連網下載補充。 |
 | `close_window_after_send` | `true` | 發送完成後是否自動將對話框最小化至工作列，維持後續未讀狀態。 |
-| `time_aware_images` | `true` | 依時段挑圖：05-11 時只送早安或無時段字樣的圖，11-17 時送午安，17-05 時送晚安。以 OCR 辨識圖上字樣並快取於 `image_tags.json`；沒有該時段的圖時，改用無時段字樣的圖代替；兩者皆無才不發送。 |
+| `time_aware_images` | `true` | 依時段挑圖：05-11 時只送早安或無時段字樣的圖，11-17 時送午安，17-05 時送晚安。以 OCR 辨識圖上字樣並快取於 `image_tags.json`；沒有該時段的圖時，改用已標記為 `neutral`（無時段字樣）的圖代替；兩者皆無才不發送。OCR 找不到問候語的圖視為未知，不會被挑選，請用 `--tag-image` 手動標記。 |
 
 ---
 
@@ -169,8 +169,11 @@ python auto_reply.py --bind "媽媽" db680a8a
 # 9-1. 最簡單的綁定 (請先關閉常駐程式，避免舊圖寫入被當成新圖)：執行後 30 秒內，在 LINE 開啟該好友聊天室並點開任一張舊圖片 (其他聊天室請勿操作)，程式自動辨識並綁定
 python auto_reply.py --bind-view "媽媽"
 
-# 9-2. 補圖到指定張數 (預設 30)，早安、午安、晚安、無時段字樣四類平均分配；午安/晚安來源稀少時以無時段圖補足總數
+# 9-2. 補圖到指定張數 (預設 30)，已標記為 neutral 的圖先計入總數，其餘名額由早安、午安、晚安平均分配
 python auto_reply.py --fill-pool 30
+
+# 9-3. 手動標記圖片時段 (morning / noon / evening / neutral)，標記 neutral 的圖任何時段皆可使用
+python auto_reply.py --tag-image grandma_xxx.jpg neutral
 
 # 10. 解除綁定 (可用名稱或 Hash 前綴)
 python auto_reply.py --unbind "媽媽"
@@ -179,6 +182,13 @@ python auto_reply.py --unbind "媽媽"
 ---
 
 ## 📝 版本異動紀錄 (Changelog)
+
+### [v2.4.2] - 2026-10-30
+#### 時段挑圖只採用明確標記的圖
+- **修正**：Windows OCR 常辨識不出藝術字，過去把「沒找到問候語」當成「無時段字樣」，導致晚上送出早安圖。現在 OCR 找不到問候語一律視為「未知」，未知的圖不會被挑選；只有 OCR 找到「早安/午安/晚安」，或用 `--tag-image` 手動標記的圖才會被使用。
+- **新增 `--tag-image FILE SLOT`**：手動標記圖片時段（`morning`、`noon`、`evening` 或 `neutral` 無時段字樣）。
+- **升級提醒**：舊版 OCR 推論留下的「無時段字樣」記錄一律視為未知，升級後可挑的圖可能變少；請用 `--tag-image` 把確實沒有時段字樣的圖標為 `neutral`，或執行 `--fill-pool` 補充。
+- **`--fill-pool` 調整**：只收 OCR 找得到問候語的圖，未知的圖丟棄，不再用無法確認的圖補足總數。
 
 ### [v2.4.1] - 2026-10-30
 #### 對方只傳文字時不回應
