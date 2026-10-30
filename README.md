@@ -1,6 +1,6 @@
 # LINE 長輩圖智慧自動回覆機器人 (line-grandma-bot)
 
-[![Version](https://img.shields.io/badge/version-2.3.0-blue.svg)](auto_reply.py)
+[![Version](https://img.shields.io/badge/version-2.4.0-blue.svg)](auto_reply.py)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D6.svg)](https://microsoft.com)
 [![Python](https://img.shields.io/badge/python-3.10%2B-green.svg)](https://python.org)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey.svg)](LICENSE)
@@ -45,7 +45,7 @@
 
 ```text
 line-grandma-bot/
-├── auto_reply.py        # 核心自動回覆常駐程式 (v2.3.0)
+├── auto_reply.py        # 核心自動回覆常駐程式 (v2.4.0)
 ├── crawl_images.py      # 台塑貼圖酷長輩圖抓取與過期清理模組
 ├── config.example.json  # 設定檔範本
 ├── config.json          # 個人實際設定檔 (已列入 .gitignore 保護隱私)
@@ -180,6 +180,14 @@ python auto_reply.py --unbind "媽媽"
 
 ## 📝 版本異動紀錄 (Changelog)
 
+### [v2.4.0] - 2026-10-30
+#### 時段挑圖與綁定便利化
+- **依時段挑圖**：以 OCR 辨識圖上「早安、午安、晚安」字樣，只送符合目前時段的圖；沒有時改用無時段字樣的圖，兩者皆無則不發送。等待結束後會重驗時段。
+- **補圖到 30 張**：新增 `--fill-pool`，早安、午安、晚安、無時段字樣四類平均分配。
+- **更簡單的綁定**：新增 `--bind`（以 Hash 前綴手動綁定）與 `--bind-view`（開啟聊天室點開舊圖即自動綁定），都不需傳送或接收訊息。
+- **回覆延遲上限改為 15 分鐘**：`max_delay_seconds` 預設 900，等待期間每分鐘印出倒數。
+- **穩定性**：帳號層 `tmp` 快取檔不再誤判為頻道；斷路器鎖定與冷卻期間補上日誌；暫定綁定二次核驗 (Fail-Closed)。
+
 ### [v2.3.0] - 2026-10-29
 #### 誤傳防護與對象嚴格隔離 (Accidental Send Prevention & Strict Window Isolation)
 - **徹底廢止主視窗模擬搜尋鍵盤輸入**：完全移除過去在主視窗點擊搜尋框、模擬複製貼上聯絡人名稱與模擬鍵盤 Enter 尋找對話框之邏輯。徹底杜絕因焦點漂移或停留在其他聊天室輸入框時，誤將好友姓名以文字訊息送出給錯誤對象的災難性風險。
@@ -272,7 +280,12 @@ python auto_reply.py --unbind "媽媽"
    - `copilot.cmd -p ...` (GitHub Copilot 架構安全審查)
    - `codex.cmd exec` (OpenAI Codex 推理審查)
 3. **台灣用語審查（每輪必含）**：審查報告必須獨立列出「台灣用語」一節，逐一檢查 README、程式註解、日誌訊息與測試說明，凡出現中國大陸慣用語（例如：進程、代碼、調用、運行、打開、優化、設置、窗口、激活、函數、閉環、死循環）一律列為低度意見，並提供台灣用語替換（行程、程式碼、呼叫、執行、開啟、最佳化、設定、視窗、啟用、函式、反覆修復、無窮迴圈）；若無則須明確寫「台灣用語：無問題」。
-4. **報告存檔與反覆迭代**：各工具輸出之獨立審查報告存檔至本機，確認達成「零高、中度嚴重意見」之驗證標準。
+4. **版次號碼規則（語意化版本 主.次.修）**：
+   - 主版：不相容改動（例如設定檔格式或指令改名，使舊設定失效）。
+   - 次版：新增向下相容的功能。
+   - 修訂：只修錯誤，不新增功能。
+   每次改版須同步更新 `auto_reply.py`、`crawl_images.py` 的 `VERSION`、`run_auto_reply.bat` 標題、README 徽章、檔案結構中標有版次的註解與更新紀錄，並隨該次改版一併送審。
+5. **報告存檔與反覆迭代**：各工具輸出之獨立審查報告存檔至本機，確認達成「零高、中度嚴重意見」之驗證標準。
 
 ---
 
