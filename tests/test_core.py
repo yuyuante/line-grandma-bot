@@ -3156,5 +3156,97 @@ class TestLineGrandmaBotCore(unittest.TestCase):
         self.assertEqual(counts["neutral"], 30)
         self.assertEqual(len([f for f in os.listdir(d)]), 30)
 
+    def test_last_left_message_is_media_distinguishes_text_from_media(self):
+        from PIL import Image, ImageDraw
+        import types
+
+        def judge(blocks, dpi=0, noise_at_top=False):
+            img = Image.new("RGB", (1000, 675), (255, 255, 255))
+            d = ImageDraw.Draw(img)
+            for box, color in blocks:
+                d.rectangle(box, fill=color)
+            if noise_at_top:   # 背景取樣點剛好落在彩色物件上，中位數取樣仍要找回白色背景
+                d.rectangle((490, 0, 510, 20), fill=(0, 0, 0))
+            orig = (auto_reply.win32gui.IsWindow, auto_reply.win32gui.IsIconic, auto_reply.win32gui.IsWindowVisible,
+                    auto_reply.get_window_true_rect, auto_reply.ImageGrab.grab, auto_reply.ctypes)
+            auto_reply.win32gui.IsWindow = lambda h: True
+            auto_reply.win32gui.IsIconic = lambda h: False
+            auto_reply.win32gui.IsWindowVisible = lambda h: True
+            auto_reply.get_window_true_rect = lambda h: (0, 0, 1000, 1000)
+            auto_reply.ImageGrab.grab = lambda **kw: img
+            auto_reply.ctypes = types.SimpleNamespace(
+                windll=types.SimpleNamespace(user32=types.SimpleNamespace(GetDpiForWindow=lambda h: dpi)))
+            try:
+                return auto_reply.last_left_message_is_media(1)
+            finally:
+                (auto_reply.win32gui.IsWindow, auto_reply.win32gui.IsIconic, auto_reply.win32gui.IsWindowVisible,
+                 auto_reply.get_window_true_rect, auto_reply.ImageGrab.grab, auto_reply.ctypes) = orig
+
+        gray = (239, 239, 239)                          # LINE 接收氣泡的淺灰填色
+        photo_c = (200, 120, 60)
+        text = ((60, 600, 260, 630), gray)              # 約 31px 文字氣泡
+        long_text = ((60, 420, 260, 540), gray)         # 4 行以上的長文字氣泡 (高度超過 90px)
+        photo = ((60, 200, 300, 540), photo_c)          # 約 341px 照片
+        action_row = ((60, 552, 260, 561), (166, 166, 166))   # 照片下方 12px 後、高度約 10px 的「儲存｜另存新檔｜分享」連結列
+        self.assertIs(judge([text]), False)
+        self.assertIs(judge([long_text]), False)       # 高度 >= 90 的長文字仍是文字
+        self.assertIs(judge([photo]), True)
+        self.assertIs(judge([photo, action_row]), True)  # 連結列也是照片的一部分
+        self.assertIs(judge([photo, action_row, ((60, 600, 260, 630), gray)]), False)   # 照片之後又傳文字
+        self.assertIs(judge([text], noise_at_top=True), False)
+        # 透明背景貼圖：圖案與下方文字片段間距 10px，最底部片段只有約 30px，仍須判為貼圖
+        sticker = [((80, 300, 200, 440), (250, 200, 0)), ((80, 452, 200, 482), (250, 120, 120))]
+        self.assertIs(judge(sticker), True)
+        # 更小的貼圖片段 (約 15px) 仍視為貼圖
+        self.assertIs(judge([((80, 300, 200, 440), (250, 200, 0)), ((80, 460, 200, 475), (250, 120, 120))]), True)
+        # DPI 150%：文字氣泡仍是文字、照片仍是照片
+        self.assertIs(judge([((60, 560, 260, 630), gray)], dpi=144), False)
+        self.assertIs(judge([((60, 200, 300, 540), photo_c)], dpi=144), True)
+        # 細線或雜訊 (非氣泡且低於 12px)：文字
+        self.assertIs(judge([((60, 600, 200, 606), (166, 166, 166))]), False)
+        # 網址預覽卡片 (非灰色氣泡)：已知取捨，判為照片
+        self.assertIs(judge([((60, 400, 300, 520), (210, 225, 245))]), True)
+        # 貼圖底部只剩細小片段 (約 8px) 且與上方間距超過 16px：視為雜訊 (已知取捨，README 已註明)
+        self.assertIs(judge([((80, 300, 200, 440), (250, 200, 0)), ((80, 470, 200, 478), (250, 120, 120))]), False)
+        # 間距剛好 12px 的細小片段緊貼上方區塊：視為連結列，判為照片
+        self.assertIs(judge([((80, 300, 200, 440), (250, 200, 0)), ((80, 452, 200, 460), (250, 120, 120))]), True)
+        self.assertIsNone(judge([]))                    # 左側無內容：無法判斷 (None，呼叫端走重試)
+
+    def test_skipped_text_does_not_start_cooldown_and_marks_processed(self):
+        test_cache = os.path.join(self.temp_dir.name, "skip_cache")
+        fake_hash = "777703ef1234567890abcdef1234567890abcdef"
+        chat_m = os.path.join(test_cache, fake_hash, "m")
+        os.makedirs(chat_m, exist_ok=True)
+        img_path = os.path.join(chat_m, "t.eimg")
+        with open(img_path, "wb") as f:
+            f.write(b"\x00" * 300000)
+        now = time.time()
+        os.utime(img_path, (now, now))
+        with auto_reply.locked_chat_dirs() as m:
+            m[fake_hash] = "TargetSkip"
+        orig = (auto_reply.get_active_line_cache_dir, auto_reply.find_target_chat_window,
+                auto_reply.send_grandma_image, auto_reply.is_valid_image_or_eimg)
+        auto_reply.get_active_line_cache_dir = lambda: test_cache
+        auto_reply.find_target_chat_window = lambda t: [(9970, t, "ChatWnd", True)] if t == "TargetSkip" else []
+        auto_reply.is_valid_image_or_eimg = lambda p: True
+        calls = []
+        auto_reply.send_grandma_image = lambda t, c, **kw: calls.append(t) or "SKIPPED_TEXT"
+        try:
+            cfg = {"targets": ["TargetSkip"], "trigger_mode": "photo_and_sticker", "cooldown_seconds": 0,
+                   "min_delay_seconds": 0, "max_delay_seconds": 0}
+            auto_reply.last_global_reply_time = 0.0
+            auto_reply.last_reply_times.pop("TargetSkip", None)
+            auto_reply.PROCESSED_CACHE_FILES.clear()
+            auto_reply.last_seen_cache_mtime = now - 1.0
+            auto_reply.check_for_incoming_messages(cfg)
+            self.assertEqual(calls, ["TargetSkip"])
+            self.assertEqual(auto_reply.last_reply_times.get("TargetSkip", 0), 0)   # 沒有啟動冷卻
+            self.assertIn((img_path, os.path.getmtime(img_path)), auto_reply.PROCESSED_CACHE_FILES)
+            auto_reply.check_for_incoming_messages(cfg)
+            self.assertEqual(calls, ["TargetSkip"])                                  # 同一檔案不重複觸發
+        finally:
+            (auto_reply.get_active_line_cache_dir, auto_reply.find_target_chat_window,
+             auto_reply.send_grandma_image, auto_reply.is_valid_image_or_eimg) = orig
+
 if __name__ == '__main__':
     unittest.main()

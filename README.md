@@ -1,6 +1,6 @@
 # LINE 長輩圖智慧自動回覆機器人 (line-grandma-bot)
 
-[![Version](https://img.shields.io/badge/version-2.4.0-blue.svg)](auto_reply.py)
+[![Version](https://img.shields.io/badge/version-2.4.1-blue.svg)](auto_reply.py)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D6.svg)](https://microsoft.com)
 [![Python](https://img.shields.io/badge/python-3.10%2B-green.svg)](https://python.org)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey.svg)](LICENSE)
@@ -45,7 +45,7 @@
 
 ```text
 line-grandma-bot/
-├── auto_reply.py        # 核心自動回覆常駐程式 (v2.4.0)
+├── auto_reply.py        # 核心自動回覆常駐程式 (v2.4.1)
 ├── crawl_images.py      # 台塑貼圖酷長輩圖抓取與過期清理模組
 ├── config.example.json  # 設定檔範本
 ├── config.json          # 個人實際設定檔 (已列入 .gitignore 保護隱私)
@@ -179,6 +179,10 @@ python auto_reply.py --unbind "媽媽"
 ---
 
 ## 📝 版本異動紀錄 (Changelog)
+
+### [v2.4.1] - 2026-10-30
+#### 對方只傳文字時不回應
+- **修正**：對方傳文字訊息時，LINE 偶爾會同時寫入快取檔，造成程式誤以為收到圖片而開始倒數回圖。現在送出前會判斷對方最後一則訊息的類型：只有明確的淺灰填色氣泡（含長文字、多行文字）算文字，其餘一律視為照片或貼圖（含透明背景被分段的貼圖片段與照片下方的「儲存｜另存新檔｜分享」連結列）。文字會略過，日誌顯示「[文字訊息略過]」，不回覆、不重試、不啟動冷卻。已知取捨：對方只傳網址（預覽卡片）時會被當成照片而回覆；深色主題或自訂聊天室背景下，所有內容都會被當成照片（文字也會回覆）；貼圖底部若只剩不到 12 px 的細小片段且與上方相隔超過 16 px，會被當成雜訊而略過；平塗淺灰的圖可能被當成文字。風險方向以「多回」優先，判斷不了時不回。暫時無法判斷（視窗被遮住、截圖失敗）時不丟棄，改走既有的最多 3 次重試。`trigger_mode` 為 `all` 時不套用此檢查。若對方先傳照片、倒數期間又傳了文字，最後一則是文字，該張照片不回覆。
 
 ### [v2.4.0] - 2026-10-30
 #### 時段挑圖與綁定便利化

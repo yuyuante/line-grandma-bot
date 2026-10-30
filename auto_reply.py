@@ -38,7 +38,7 @@ import pyautogui
 from crawl_images import (crawl_grandma_images, clean_expired_images, retire_image,
                           download_and_validate_image, get_existing_md5s, build_candidate_urls)
 
-VERSION = "2.4.0"
+VERSION = "2.4.1"
 
 # 0. 全系統單一執行個體鎖 (Windows Named Mutex)，防止重複啟動繞過斷路器
 _app_mutex_handle = None
@@ -1940,6 +1940,113 @@ def is_last_message_from_self_in_chat(chat_hwnd):
         log_v(f"[警告] 實體位置方向核驗發生例外: {e}，遵循 Fail-Closed 原則視為自己發送以確保安全！")
         return True
 
+# 左側訊息類型判斷參數 (邏輯像素，相對 96 DPI)
+MEDIA_NOISE_MAX_HEIGHT = 12     # 非氣泡區塊低於此高度視為細線、雜訊或連結列
+MEDIA_STICKER_MIN_HEIGHT = 40   # 連結列上方的區塊至少要有此高度才算照片
+MEDIA_ACTION_GAP_MAX = 16       # 連結列與上方照片之間的最大間距
+
+def last_left_message_is_media(chat_hwnd):
+    """
+    判斷聊天室最底部「左側 (對方)」訊息是否為照片/貼圖。回傳 True (照片/貼圖)、False (文字)、
+    None (暫時無法判斷：視窗縮小/被遮住/太窄、截圖失敗、左側無內容)。
+    由下往上把左側取樣帶 (固定自 56px 起寬 160px，避開頭像) 的內容列分成區塊 (連續約 6px 無內容即分開)，
+    只看最底部區塊 B。只有明確的文字氣泡才算文字，其餘一律視為照片或貼圖 (含透明背景被分段的貼圖片段與
+    照片下方的「儲存｜另存新檔｜分享」連結列)，避免貼圖被誤略過：
+    - B 為文字氣泡：LINE 接收氣泡為單一淺灰填色，占區塊內容 55% 以上，文字 (不論高度，長文字也算)。
+    - B 非氣泡且高度 (邏輯像素，已除以 DPI 縮放) 達 MEDIA_NOISE_MAX_HEIGHT：照片或貼圖。
+    - B 非氣泡且低於該高度：若緊貼 (間距 <= MEDIA_ACTION_GAP_MAX) 在上方非氣泡且達 MEDIA_STICKER_MIN_HEIGHT
+      的區塊下方，是照片的連結列，視為照片；否則是細線或雜訊，文字。
+    已知取捨：網址預覽卡片 (白底) 不是氣泡，對方只傳連結時會被當成照片而回覆。
+    背景色取 10 個取樣點中位數，避免取樣點剛好落在氣泡上。
+    """
+    try:
+        if not win32gui.IsWindow(chat_hwnd) or win32gui.IsIconic(chat_hwnd) or not win32gui.IsWindowVisible(chat_hwnd):
+            return None
+        rect = get_window_true_rect(chat_hwnd)
+        w = rect[2] - rect[0]
+        h = rect[3] - rect[1]
+        if w < 300 or h < 200:
+            return None
+        scale = 1.0
+        try:
+            dpi = ctypes.windll.user32.GetDpiForWindow(chat_hwnd)
+            if dpi > 0:
+                scale = dpi / 96.0
+        except Exception:
+            pass
+        crop_y = rect[1] + int(h * 0.18)
+        crop_h = max(50, h - int(h * 0.18) - int(145 * scale))
+        shot = ImageGrab.grab(bbox=(rect[0], crop_y, rect[0] + w, crop_y + crop_h), all_screens=True)
+
+        pts = [shot.getpixel((int(w * fx), y)) for fx in (0.3, 0.4, 0.5, 0.6, 0.7) for y in (10, 30) if y < crop_h]
+        bg = tuple(sorted(c[i] for c in pts)[len(pts) // 2] for i in range(3))
+
+        def is_content(px):
+            return (abs(px[0] - bg[0]) + abs(px[1] - bg[1]) + abs(px[2] - bg[2])) > 30
+
+        x_start = int(56 * scale)
+        x_end = min(x_start + int(160 * scale), int(w * 0.5))
+
+        def row_has_content(y):
+            return any(is_content(shot.getpixel((x, y))) for x in range(x_start, x_end, 4))
+
+        # 由下往上分區塊 [(底, 頂)]，只需最底部兩個
+        blocks = []
+        cur_bottom = cur_top = None
+        gap = 0
+        for y in range(crop_h - 1, 0, -2):
+            if row_has_content(y):
+                if cur_bottom is None:
+                    cur_bottom = y
+                cur_top, gap = y, 0
+            elif cur_bottom is not None:
+                gap += 2
+                if gap > 4:
+                    blocks.append((cur_bottom, cur_top))
+                    cur_bottom = cur_top = None
+                    gap = 0
+                    if len(blocks) >= 2:
+                        break
+        if cur_bottom is not None and len(blocks) < 2:
+            blocks.append((cur_bottom, cur_top))
+        if not blocks:
+            return None
+
+        def height(blk):
+            return int((blk[0] - blk[1] + 1) / scale)
+
+        def is_text_bubble(blk):
+            counts = {}
+            total = 0
+            for y in range(blk[1], blk[0] + 1, 2):
+                for x in range(x_start, x_end, 4):
+                    px = shot.getpixel((x, y))
+                    if is_content(px):
+                        total += 1
+                        counts[px] = counts.get(px, 0) + 1
+            if total == 0:
+                return False
+            top_px, top_n = max(counts.items(), key=lambda kv: kv[1])
+            neutral = max(top_px) - min(top_px) <= 6 and 215 <= min(top_px) <= 250
+            return neutral and top_n / total >= 0.55
+
+        last = blocks[0]
+        if is_text_bubble(last):
+            return False
+        if height(last) >= MEDIA_NOISE_MAX_HEIGHT:
+            return True
+        # 細小區塊：若緊貼在非氣泡的大區塊 (照片) 下方，是「儲存｜另存新檔｜分享」連結列，屬於照片；否則為雜訊
+        if len(blocks) >= 2:
+            above = blocks[1]
+            gap_px = int((last[1] - above[0]) / scale)
+            return (gap_px <= MEDIA_ACTION_GAP_MAX and height(above) >= MEDIA_STICKER_MIN_HEIGHT
+                    and not is_text_bubble(above))
+        return False
+    except Exception as e:
+        log_v(f"[警告] 訊息類型量測發生例外: {e}，視為無法判斷 (Fail-Closed)。")
+        return None
+
+
 def get_chat_history_image(chat_hwnd):
     """擷取聊天歷史區域影像 (完全避開底部 145px 輸入框以排除閃爍游標干擾)"""
     try:
@@ -2149,6 +2256,19 @@ def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_f
         log_v(f"[防自循環保護]「{target_name}」視窗內最後訊息位於右側（本機送出），安全攔截絕不發送！")
         _minimize_if_configured(chat_hwnd, config)
         return "NOT_SENT"
+
+    # 訊息類型核驗 (Fail-Closed)：對方最後一則若只是文字氣泡，不需回應 (trigger_mode="all" 時文字也要回，不套用)
+    if config.get("trigger_mode", "photo_and_sticker") != "all":
+        is_media = last_left_message_is_media(chat_hwnd)
+        if is_media is None:
+            # 暫時無法判斷 (截圖失敗、視窗被遮住等)：不丟棄，走既有重試流程
+            log_v(f"[訊息類型待確認]「{target_name}」暫時無法判斷最後一則訊息類型，本次不發送，稍後重試。")
+            _minimize_if_configured(chat_hwnd, config)
+            return "NOT_SENT"
+        if not is_media:
+            log_v(f"[文字訊息略過]「{target_name}」最後一則訊息為文字，不需回應。")
+            _minimize_if_configured(chat_hwnd, config)
+            return "SKIPPED_TEXT"
 
     # 發送前先對快取進行檔案集合快照 (包含 mtime 與大小)
     active_cache = get_active_line_cache_dir()
@@ -2659,11 +2779,13 @@ def check_for_incoming_messages(config):
             return
 
         log_v(f" -> 經安全驗證確認，觸發自動回覆長輩圖給:「{target_to_reply}」")
+        prev_reply_time = last_reply_times.get(target_to_reply, 0)
         send_result = send_grandma_image(target_to_reply, config, triggered_file=new_image_found)
-        last_reply_times[target_to_reply] = time.time()
+        # 對方只傳文字而略過時沒有送出任何東西，不啟動冷卻 (避免擋住隨後真正的新圖)
+        last_reply_times[target_to_reply] = prev_reply_time if send_result == "SKIPPED_TEXT" else time.time()
 
-        if send_result in ("SENT_CONFIRMED", "SENT_UNCERTAIN"):
-            # 為防重複刷屏一律視為已處理並更新基準線
+        if send_result in ("SENT_CONFIRMED", "SENT_UNCERTAIN", "SKIPPED_TEXT"):
+            # 為防重複刷屏一律視為已處理並更新基準線 (SKIPPED_TEXT：對方只傳文字，同樣標記已處理且不重試)
             if new_image_found:
                 try:
                     m_f = os.path.getmtime(new_image_found)
@@ -3029,7 +3151,8 @@ def main():
         if not check_circuit_breaker(target, max_replies=2, window_seconds=300):
             log_v(f"❌ [斷路器鎖定]「{target}」在 5 分鐘內已達發送上限，已啟動防禦退避鎖定，拒絕發送！")
             return
-        send_grandma_image(target, config)
+        result = send_grandma_image(target, config)
+        log_v(f"手動測試結果: {result}")
         return
 
     print("=" * 65)
