@@ -981,25 +981,125 @@ def pick_unique_image(images, target_name, config):
     selected = random.choice(candidates)
     return selected
 
-def copy_image_to_clipboard(image_path):
-    """使用 Win32 原生 API 將圖片以 CF_DIB (標準設備無關點陣圖) 注入剪貼簿，確保 LINE 100% 辨識為真實圖片檔案而非文字"""
-    abs_path = os.path.abspath(image_path)
+ATTACH_DIALOG_TIMEOUT = 8.0         # 按下附加檔案按鈕後，等檔案對話框出現的秒數
+ATTACH_DIALOG_CLOSE_TIMEOUT = 8.0   # 按 Enter 後，等檔案對話框關閉 (LINE 接手送出) 的秒數
+
+def _find_attach_button_center(chat_hwnd):
+    """
+    用 UIA 找輸入區最左邊的按鈕 (迴紋針，附加檔案)，回傳螢幕座標 (x, y)；找不到回傳 None。
+    LINE 電腦版目前不接受貼上圖片 (CF_DIB、PNG、檔案清單三種剪貼簿格式都試過，輸入框都沒有反應)，
+    但這個按鈕選檔後會直接送出。
+    """
     try:
-        with Image.open(abs_path) as img:
-            output = BytesIO()
-            img.convert("RGB").save(output, "BMP")
-            dib_data = output.getvalue()[14:]
-        win32clipboard.OpenClipboard()
+        import uiautomation as auto
+        panel = auto.ControlFromHandle(chat_hwnd).GroupControl(ClassName="MessageInputPanel")
+        if not panel.Exists(1, 0.2):
+            return None
+        buttons = []
+
+        def walk(ctrl, depth=0):
+            if depth > 3:
+                return
+            for child in ctrl.GetChildren():
+                if child.ClassName == "LcButton":
+                    buttons.append(child)
+                walk(child, depth + 1)
+
+        walk(panel)
+        if not buttons:
+            return None
+        r = min(buttons, key=lambda b: b.BoundingRectangle.left).BoundingRectangle
+        return (r.left + r.right) // 2, (r.top + r.bottom) // 2
+    except Exception:
+        return None
+
+def _find_open_dialog(timeout=ATTACH_DIALOG_TIMEOUT):
+    """等 LINE 的「開啟」檔案對話框 (標準對話框，視窗類別 #32770) 出現，回傳視窗控制代碼；逾時回傳 None"""
+    deadline = time.time() + timeout
+    while True:
+        line_pids = get_line_pids()
+        found = []
+
+        def enum_cb(hwnd, _):
+            if win32gui.IsWindowVisible(hwnd) and win32gui.GetClassName(hwnd) == "#32770":
+                _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                if pid in line_pids:
+                    found.append(hwnd)
+            return True
+
         try:
-            win32clipboard.EmptyClipboard()
-            win32clipboard.SetClipboardData(win32con.CF_DIB, dib_data)
-        finally:
-            win32clipboard.CloseClipboard()
-        return True
-    except Exception as e:
-        log_v(f"[錯誤] Win32 點陣圖注入剪貼簿失敗: {e}")
+            win32gui.EnumWindows(enum_cb, None)
+        except Exception:
+            pass
+        if found:
+            return found[0]
+        if time.time() >= deadline:
+            return None
+        time.sleep(0.2)
+
+def _set_dialog_filename(dialog_hwnd, path):
+    """
+    用 UIA 直接設定檔案對話框的檔名欄 (id 1148)，不經鍵盤輸入，所以不受輸入法影響
+    (注音輸入法會把路徑打成注音符號)。設完讀回來比對 (Windows 路徑不分大小寫)，一致才回傳 True。
+    """
+    try:
+        import uiautomation as auto
+        edit = auto.ControlFromHandle(dialog_hwnd).EditControl(AutomationId="1148")
+        if not edit.Exists(2, 0.2):
+            return False
+        pattern = edit.GetValuePattern()
+        pattern.SetValue(path)
+        time.sleep(0.3)
+        return os.path.normcase(os.path.normpath(pattern.Value)) == os.path.normcase(os.path.normpath(path))
+    except Exception:
         return False
 
+def _close_dialog(dialog_hwnd):
+    """關掉檔案對話框 (相當於按取消)，不會送出任何東西"""
+    try:
+        win32gui.PostMessage(dialog_hwnd, win32con.WM_CLOSE, 0, 0)
+    except Exception:
+        pass
+
+def send_image_via_attach_dialog(chat_hwnd, image_path):
+    """
+    透過輸入區的附加檔案按鈕送出圖片：點按鈕 -> 檔案對話框 -> UIA 填入完整路徑 -> Enter 開啟，LINE 接手直接送出。
+    回傳 True 表示已按下 Enter 且對話框已關閉 (圖片視為已送出)；任何一步沒把握都關掉對話框並回傳 False (什麼都沒送)。
+    每一步前都核驗前景視窗，避免點到別的視窗。
+    """
+    path = os.path.abspath(image_path)
+    if not os.path.isfile(path):
+        log_v(f"[錯誤] 要送出的圖片不存在: {path}")
+        return False
+    center = _find_attach_button_center(chat_hwnd)
+    if center is None:
+        log_v("[安全攔截] 找不到輸入區的附加檔案按鈕，終止發送。")
+        return False
+    if win32gui.GetForegroundWindow() != chat_hwnd:
+        log_v("[安全攔截] 點附加檔案按鈕前焦點已被移轉至其他視窗，終止發送。")
+        return False
+    pyautogui.click(center[0], center[1])
+    dialog = _find_open_dialog()
+    if dialog is None:
+        log_v("[安全攔截] 點了附加檔案按鈕但沒有出現檔案對話框，終止發送。")
+        return False
+    if not _set_dialog_filename(dialog, path):
+        log_v("[安全攔截] 無法把圖片路徑填入檔案對話框，取消發送。")
+        _close_dialog(dialog)
+        return False
+    if win32gui.GetForegroundWindow() != dialog:
+        log_v("[安全攔截] 按 Enter 前檔案對話框不在前景，取消發送。")
+        _close_dialog(dialog)
+        return False
+    pyautogui.press("enter")
+    deadline = time.time() + ATTACH_DIALOG_CLOSE_TIMEOUT
+    while win32gui.IsWindow(dialog) and win32gui.IsWindowVisible(dialog):
+        if time.time() >= deadline:
+            log_v("[安全攔截] 按 Enter 後檔案對話框沒有關閉，取消發送。")
+            _close_dialog(dialog)
+            return False
+        time.sleep(0.2)
+    return True
 def get_line_pids():
     pids = set()
     for p in psutil.process_iter(['pid', 'name']):
@@ -2830,53 +2930,22 @@ def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_f
     active_cache = get_active_line_cache_dir()
     before_cache_files = get_all_cache_files(active_cache)
 
-    # 複製圖片至剪貼簿
-    if not copy_image_to_clipboard(selected_image):
-        log_v("[錯誤] 複製圖片到剪貼簿失敗。")
-        _minimize_if_configured(chat_hwnd, config)
-        return "NOT_SENT"
-
-    time.sleep(0.3)
-    # 貼上前核驗前景視窗未被轉移
+    # 送出前核驗前景視窗未被轉移
     if win32gui.GetForegroundWindow() != chat_hwnd:
-        log_v(f"[安全攔截] 貼上前焦點已被移轉至其他視窗，終止貼上！")
+        log_v(f"[安全攔截] 送出前焦點已被移轉至其他視窗，終止發送！")
         _minimize_if_configured(chat_hwnd, config)
         return "NOT_SENT"
 
-    # 送出前最後微秒防禦 (TOCTOU 免疫)：貼上瞬間核驗前景 HWND
-    cur_fg = win32gui.GetForegroundWindow()
-    if cur_fg != chat_hwnd:
-        log_v(f"[安全攔截] 貼上瞬間焦點非目標視窗 (目前 HWND: {cur_fg})，終止發送！")
-        _minimize_if_configured(chat_hwnd, config)
-        return "NOT_SENT"
-
-    # 貼上圖片 (Ctrl+V) 與送出防護 (保證例外發生時不丟失記帳、不重複記帳且清空待送殘留)
-    pasted = False
+    # 送出圖片與記帳防護 (保證例外發生時不丟失記帳、不重複記帳)。圖片經附加檔案對話框送出，沒有貼上、不會在輸入框留下殘留
     enter_sent = False
     accounting_done = False
     history_recorded = False
     try:
-        pyautogui.hotkey('ctrl', 'v')
-        pasted = True
-        log_v(" -> 已貼上長輩圖，等待 LINE 預覽載入...")
-        time.sleep(1.0)
-
-        # 單次 Enter：送出前瞬間再次核驗前景 HWND (TOCTOU 雙重防禦)
-        if win32gui.GetForegroundWindow() != chat_hwnd:
-            log_v(f"[安全攔截] 送出長輩圖前焦點已被移轉至其他視窗，注入 Esc 取消預覽並終止發送！")
-            # 啟用並發送 Esc 清理輸入框與貼圖預覽，徹底杜絕待送圖片殘留
-            try:
-                win32gui.ShowWindow(chat_hwnd, win32con.SW_RESTORE)
-                activate_window(chat_hwnd)
-                time.sleep(0.1)
-                if win32gui.GetForegroundWindow() == chat_hwnd:
-                    pyautogui.press('esc')
-                time.sleep(0.2)
-            except Exception:
-                pass
+        log_v(" -> 透過附加檔案按鈕送出長輩圖...")
+        if not send_image_via_attach_dialog(chat_hwnd, selected_image):
+            log_v("[安全攔截] 無法經由附加檔案對話框送出長輩圖，本次未送出。")
             _minimize_if_configured(chat_hwnd, config)
             return "NOT_SENT"
-        pyautogui.press('enter')
         enter_sent = True
         time.sleep(1.0)
 
@@ -2941,15 +3010,7 @@ def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_f
     except Exception as e:
         log_v(f"[例外防護] 發送流程發生異常: {e}")
         if not enter_sent:
-            # 貼上後未送出 Enter 即中斷（包括 FailSafeException）：清空聊天室輸入框避免殘留圖片
-            if pasted:
-                try:
-                    if win32gui.GetForegroundWindow() == chat_hwnd:
-                        pyautogui.press('esc')
-                        pyautogui.hotkey('ctrl', 'a')
-                        pyautogui.press('backspace')
-                except Exception:
-                    pass
+            # 尚未送出就中斷（包括 FailSafeException）：send_image_via_attach_dialog 沒回傳 True 就代表什麼都沒送
             # 回傳 NOT_SENT 讓外層計入重試次數並執行指數退避，徹底杜絕無上限高頻無窮迴圈重試
             return "NOT_SENT"
         else:
