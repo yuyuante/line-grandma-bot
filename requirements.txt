@@ -4,3 +4,4 @@ psutil>=5.9.0
 pillow>=10.0.0
 
 uiautomation>=2.0.18
+rapidocr-onnxruntime>=1.3.0   # 離線中文 OCR (辨識圖片性質、時段、節日)；沒安裝時退回 Windows 內建 OCR，辨識率大幅下降

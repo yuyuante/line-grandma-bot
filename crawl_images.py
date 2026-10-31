@@ -195,10 +195,39 @@ def build_candidate_urls(sources=None):
     """相容舊介面：只回傳隨機排序的候選網址"""
     return [url for url, _ in build_candidates(sources)]
 
+FESTIVAL_LISTING_URL = "https://sticker.fpg.com.tw/festival_all.aspx"
+FESTIVAL_BASE_URL = "https://sticker.fpg.com.tw/"
+_FESTIVAL_IMAGE_RE = re.compile(r'data-original="(sticker/festival-(?:illustration|photo)/[a-z-]+-\d+\.jpg)"')
+FESTIVAL_CACHE_SECONDS = 3600
+_festival_cache = {"time": 0.0, "urls": []}
+
+def fetch_festival_candidates(listing_url=FESTIVAL_LISTING_URL, now=None):
+    """
+    取得節慶圖的候選清單 [(網址, None)]，隨機排序。節日圖的編號不連續 (只有部分編號存在)，所以要先讀列表頁
+    取得有效的圖片網址；festival-short 是影片 (6~10MB)，不收。一小時內重複呼叫用快取，抓不到回傳空清單。
+    """
+    now = time.time() if now is None else now
+    if _festival_cache["urls"] and now - _festival_cache["time"] < FESTIVAL_CACHE_SECONDS:
+        urls = list(_festival_cache["urls"])
+    else:
+        try:
+            req = urllib.request.Request(listing_url, headers=HEADERS)
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                html = resp.read(4 * 1024 * 1024).decode("utf-8", errors="ignore")
+        except Exception as e:
+            log_crawl(f"[警告] 讀取節慶圖列表失敗: {e}")
+            return []
+        paths = sorted(set(_FESTIVAL_IMAGE_RE.findall(html)))
+        urls = [FESTIVAL_BASE_URL + p for p in paths]
+        if urls:
+            _festival_cache.update({"time": now, "urls": urls})
+    random.shuffle(urls)
+    return [(u, None) for u in urls]
+
 def crawl_grandma_images(target_count=10, keywords=None, save_dir=DEFAULT_IMAGES_DIR, sources=None, on_saved=None):
     """
     從長輩圖圖庫隨機抓取全新長輩圖。來源由 sources 指定 (見 DEFAULT_IMAGE_SOURCES，預設是 Formosa 貼圖酷的
-    每日問候攝影與插畫)。on_saved(路徑, 該來源的類別或 None) 在每張圖存檔後呼叫，讓呼叫端記下來源標明的時段。
+    每日問候攝影與插畫)。on_saved(路徑, 該來源的類別或 None) 在每張圖存檔後呼叫，回傳 False 表示不要這張圖 (已被呼叫端捨棄，不計入張數)。
     """
     os.makedirs(save_dir, exist_ok=True)
     existing_md5s = get_existing_md5s(save_dir)
@@ -220,14 +249,15 @@ def crawl_grandma_images(target_count=10, keywords=None, save_dir=DEFAULT_IMAGES
             break
         saved = download_and_validate_image(u, save_dir, existing_md5s)
         if saved:
-            downloaded_count += 1
             consecutive_fails = 0
-            log_crawl(f" -> [{downloaded_count}/{target_count}] 成功下載正統長輩圖: {os.path.basename(saved)}")
             if on_saved:
                 try:
-                    on_saved(saved, category)
+                    if on_saved(saved, category) is False:      # 呼叫端回傳 False = 這張圖不要 (例如辨識不出來，已捨棄)，不計入張數
+                        continue
                 except Exception as e:
-                    log_crawl(f"[警告] 記錄圖片來源類別失敗: {e}")
+                    log_crawl(f"[警告] 處理下載的圖片失敗: {e}")
+            downloaded_count += 1
+            log_crawl(f" -> [{downloaded_count}/{target_count}] 成功下載正統長輩圖: {os.path.basename(saved)}")
             time.sleep(0.2)
         else:
             consecutive_fails += 1

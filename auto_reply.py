@@ -37,11 +37,16 @@ from PIL import Image, ImageGrab, ImageOps
 import pyautogui
 
 import notifier
+import ocr_engine
+import image_kind
+import image_library
+import reply_budget
+import crawl_images
 from crawl_images import (crawl_grandma_images, clean_expired_images, retire_image,
                           download_and_validate_image, get_existing_md5s, build_candidate_urls,
                           build_candidates, normalize_sources)
 
-VERSION = "2.6.0"
+VERSION = "2.7.0"
 
 # 0. 全系統單一執行個體鎖 (Windows Named Mutex)，防止重複啟動繞過斷路器
 _app_mutex_handle = None
@@ -107,6 +112,8 @@ CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
 HISTORY_PATH = os.path.join(SCRIPT_DIR, "contact_history.json")
 IMAGE_TAGS_PATH = os.path.join(SCRIPT_DIR, "image_tags.json")
 CHAT_MAP_PATH = os.path.join(SCRIPT_DIR, "chat_dirs.json")
+IMAGE_KINDS_PATH = os.path.join(SCRIPT_DIR, "image_kinds.json")        # 每張圖的性質 (辨識過一次就快取)
+REPLY_COUNTS_PATH = os.path.join(SCRIPT_DIR, "reply_counts.json")      # 每個聊天室今天已回覆幾次
 NOTIFY_STATE_PATH = os.path.join(SCRIPT_DIR, "notify_state.json")   # 本月已推播則數 (見 notifier.py)
 
 def atomic_save_json(file_path, data):
@@ -157,6 +164,9 @@ DEFAULT_CONFIG = {
     "time_aware_images": True,          # 依時段挑圖：早上不送晚安圖、晚上不送早安圖 (標記為 neutral 的無時段字樣圖不受限)
     "stop_command": "結束長輩圖機器人",   # 停止指令：你在 stop_command_chats 內的聊天室自己發了含此文字的訊息，程式立即結束
     "stop_command_chats": [],            # 接受你下停止指令的聊天室名單 (預設空白 = 停用)
+    "max_replies_per_day": 3,           # 每個聊天室每天最多回覆幾次 (本機午夜重置，只計實際送出的；0 = 不限次數)
+    "max_image_pool": 120,              # 圖庫上限張數：即時抓圖時辨識得出但用不到的圖，超過這個數量就不留
+    "instant_crawl_max_downloads": 40,  # 圖庫沒有合適的圖時，立即上網抓圖最多下載幾張 (節日圖加倍)
     "image_sources": [],                # 圖庫來源 (網址範本、編號範圍、選填時段類別，見 crawl_images.py)；空白 = 預設的 Formosa 貼圖酷每日問候攝影與插畫
     "require_grandma_image": True,      # 對方傳來的圖要先辨識為長輩圖才回覆；貼圖、生活照、無法辨識的一律不理會
     "auto_neutral_images": False,       # 【開發中，預設關閉】沒有符合目前時段的圖時，用 OCR 讀得到字、但沒有問候語與節慶字樣的圖代替。實測 OCR 常讀不出藝術字的問候語，開啟會把早安圖誤判成無時段
@@ -232,6 +242,12 @@ def load_config():
                     if msg not in _WARNED_ONCE:
                         _WARNED_ONCE.add(msg)            # 主迴圈每秒讀一次設定，同一則警告只印一次
                         logging.warning(f"image_sources {msg}")
+        for k, minimum in (("max_replies_per_day", 0), ("max_image_pool", 1), ("instant_crawl_max_downloads", 1)):
+            if k in cfg:
+                try:
+                    sanitized[k] = max(minimum, int(cfg[k]))
+                except Exception:
+                    pass
         if isinstance(cfg.get("notify_log"), bool):
             sanitized["notify_log"] = cfg["notify_log"]
         try:
@@ -474,9 +490,25 @@ def _tag_source_category(path, category):
     if category:
         set_image_slots(path, [category])
 
+def _ingest_downloaded(path, category):
+    """下載後立即辨識性質：辨識不出來的圖直接捨棄 (不入庫，回傳 False 讓爬蟲不計入張數)；辨識得出的留下"""
+    _tag_source_category(path, category)
+    try:
+        kind, _ = KIND_INDEX.classify(path)
+    except Exception:
+        kind = None
+    if kind is None:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        log_v(f" -> [辨識不出來捨棄] {os.path.basename(path)} 辨識不出性質，已捨棄。")
+        return False
+    return True
+
 def crawl_images_now(target_count, save_dir):
-    """依設定的來源下載新長輩圖，並記下來源標明的時段"""
-    return crawl_grandma_images(target_count=target_count, save_dir=save_dir, sources=_IMAGE_SOURCES, on_saved=_tag_source_category)
+    """依設定的來源下載新長輩圖；辨識不出性質的圖當場捨棄"""
+    return crawl_grandma_images(target_count=target_count, save_dir=save_dir, sources=_IMAGE_SOURCES, on_saved=_ingest_downloaded)
 
 OCR_VARIANT_MAX_SIDE = 1600     # 前處理後的圖最長邊上限 (太大辨識很慢)
 OCR_VARIANT_MIN_SIDE = 700      # 最長邊低於此值就放大 2 倍 (小字放大後較容易辨識)
@@ -518,41 +550,54 @@ def ocr_image_text_variants(image_path):
             except OSError:
                 pass
 
+def _fallback_ocr(image):
+    """RapidOCR 不能用時的後備：Windows 內建 OCR 多種前處理的文字串在一起 (辨識率低很多)。image 是檔案路徑或 PIL 圖片"""
+    if isinstance(image, str):
+        return "".join(ocr_image_text_variants(image))
+    fd, tmp = tempfile.mkstemp(suffix=".png")
+    os.close(fd)
+    try:
+        image.save(tmp)
+        return "".join(ocr_image_text_variants(tmp))
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+def ocr_text(image):
+    """辨識圖片上的文字：RapidOCR 優先，沒安裝時退回 Windows 內建 OCR。image 是檔案路徑或 PIL 圖片"""
+    return ocr_engine.read_text(image, fallback=_fallback_ocr)
+
+KIND_INDEX = image_library.KindIndex(IMAGE_KINDS_PATH, ocr_text)   # 圖庫的性質索引
+
 GRANDMA_MIN_SIDE = 250          # 邊長低於此值的圖 (LINE 貼圖、縮圖) 不是長輩圖
-GRANDMA_KEYWORDS = (
-    "早安", "晚安", "午安", "日安", "晨", "平安", "喜樂", "順心", "問候", "祝",
-    "感恩", "幸福", "吉祥", "健康", "如意", "快樂", "笑口常開", "佛", "南無",
-    "慈悲", "福", "蓮花", "認同請分享", "知足", "心靈", "語錄", "美麗", "微笑",
-    "美好", "珍惜", "善", "緣", "善緣", "祝福"
-)
-_GRANDMA_ID_CACHE = {}          # {圖片 MD5: 是否為長輩圖}，同一張圖在同一次執行只辨識一次 (回覆前辨識、收納時再問一次會直接用快取)
+_FILE_KIND_CACHE = {}           # {圖片 MD5: (性質或 None, 文字)}，同一張圖在同一次執行只辨識一次
 
-def _grandma_keywords_in_variants(image_path):
-    """多種前處理的 OCR 任一種讀到長輩圖關鍵字就回傳 True (找到就停，不再跑後面的前處理)"""
-    for text in ocr_image_text_variants(image_path):
-        if any(kw in text for kw in GRANDMA_KEYWORDS):
-            return True
-    return False
-
-def is_authentic_grandma_image(image_path):
+def _recognize_file(image_path):
     """
-    判斷圖片檔是不是真正的長輩圖：邊長至少 GRANDMA_MIN_SIDE，且 Windows OCR (多種前處理，任何一種讀到即可)
-    讀得到早安、平安、祝福、喜樂等關鍵字。寵物照、生活照、自拍、截圖、LINE 貼圖都回傳 False。
-    OCR 讀不出字也回傳 False (Fail-Closed：不回覆、不收納)。
-    注意：LINE 的快取檔 (.eimg) 是加密的，Pillow 打不開，這裡一律回傳 False；識別對方傳來的圖請用 identify_incoming_image。
+    辨識一個可以開啟的圖片檔，回傳 (性質或 None, 清理過的文字)。邊長小於 GRANDMA_MIN_SIDE (貼圖、縮圖)、
+    開不了、OCR 失敗、認不出性質都回傳 (None, "")。注意：LINE 的快取檔 (.eimg) 是加密的，Pillow 打不開。
     """
     try:
         md5 = get_file_md5(image_path)
-        if md5 in _GRANDMA_ID_CACHE:
-            return _GRANDMA_ID_CACHE[md5]
+        if md5 in _FILE_KIND_CACHE:
+            return _FILE_KIND_CACHE[md5]
         with Image.open(image_path) as img:
             width, height = img.size
-        result = min(width, height) >= GRANDMA_MIN_SIDE and _grandma_keywords_in_variants(image_path)
+        result = (None, "")
+        if min(width, height) >= GRANDMA_MIN_SIDE:
+            text = ocr_text(image_path)
+            result = (image_kind.classify_text(text), image_library.clean_text(text))
         if md5:
-            _GRANDMA_ID_CACHE[md5] = result
+            _FILE_KIND_CACHE[md5] = result
         return result
     except Exception:
-        return False
+        return None, ""
+
+def is_authentic_grandma_image(image_path):
+    """圖片檔是不是辨識得出性質的長輩圖 (見 _recognize_file)"""
+    return _recognize_file(image_path)[0] is not None
 
 GRANDMA_SCREEN_MIN_WIDTH = 200  # 聊天室截圖裡，圖片內容寬度 (邏輯像素) 低於此值視為貼圖 (LINE 貼圖約 120~180px，照片縮圖 250px 以上)
 GRANDMA_MEDIA_CROP_WIDTH = 420  # 截圖時從左側取樣帶起算的最大寬度 (邏輯像素)，涵蓋圖片縮圖又不會取到太多空白
@@ -587,48 +632,62 @@ def _incoming_media_crop(chat_hwnd):
     box = (max(0, min(xs) - pad), max(0, top - pad), min(shot.width, max(xs) + pad + 1), min(shot.height, bottom + pad + 1))
     return shot.crop(box), int((max(xs) - min(xs) + 1) / scale)
 
-def _grandma_in_chat_screenshot(chat_hwnd):
-    """用聊天室截圖識別最底部左側的圖：True (長輩圖)、False (貼圖或不是長輩圖)、None (暫時無法判斷)"""
-    found = _incoming_media_crop(chat_hwnd)
+IMAGE_LOAD_WAIT_SECONDS = 8.0   # 圖片縮圖還在載入時 (灰色佔位方塊) 最多等幾秒；等不到變大才當成貼圖或文字
+IMAGE_LOAD_POLL_SECONDS = 1.0
+
+def _recognize_chat_screenshot(chat_hwnd):
+    """
+    用聊天室截圖辨識最底部左側那張圖，回傳 (狀態, 性質, 文字)：
+    狀態 True (辨識得出性質)、False (貼圖，或辨識不出來)、None (暫時無法判斷：截不到圖、OCR 暫時不能用)。
+    內容寬度不到 GRANDMA_SCREEN_MIN_WIDTH 可能是貼圖，也可能是圖片還在載入 (LINE 先顯示一個灰色小方塊)，
+    所以每秒重新截圖，最多等 IMAGE_LOAD_WAIT_SECONDS 秒，還是很小才判定是貼圖。
+    """
+    deadline = time.time() + IMAGE_LOAD_WAIT_SECONDS
+    while True:
+        found = _incoming_media_crop(chat_hwnd)
+        if (found is not None and found[1] >= GRANDMA_SCREEN_MIN_WIDTH) or time.time() >= deadline:
+            break
+        time.sleep(IMAGE_LOAD_POLL_SECONDS)
     if found is None:
-        return None
+        return None, None, ""
     crop, content_width = found
     if content_width < GRANDMA_SCREEN_MIN_WIDTH:
-        return False
-    fd, tmp = tempfile.mkstemp(suffix=".png")
-    os.close(fd)
+        return False, None, ""
     try:
-        crop.save(tmp)
-        return _grandma_keywords_in_variants(tmp)
-    finally:
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
+        text = ocr_text(crop)
+    except Exception:
+        return None, None, ""
+    kind = image_kind.classify_text(text)
+    return kind is not None, kind, image_library.clean_text(text)
 
-def identify_incoming_image(triggered_file, chat_hwnd=None):
+def recognize_incoming_image(triggered_file, chat_hwnd=None):
     """
-    識別對方傳來的圖是不是長輩圖：True / False / None (None = 現在無法判斷，要等視窗在前景再問一次)。
+    辨識對方傳來的圖，回傳 (狀態, 性質, 文字)：狀態 True (辨識得出性質，是長輩圖)、False (不是長輩圖，或辨識不出來)、
+    None (現在無法判斷，要等視窗在前景再問一次)。辨識不出來的圖一律不理會。
     - 沒有觸發檔 (例如只傳文字)：False。
-    - 快取檔是一般圖片：直接 OCR 檔案。
-    - 快取檔是加密的 .eimg (LINE 電腦版的實際情況)：改截聊天視窗裡那張圖的縮圖來 OCR。
+    - 快取檔是一般圖片：直接辨識檔案。
+    - 快取檔是加密的 .eimg (LINE 電腦版的實際情況)：改截聊天視窗裡那張圖的縮圖來辨識。
       只在視窗已是前景時才截圖 (視窗被別的視窗蓋住時截到的是別人的畫面)，否則回傳 None 延後判斷。
     """
     if not triggered_file:
-        return False
+        return False, None, ""
     if _can_decode_image(triggered_file):
-        return is_authentic_grandma_image(triggered_file)
+        kind, text = _recognize_file(triggered_file)
+        return kind is not None, kind, text
     try:
         if (chat_hwnd is not None and win32gui.IsWindow(chat_hwnd) and not win32gui.IsIconic(chat_hwnd)
                 and win32gui.IsWindowVisible(chat_hwnd) and win32gui.GetForegroundWindow() == chat_hwnd):
-            return _grandma_in_chat_screenshot(chat_hwnd)
+            return _recognize_chat_screenshot(chat_hwnd)
     except Exception:
         pass
-    return None
+    return None, None, ""
 
-def _skip_not_grandma(target_name, triggered_file, config):
-    """略過不是長輩圖的來訊：記下對方傳過這張 (百輪內不回送給本人)，回傳結果代碼"""
-    log_v(f"[非長輩圖略過]「{target_name}」傳來的不是長輩圖 (或無法辨識)，不回覆。")
+def _skip_not_grandma(target_name, triggered_file, config, incoming_text=""):
+    """略過不是長輩圖 (或辨識不出來、或是競選圖) 的來訊：記下對方傳過這張 (百輪內不回送給本人)，回傳結果代碼"""
+    if image_kind.is_campaign_text(incoming_text):
+        log_v(f"[競選圖略過]「{target_name}」傳來的是候選人或競選相關的圖，不回覆。")
+    else:
+        log_v(f"[非長輩圖略過]「{target_name}」傳來的不是長輩圖 (或辨識不出來)，不回覆。")
     md5 = get_file_md5(triggered_file) if triggered_file else None
     if md5:
         record_contact_received(target_name, md5, max_rounds=config.get("history_rounds", 100))
@@ -2399,15 +2458,24 @@ def _left_message_blocks(chat_hwnd, side="left"):
 MEDIA_CHECK_ATTEMPTS = 3        # 剛把視窗還原並帶到前景時，LINE 可能還沒重繪完，判斷不出來就稍等再試
 MEDIA_CHECK_RETRY_WAIT = 0.8    # 每次重試前等待的秒數
 
-def _media_type_with_retry(chat_hwnd):
-    """last_left_message_is_media 加上重試：回傳 True (照片或貼圖)、False (文字)、None (試完仍無法判斷)"""
+def _media_type_with_retry(chat_hwnd, expect_media=False):
+    """
+    last_left_message_is_media 加上重試：回傳 True (照片或貼圖)、False (文字)、None (試完仍無法判斷)。
+    expect_media=True 表示這次是被「圖片快取」觸發的，最後一則一定是圖：圖還在載入時 LINE 顯示的灰色方塊
+    會被看成文字氣泡，所以判成文字也要重試，最多等 IMAGE_LOAD_WAIT_SECONDS 秒。
+    """
     result = None
-    for attempt in range(MEDIA_CHECK_ATTEMPTS):
+    attempts = MEDIA_CHECK_ATTEMPTS
+    wait = MEDIA_CHECK_RETRY_WAIT
+    if expect_media:
+        wait = IMAGE_LOAD_POLL_SECONDS
+        attempts = max(attempts, int(IMAGE_LOAD_WAIT_SECONDS / wait) + 1)
+    for attempt in range(attempts):
         result = last_left_message_is_media(chat_hwnd)
-        if result is not None:
+        if result is True or (result is False and not expect_media):
             return result
-        if attempt < MEDIA_CHECK_ATTEMPTS - 1:
-            time.sleep(MEDIA_CHECK_RETRY_WAIT)
+        if attempt < attempts - 1:
+            time.sleep(wait)
     return result
 
 def last_left_message_is_media(chat_hwnd):
@@ -2805,38 +2873,124 @@ def _verify_message_sent_to_chat(chat_hwnd):
         return False
 
 
+def report_ocr_engine():
+    """啟動時回報用哪一套 OCR；沒安裝 RapidOCR 要明確警告 (辨識率會大幅下降，節日、時段、性質多半認不出來)"""
+    if ocr_engine.is_available():
+        log_v("[OCR] 使用 RapidOCR (離線)。")
+        return True
+    log_v(f"⚠️ [警告] 找不到 RapidOCR ({ocr_engine.unavailable_reason()})，退回 Windows 內建 OCR，辨識率大幅下降，"
+          "多數圖會辨識不出來而被捨棄。請執行: pip install rapidocr-onnxruntime")
+    return False
+
+def warm_up_image_library(config):
+    """在背景預先辨識整個圖庫 (結果快取在 image_kinds.json，之後挑圖不必等)，完成後回報各性質的張數"""
+    images_dir = config.get("images_dir", "images")
+    abs_dir = images_dir if os.path.isabs(images_dir) else os.path.join(SCRIPT_DIR, images_dir)
+
+    def work():
+        try:
+            library = image_library.scan_library(abs_dir, KIND_INDEX, log=log_v)
+            counts = {}
+            for img in library:
+                counts[img.kind.category] = counts.get(img.kind.category, 0) + 1
+            detail = "、".join(f"{image_kind.CATEGORY_NAMES[c]} {n}" for c, n in sorted(counts.items())) or "沒有"
+            log_v(f"[圖庫] 辨識完成：可用 {len(library)} 張 ({detail})。辨識不出性質的圖不會被挑到。")
+        except Exception as e:
+            log_v(f"[警告] 預先辨識圖庫失敗: {e}")
+
+    threading.Thread(target=work, name="library-warmup", daemon=True).start()
+
+SKIPPED_RESULTS = ("SKIPPED_TEXT", "SKIPPED_NOT_GRANDMA", "SKIPPED_DAILY_LIMIT", "SKIPPED_NO_IMAGE")   # 已處理、沒有送出：不啟動冷卻、不重試
+
+def _record_reply(target_name):
+    """記下一次實際送出的回覆：冷卻、斷路器用的記帳，加上每日上限的計數"""
+    record_reply_sent(target_name)
+    reply_budget.record_reply(REPLY_COUNTS_PATH, target_name)
+
+def _forbidden_md5s(target_name, config):
+    """百輪內不能再送給該對象的圖的 MD5 集合 (曾送出的加上對方曾傳來的)"""
+    max_rounds = config.get("history_rounds", 100)
+    history = load_contact_history()
+    contact_data = history.get(target_name, {"sent": [], "received": []})
+    if not isinstance(contact_data, dict):
+        contact_data = {"sent": [], "received": []}
+    sent_list = contact_data.get("sent", []) if isinstance(contact_data.get("sent"), list) else []
+    recv_list = contact_data.get("received", []) if isinstance(contact_data.get("received"), list) else []
+    return set(sent_list[-max_rounds:] + recv_list[-max_rounds:])
+
+def choose_reply_image(target_name, incoming_kind, incoming_text, config):
+    """
+    依對方傳來的圖的性質挑回覆用的圖 (規則見 image_library.py)：同性質但不同張、百輪內沒送過。
+    圖庫沒有合適的圖就立即上網抓 (邊抓邊辨識，抓到符合的就停)。挑不到回傳 None。
+    """
+    images_dir = config.get("images_dir", "images")
+    abs_dir = images_dir if os.path.isabs(images_dir) else os.path.join(SCRIPT_DIR, images_dir)
+    forbidden = _forbidden_md5s(target_name, config)
+    slot = current_time_slot()
+    pools = image_library.candidate_pools(incoming_kind, slot, config.get("time_aware_images", True))
+    library = image_library.scan_library(abs_dir, KIND_INDEX, log=log_v)
+    is_festival = incoming_kind.category == "festival"
+    for pool in pools:
+        picked = image_library.pick_from_pool(library, pool, incoming_text, forbidden)
+        if picked:
+            log_v(f" -> 圖庫挑到 {os.path.basename(picked.path)} ({picked.kind.label})，對方傳來的是 {incoming_kind.label}。")
+            return picked.path
+        if not config.get("auto_crawl_images", True):
+            continue
+        log_v(f" -> [即時抓圖] 圖庫沒有合適的圖 (對方傳來 {incoming_kind.label}，現在時段 {slot})，立即上網抓...")
+        candidates = crawl_images.fetch_festival_candidates() if is_festival else build_candidates(_IMAGE_SOURCES)
+        limit = config.get("instant_crawl_max_downloads", 40) * (2 if is_festival else 1)
+        fetched = image_library.fetch_matching(pool, abs_dir, KIND_INDEX, candidates, download_and_validate_image,
+                                               incoming_text, forbidden, max_downloads=limit,
+                                               max_pool=config.get("max_image_pool", 120), log=log_v)
+        if fetched:
+            log_v(f" -> [即時抓圖] 抓到 {os.path.basename(fetched.path)} ({fetched.kind.label})。")
+            return fetched.path
+        library = image_library.scan_library(abs_dir, KIND_INDEX, log=log_v)     # 抓的過程中留下的庫存，下一個池子可能用得到
+    return None
+
 def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_file=None):
     """執行長輩圖發送"""
     global last_global_reply_time
-    # 識別關卡 (Fail-Closed)：對方傳來的必須是長輩圖才回。貼圖、生活照、無法辨識的、沒有圖可驗證的 (例如只傳文字) 一律不理會
+    # 每日上限：每個聊天室一天最多回覆 max_replies_per_day 次 (本機午夜重置，只計實際送出的)
+    max_per_day = config.get("max_replies_per_day", reply_budget.DEFAULT_MAX_PER_DAY)
+    if not reply_budget.can_reply(REPLY_COUNTS_PATH, target_name, max_per_day):
+        log_v(f"[每日上限]「{target_name}」今天已回覆 {reply_budget.count_today(REPLY_COUNTS_PATH, target_name)} 次 (上限 {max_per_day} 次)，不再回覆。")
+        return "SKIPPED_DAILY_LIMIT"
+
+    # 識別關卡 (Fail-Closed)：對方傳來的必須是辨識得出性質的長輩圖才回。貼圖、生活照、辨識不出來的、沒有圖可驗證的 (例如只傳文字) 一律不理會
     deferred_identify = False
+    incoming_kind, incoming_text = None, ""
     if config.get("require_grandma_image", True):
         early = find_target_chat_window(target_name)
-        verdict = identify_incoming_image(triggered_file, early[0][0] if early else None)
-        if verdict is False:
-            return _skip_not_grandma(target_name, triggered_file, config)
-        if verdict:
-            log_v(f" -> [長輩圖識別]「{target_name}」傳來的圖通過長輩圖識別。")
-        deferred_identify = verdict is None     # 加密快取且視窗不在前景：等實際要回覆、視窗已帶到前景時再用截圖判斷
+        state, incoming_kind, incoming_text = recognize_incoming_image(triggered_file, early[0][0] if early else None)
+        if state is False:
+            return _skip_not_grandma(target_name, triggered_file, config, incoming_text)
+        if state:
+            log_v(f" -> [長輩圖識別]「{target_name}」傳來的圖通過識別，性質：{incoming_kind.label}。")
+        deferred_identify = state is None     # 加密快取且視窗不在前景：等實際要回覆、視窗已帶到前景時再用截圖辨識
+    else:
+        incoming_kind = image_kind.ImageKind("greeting")     # 關閉識別：不管對方傳什麼，一律照現在時段回問候圖 (舊行為)
+
     # 借花獻佛：僅精確收納本次觸發該回覆的圖片，絕不掃描其他聊天室快取
     if config.get("collect_incoming_images", True) and triggered_file:
         max_rounds = config.get("history_rounds", 100)
         harvest_line_incoming_images(config.get("images_dir", "images"), sender_name=target_name, max_rounds=max_rounds, specific_file_path=triggered_file)
 
-    auto_crawl = config.get("auto_crawl_images", True)
-    min_pool = config.get("min_image_pool", 10)
-    images = get_images(config.get("images_dir", "images"), auto_replenish=auto_crawl, min_pool=min_pool)
-    if not images:
-        log_v(f"[錯誤] {config.get('images_dir', 'images')} 資料夾中沒有任何圖片！請放入長輩圖。")
-        return "NOT_SENT"
+    # 圖庫庫存不足時先補一批 (辨識不出來的會被捨棄)
+    get_images(config.get("images_dir", "images"), auto_replenish=config.get("auto_crawl_images", True), min_pool=config.get("min_image_pool", 10))
 
-    # 依據百輪記憶挑選一張不重複的長輩圖
-    selected_image = pick_unique_image(images, target_name, config)
-    if not selected_image:
-        log_v(f"⚠️ [百輪保護安全攔截] 無可用之未重複合規長輩圖，安全終止回覆流程。")
-        return "NOT_SENT"
+    selected_image = None
+    picked_slot = current_time_slot()
     log_v(f"\n偵測到「{target_name}」發來訊息！")
-    log_v(f" -> 隨機挑選一張合格且百輪不重複長輩圖: {os.path.basename(selected_image)}")
+    if not deferred_identify:
+        selected_image = choose_reply_image(target_name, incoming_kind, incoming_text, config)
+        if not selected_image:
+            log_v(f"[無合適圖片]「{target_name}」傳來 {incoming_kind.label}，圖庫與即時抓圖都找不到合適的回覆圖，本次不回覆。")
+            return "SKIPPED_NO_IMAGE"
+        log_v(f" -> 挑選回覆圖片: {os.path.basename(selected_image)}")
+    else:
+        log_v(" -> 對方那張圖的性質等視窗在前景時再辨識。")
 
     # 隨機延遲時間 (避免固定規律被看穿是機器人)
     min_d = max(1, config.get("min_delay_seconds", 5))
@@ -2845,17 +2999,14 @@ def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_f
     log_v(f" -> 為了模擬真人自然反應，本次隨機等待 {delay} 秒後發送...")
     countdown_sleep(delay, abort_check=lambda: check_stop_command(config))
 
-    # 等待期間時段可能已跨越 (例如 10:55 挑早安圖、11:10 才送出)：送出前重驗，不符則重新挑圖
-    if config.get("time_aware_images", False):
-        new_slot = current_time_slot()
-        picked_slots = classify_image_slots(selected_image)
-        if picked_slots is None or ("neutral" not in picked_slots and new_slot not in picked_slots):
-            log_v(f" -> [時段重驗] 等待後時段已變為 {new_slot}，原圖不再適用，重新挑選...")
-            selected_image = pick_unique_image(images, target_name, config)
-            if not selected_image:
-                log_v("⚠️ [時段保護] 重新挑選後仍無合適長輩圖，安全終止本次發送。")
-                return "NOT_SENT"
-            log_v(f" -> [時段重驗] 改選圖片: {os.path.basename(selected_image)}")
+    # 等待期間時段可能已跨越 (例如 10:55 挑早安圖、11:10 才送出)：節日以外的回覆送出前重新挑圖
+    if selected_image and config.get("time_aware_images", True) and incoming_kind.category != "festival" and current_time_slot() != picked_slot:
+        log_v(f" -> [時段重驗] 等待後時段已變為 {current_time_slot()}，重新挑選...")
+        selected_image = choose_reply_image(target_name, incoming_kind, incoming_text, config)
+        if not selected_image:
+            log_v("⚠️ [時段保護] 重新挑選後仍無合適長輩圖，安全終止本次發送。")
+            return "SKIPPED_NO_IMAGE"
+        log_v(f" -> [時段重驗] 改選圖片: {os.path.basename(selected_image)}")
 
     # 尋找現有聊天視窗 (嚴格 Fail-Closed，絕不盲目模擬搜尋或開啟其他視窗)
     matched = find_target_chat_window(target_name)
@@ -2903,7 +3054,7 @@ def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_f
 
     # 訊息類型核驗 (Fail-Closed)：對方最後一則若只是文字氣泡，不需回應 (trigger_mode="all" 時文字也要回，不套用)
     if config.get("trigger_mode", "photo_and_sticker") != "all":
-        is_media = _media_type_with_retry(chat_hwnd)
+        is_media = _media_type_with_retry(chat_hwnd, expect_media=triggered_file is not None)
         if is_media is None:
             # 重試後仍無法判斷 (截圖失敗、視窗被遮住等)：不丟棄，走既有重試流程
             log_v(f"[訊息類型待確認]「{target_name}」暫時無法判斷最後一則訊息類型，本次不發送，稍後重試。")
@@ -2914,17 +3065,23 @@ def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_f
             _minimize_if_configured(chat_hwnd, config)
             return "SKIPPED_TEXT"
 
-    # 延後的長輩圖識別：視窗此時已在前景，用截圖判斷對方那張圖是不是長輩圖 (Fail-Closed)
+    # 延後的識別：視窗此時已在前景，用截圖辨識對方那張圖的性質 (Fail-Closed)，再挑回覆圖
     if deferred_identify:
-        verdict = identify_incoming_image(triggered_file, chat_hwnd)
-        if verdict is None:
+        state, incoming_kind, incoming_text = recognize_incoming_image(triggered_file, chat_hwnd)
+        if state is None:
             log_v(f"[長輩圖識別待確認]「{target_name}」暫時無法識別對方傳來的圖，本次不發送，稍後重試。")
             _minimize_if_configured(chat_hwnd, config)
             return "NOT_SENT"
-        if not verdict:
+        if not state:
             _minimize_if_configured(chat_hwnd, config)
-            return _skip_not_grandma(target_name, triggered_file, config)
-        log_v(f" -> [長輩圖識別]「{target_name}」傳來的圖通過長輩圖識別 (視窗截圖)。")
+            return _skip_not_grandma(target_name, triggered_file, config, incoming_text)
+        log_v(f" -> [長輩圖識別]「{target_name}」傳來的圖通過識別 (視窗截圖)，性質：{incoming_kind.label}。")
+        selected_image = choose_reply_image(target_name, incoming_kind, incoming_text, config)
+        if not selected_image:
+            log_v(f"[無合適圖片]「{target_name}」傳來 {incoming_kind.label}，圖庫與即時抓圖都找不到合適的回覆圖，本次不回覆。")
+            _minimize_if_configured(chat_hwnd, config)
+            return "SKIPPED_NO_IMAGE"
+        log_v(f" -> 挑選回覆圖片: {os.path.basename(selected_image)}")
 
     # 發送前先對快取進行檔案集合快照 (包含 mtime 與大小)
     active_cache = get_active_line_cache_dir()
@@ -2976,7 +3133,7 @@ def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_f
 
         send_now = time.time()
         last_global_reply_time = send_now
-        record_reply_sent(target_name)
+        _record_reply(target_name)
         accounting_done = True
 
         if new_count > 0:
@@ -3018,7 +3175,7 @@ def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_f
             if not accounting_done:
                 send_now = time.time()
                 last_global_reply_time = send_now
-                record_reply_sent(target_name)
+                _record_reply(target_name)
                 accounting_done = True
             if not history_recorded:
                 sent_md5 = get_file_md5(selected_image)
@@ -3401,9 +3558,9 @@ def check_for_incoming_messages(config):
         prev_reply_time = last_reply_times.get(target_to_reply, 0)
         send_result = send_grandma_image(target_to_reply, config, triggered_file=new_image_found)
         # 對方只傳文字而略過時沒有送出任何東西，不啟動冷卻 (避免擋住隨後真正的新圖)
-        last_reply_times[target_to_reply] = prev_reply_time if send_result in ("SKIPPED_TEXT", "SKIPPED_NOT_GRANDMA") else time.time()
+        last_reply_times[target_to_reply] = prev_reply_time if send_result in SKIPPED_RESULTS else time.time()
 
-        if send_result in ("SENT_CONFIRMED", "SENT_UNCERTAIN", "SKIPPED_TEXT", "SKIPPED_NOT_GRANDMA"):
+        if send_result in ("SENT_CONFIRMED", "SENT_UNCERTAIN") + SKIPPED_RESULTS:
             # 為防重複刷屏一律視為已處理並更新基準線 (SKIPPED_TEXT：對方只傳文字，同樣標記已處理且不重試)
             if new_image_found:
                 try:
@@ -3828,6 +3985,8 @@ def main():
     log_v("快取監聽基準線已就緒，正靜態待命中...")
     print("-" * 65)
 
+    report_ocr_engine()
+    warm_up_image_library(config)
     configure_notifier(config)
     notifier.install_logging_handler()
     stop_chats_desc = "、".join(config.get("stop_command_chats", [])) or "未啟用"

@@ -96,6 +96,40 @@ class TestCrawlSources(unittest.TestCase):
         got, _ = self._crawl(boom, count=3)
         self.assertEqual(got, 3)                                                    # 記錄類別失敗不影響下載
 
+    def test_on_saved_false_means_discarded_and_not_counted(self):
+        decisions = iter([False, True, False, True])
+        calls = []
+        got, paths = self._crawl(lambda path, cat: calls.append(path) or next(decisions), count=2)
+        self.assertEqual(got, 2)                                                    # 兩張被捨棄的不算
+        self.assertEqual(len(calls), 4)
+
+    def test_fetch_festival_candidates_parses_listing_and_caches(self):
+        html = ('<a data-original="sticker/festival-illustration/festival-illustration-051.jpg"></a>'
+                '<a data-original="sticker/festival-photo/festival-photo-036.jpg"></a>'
+                '<a data-original="sticker/festival-short/festival-short-002.jpg"></a>'          # 影片：不收
+                '<a data-original="sticker/daily-photo/daily-photo-001.jpg"></a>'                # 不是節慶：不收
+                '<a data-original="sticker/festival-illustration/festival-illustration-051.jpg"></a>')   # 重複
+        resp = mock.MagicMock()
+        resp.__enter__.return_value.read.return_value = html.encode("utf-8")
+        crawl_images._festival_cache.update({"time": 0.0, "urls": []})
+        with mock.patch.object(crawl_images.urllib.request, "urlopen", return_value=resp) as opener:
+            first = crawl_images.fetch_festival_candidates(now=1000.0)
+            second = crawl_images.fetch_festival_candidates(now=1500.0)                         # 一小時內：用快取
+        self.assertEqual(sorted(u for u, _ in first), [
+            "https://sticker.fpg.com.tw/sticker/festival-illustration/festival-illustration-051.jpg",
+            "https://sticker.fpg.com.tw/sticker/festival-photo/festival-photo-036.jpg"])
+        self.assertEqual(len(second), 2)
+        self.assertEqual(opener.call_count, 1)
+        self.assertTrue(all(cat is None for _, cat in first))
+        with mock.patch.object(crawl_images.urllib.request, "urlopen", return_value=resp) as opener:
+            crawl_images.fetch_festival_candidates(now=1000.0 + crawl_images.FESTIVAL_CACHE_SECONDS + 1)
+            self.assertEqual(opener.call_count, 1)                                                # 過期後重新抓
+
+    def test_fetch_festival_candidates_failure_returns_empty(self):
+        crawl_images._festival_cache.update({"time": 0.0, "urls": []})
+        with mock.patch.object(crawl_images.urllib.request, "urlopen", side_effect=OSError("offline")),              mock.patch.object(crawl_images, "log_crawl"):
+            self.assertEqual(crawl_images.fetch_festival_candidates(now=5.0), [])
+
     def test_crawl_without_callback_still_works(self):
         got, _ = self._crawl(None)
         self.assertEqual(got, 2)
