@@ -138,37 +138,81 @@ def download_and_validate_image(url, save_dir, existing_md5s):
                 pass
         return None
 
-def build_candidate_urls():
-    """隨機混合攝影類 (1~750) 與插畫類 (30~245) 長輩圖候選網址"""
-    photo_ids = list(range(100, 750))
-    random.shuffle(photo_ids)
-    illust_ids = list(range(30, 245))
-    random.shuffle(illust_ids)
-    urls = [f"https://sticker.fpg.com.tw/sticker/daily-photo/daily-photo-{i}.jpg" for i in photo_ids]
-    urls += [f"https://sticker.fpg.com.tw/sticker/daily-illustration/daily-illustration-{i}.jpg" for i in illust_ids]
-    random.shuffle(urls)
-    return urls
+# 圖庫來源：url 為含 {n} 的網址範本，n 取 start~end (含)。category 選填，表示這個來源的圖適用的時段
+# (morning / noon / evening / neutral)；有填就不必靠 OCR 判斷，例如「平安祝福」類的來源可填 neutral。
+# 預設是 Formosa 貼圖酷的每日問候攝影與插畫 (這兩類圖上都有早安、午安或晚安字樣，所以不填 category)。
+# 節慶類 (festival-*) 是特定節日的圖 (父親節、中秋節)，note-short 是短影片，都不適合當通用圖，沒有收進預設。
+DEFAULT_IMAGE_SOURCES = [
+    {"name": "fpg-daily-photo", "url": "https://sticker.fpg.com.tw/sticker/daily-photo/daily-photo-{n}.jpg", "start": 100, "end": 749},
+    {"name": "fpg-daily-illustration", "url": "https://sticker.fpg.com.tw/sticker/daily-illustration/daily-illustration-{n}.jpg", "start": 30, "end": 244},
+]
+SOURCE_CATEGORIES = ("morning", "noon", "evening", "neutral")
+MAX_SOURCE_SPAN = 5000              # 單一來源最多展開幾個編號，避免設定打錯數字展開成百萬個網址
 
-def crawl_grandma_images(target_count=10, keywords=None, save_dir=DEFAULT_IMAGES_DIR):
+def normalize_sources(sources):
     """
-    從正統台灣長輩圖專屬圖庫隨機抓取全新長輩圖：
-    1. Formosa 貼圖酷每日問候攝影圖庫 (1~750)
-    2. Formosa 貼圖酷精選問候插畫圖庫 (1~250)
-    3. 保證 100% 均為正統早安、平安、喜樂、祝福長輩圖，杜絕任何無關雜圖
+    檢查並整理 config 的 image_sources：每項需有含 {n} 的 http(s) url 與整數 start <= end；
+    category 只接受 morning / noon / evening / neutral。不合格的項目略過；清單空或不是清單時用預設來源。
+    回傳 (來源清單, 被略過的原因清單)。
+    """
+    if not isinstance(sources, list) or not sources:
+        return [dict(s) for s in DEFAULT_IMAGE_SOURCES], []
+    good, skipped = [], []
+    for i, src in enumerate(sources):
+        label = (src.get("name") if isinstance(src, dict) else None) or f"#{i + 1}"
+        try:
+            url = src["url"]
+            start, end = int(src["start"]), int(src["end"])
+            if not (isinstance(url, str) and url.startswith(("http://", "https://")) and "{n}" in url):
+                raise ValueError("url 必須是含 {n} 的 http(s) 網址")
+            if start > end or end - start + 1 > MAX_SOURCE_SPAN:
+                raise ValueError(f"start~end 必須是 1 到 {MAX_SOURCE_SPAN} 個編號")
+            category = src.get("category")
+            if category is not None and category not in SOURCE_CATEGORIES:
+                raise ValueError("category 只能是 morning/noon/evening/neutral")
+            pad = int(src.get("pad", 0))
+            good.append({"name": str(label), "url": url, "start": start, "end": end, "category": category, "pad": max(0, pad)})
+        except Exception as e:
+            skipped.append(f"來源「{label}」略過：{e}")
+    if not good:
+        return [dict(s) for s in DEFAULT_IMAGE_SOURCES], skipped
+    return good, skipped
+
+def build_candidates(sources=None):
+    """把所有來源展開成隨機排序的 (網址, 類別或 None) 清單；各來源的編號先各自洗牌再交錯混合，避免一個來源獨佔。"""
+    srcs, _ = normalize_sources(sources)
+    pools = []
+    for src in srcs:
+        ids = list(range(src["start"], src["end"] + 1))
+        random.shuffle(ids)
+        pad = src.get("pad", 0)
+        pools.append([(src["url"].replace("{n}", str(i).zfill(pad)), src.get("category")) for i in ids])
+    merged = [c for pool in pools for c in pool]
+    random.shuffle(merged)
+    return merged
+
+def build_candidate_urls(sources=None):
+    """相容舊介面：只回傳隨機排序的候選網址"""
+    return [url for url, _ in build_candidates(sources)]
+
+def crawl_grandma_images(target_count=10, keywords=None, save_dir=DEFAULT_IMAGES_DIR, sources=None, on_saved=None):
+    """
+    從長輩圖圖庫隨機抓取全新長輩圖。來源由 sources 指定 (見 DEFAULT_IMAGE_SOURCES，預設是 Formosa 貼圖酷的
+    每日問候攝影與插畫)。on_saved(路徑, 該來源的類別或 None) 在每張圖存檔後呼叫，讓呼叫端記下來源標明的時段。
     """
     os.makedirs(save_dir, exist_ok=True)
     existing_md5s = get_existing_md5s(save_dir)
     log_crawl(f"\n=== 開始下載正統台灣長輩圖 (目標新增: {target_count} 張) ===")
     log_crawl(f"儲存目錄: {save_dir}")
 
-    candidate_urls = build_candidate_urls()
+    candidates = build_candidates(sources)
 
     # 限制單次最大嘗試數，避免無網路時長時間卡死阻塞
-    candidate_urls = candidate_urls[:max(target_count * 4, 30)]
+    candidates = candidates[:max(target_count * 4, 30)]
 
     downloaded_count = 0
     consecutive_fails = 0
-    for u in candidate_urls:
+    for u, category in candidates:
         if downloaded_count >= target_count:
             break
         if consecutive_fails >= 10:
@@ -179,6 +223,11 @@ def crawl_grandma_images(target_count=10, keywords=None, save_dir=DEFAULT_IMAGES
             downloaded_count += 1
             consecutive_fails = 0
             log_crawl(f" -> [{downloaded_count}/{target_count}] 成功下載正統長輩圖: {os.path.basename(saved)}")
+            if on_saved:
+                try:
+                    on_saved(saved, category)
+                except Exception as e:
+                    log_crawl(f"[警告] 記錄圖片來源類別失敗: {e}")
             time.sleep(0.2)
         else:
             consecutive_fails += 1

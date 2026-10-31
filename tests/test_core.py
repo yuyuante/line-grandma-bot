@@ -5,6 +5,7 @@ import sys
 import tempfile
 import json
 import time
+import contextlib
 
 # Portable path insertion derived from __file__
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -3291,83 +3292,168 @@ class TestLineGrandmaBotCore(unittest.TestCase):
         self.assertFalse(m("結束長輩圖機器人", ""))
 
     def _stop_cfg(self):
-        return {"stop_command": "結束長輩圖機器人", "stop_command_chats": ["小明"]}
+        return {"stop_command": "結束長輩圖機器人", "stop_command_chats": ["Notify Bot"]}
 
-    def test_check_stop_command_raises_once_per_unread(self):
-        auto_reply._STOP_SEEN_UNREAD.clear()
-        cfg = self._stop_cfg()
+    def _reset_stop_state(self):
+        auto_reply._STOP_SEEN_SIG.clear()
+        auto_reply._STOP_SIG_LAST_CHECK.clear()
+
+    def _run_stop_rounds(self, sigs, *, fg=5, check=False, clock=None, windows=None, rounds=None):
+        """依序餵入每輪的視窗簽章跑 check_stop_command，回傳 _chat_has_stop_command 被呼叫的次數"""
+        sigs = list(sigs)
+        it = iter(sigs)
         calls = []
-        with mock.patch.object(auto_reply, "get_all_line_windows", return_value=[(1, "小明 (1)", "Qt", True)]), \
-             mock.patch.object(auto_reply, "_chat_has_stop_command", side_effect=lambda *a, **k: calls.append((a, k)) or True):
-            with self.assertRaises(auto_reply.StopRequested):
-                auto_reply.check_stop_command(cfg)
-        self.assertEqual(len(calls), 1)
+        patches = [
+            mock.patch.object(auto_reply, "get_all_line_windows", return_value=windows or [(5, "Notify Bot", "Qt", True)]),
+            mock.patch.object(auto_reply, "_expanded_window_signature", side_effect=lambda h: next(it)),
+            mock.patch.object(auto_reply.win32gui, "GetForegroundWindow", return_value=fg),
+            mock.patch.object(auto_reply, "_chat_has_stop_command", side_effect=lambda *a, **k: calls.append(a) or check),
+            mock.patch.object(auto_reply, "log_v"),
+        ]
+        if clock is not None:
+            patches.append(mock.patch.object(auto_reply.time, "time", lambda: clock["t"]))
+        for p in patches:
+            p.start()
+        try:
+            for _ in range(rounds or len(sigs)):
+                auto_reply.check_stop_command(self._stop_cfg())
+                if clock is not None:
+                    clock["t"] += auto_reply.STOP_SIG_MIN_INTERVAL
+        finally:
+            for p in patches:
+                p.stop()
+        return calls
 
-    def test_check_stop_command_checks_each_unread_count_once(self):
-        auto_reply._STOP_SEEN_UNREAD.clear()
-        cfg = self._stop_cfg()
-        calls = []
-        with mock.patch.object(auto_reply, "_chat_has_stop_command", side_effect=lambda *a, **k: calls.append((a, k)) or False):
-            for title in ("小明 (1)", "小明 (1)", "小明 (2)", "小明", "小明 (1)"):
-                with mock.patch.object(auto_reply, "get_all_line_windows", return_value=[(1, title, "Qt", True)]):
-                    auto_reply.check_stop_command(cfg)        # 沒有指令：不擲出
-        # (1) 檢查一次、重複的 (1) 略過、(2) 再檢查、已讀歸零後的新 (1) 再檢查
-        self.assertEqual(len(calls), 3)
-
-    def test_check_stop_command_disabled_or_other_chats(self):
-        auto_reply._STOP_SEEN_UNREAD.clear()
-        with mock.patch.object(auto_reply, "get_all_line_windows") as gw, \
-             mock.patch.object(auto_reply, "_chat_has_stop_command") as chk:
+    def test_check_stop_command_disabled_or_missing_window(self):
+        self._reset_stop_state()
+        with mock.patch.object(auto_reply, "get_all_line_windows") as gw:
             auto_reply.check_stop_command({"stop_command": "x", "stop_command_chats": []})
             gw.assert_not_called()
-        with mock.patch.object(auto_reply, "get_all_line_windows", return_value=[(1, "別人 (3)", "Qt", True)]), \
-             mock.patch.object(auto_reply, "_chat_has_stop_command") as chk:
-            auto_reply.check_stop_command(self._stop_cfg())
-            chk.assert_not_called()                           # 名單外的好友傳來未讀不檢查
+        # 名單內的聊天室沒開視窗：不檢查
+        self.assertEqual(self._run_stop_rounds([], windows=[(1, "別人", "Qt", True)], rounds=1), [])
+
+    def test_check_stop_command_builds_baseline_then_checks_each_change_once(self):
+        self._reset_stop_state()
+        clock = {"t": 1000.0}
+        # 第一輪只建基準，第二輪沒變，第三輪變了檢查一次，第四輪沒變不再檢查
+        calls = self._run_stop_rounds([(10, "a", "b"), (10, "a", "b"), (11, "c", "a"), (11, "c", "a")], clock=clock)
+        self.assertEqual(calls, [("Notify Bot", "結束長輩圖機器人")])
+
+    def test_check_stop_command_raises_when_own_command_found(self):
+        self._reset_stop_state()
+        auto_reply._STOP_SEEN_SIG["Notify Bot"] = (10, "a", "b")
+        with self.assertRaises(auto_reply.StopRequested):
+            self._run_stop_rounds([(11, "c", "a")], check=True)
+
+    def test_check_stop_command_is_throttled_while_scrolling(self):
+        self._reset_stop_state()
+        auto_reply._STOP_SEEN_SIG["Notify Bot"] = (10, "a", "b")
+        clock = {"t": 1000.0}
+        # 捲動歷史訊息：簽章每輪都變。第一次檢查後 5 秒內不再檢查，間隔過後才再查一次
+        it = iter([(11, "c", "a"), (12, "d", "c"), (13, "e", "d")])
+        calls = []
+        with mock.patch.object(auto_reply, "get_all_line_windows", return_value=[(5, "Notify Bot", "Qt", True)]), \
+             mock.patch.object(auto_reply.time, "time", lambda: clock["t"]), \
+             mock.patch.object(auto_reply.win32gui, "GetForegroundWindow", return_value=5), \
+             mock.patch.object(auto_reply, "_expanded_window_signature", side_effect=lambda h: next(it)), \
+             mock.patch.object(auto_reply, "_chat_has_stop_command", side_effect=lambda *a, **k: calls.append(1) or False):
+            auto_reply.check_stop_command(self._stop_cfg())      # 檢查
+            clock["t"] += 1
+            auto_reply.check_stop_command(self._stop_cfg())      # 距上次 1 秒：略過，保留舊簽章
+            self.assertEqual(len(calls), 1)
+            clock["t"] += auto_reply.STOP_SIG_MIN_INTERVAL
+            auto_reply.check_stop_command(self._stop_cfg())      # 間隔已過：再檢查
+        self.assertEqual(len(calls), 2)
+
+    def test_check_stop_command_waits_until_window_is_foreground(self):
+        self._reset_stop_state()
+        auto_reply._STOP_SEEN_SIG["Notify Bot"] = (10, "a", "b")
+        # 背景視窗 (例如官方帳號推來 log)：不檢查、保留舊簽章；回到前景後才檢查
+        calls = self._run_stop_rounds([(11, "c", "a")], fg=99)
+        self.assertEqual(calls, [])
+        self.assertEqual(auto_reply._STOP_SEEN_SIG["Notify Bot"], (10, "a", "b"))
+        calls = self._run_stop_rounds([(11, "c", "a")], fg=5)
+        self.assertEqual(len(calls), 1)
+
+    def test_check_stop_command_minimized_window_drops_signature_and_rebuilds(self):
+        self._reset_stop_state()
+        auto_reply._STOP_SEEN_SIG["Notify Bot"] = (10, "a", "b")
+        calls = self._run_stop_rounds([None, (12, "x", "y")])     # 縮小時為 None；還原後第一次只重建基準，不檢查
+        self.assertEqual(calls, [])
+        self.assertEqual(auto_reply._STOP_SEEN_SIG["Notify Bot"], (12, "x", "y"))
 
     def test_check_stop_command_swallows_ordinary_errors(self):
-        auto_reply._STOP_SEEN_UNREAD.clear()
-        with mock.patch.object(auto_reply, "get_all_line_windows", return_value=[(1, "小明 (1)", "Qt", True)]), \
+        self._reset_stop_state()
+        auto_reply._STOP_SEEN_SIG["Notify Bot"] = (10, "a", "b")
+        with mock.patch.object(auto_reply, "get_all_line_windows", return_value=[(5, "Notify Bot", "Qt", True)]), \
+             mock.patch.object(auto_reply, "_expanded_window_signature", return_value=(11, "c", "a")), \
+             mock.patch.object(auto_reply.win32gui, "GetForegroundWindow", return_value=5), \
              mock.patch.object(auto_reply, "_chat_has_stop_command", side_effect=RuntimeError("boom")), \
              mock.patch.object(auto_reply, "log_v"):
             auto_reply.check_stop_command(self._stop_cfg())   # 一般例外只記錄，不擲出
 
-    def _run_chat_has_stop(self, *, self_sent=False, media=False, found=True, fg_ok=True, was_fg=False):
-        hwnd = 77
-        minimized = []
-        with mock.patch.object(auto_reply, "find_target_chat_window", return_value=[(hwnd, "小明", "Qt", True)]), \
-             mock.patch.object(auto_reply, "activate_window"), \
+    def test_init_stop_baselines_records_signature_and_ignores_old_command(self):
+        self._reset_stop_state()
+        cfg = {"stop_command": "結束長輩圖機器人", "stop_command_chats": ["Notify Bot", "小華"]}
+        wins = [(1, "Notify Bot", "Qt", True), (2, "小華", "Qt", True)]
+        with mock.patch.object(auto_reply, "get_all_line_windows", return_value=wins), \
+             mock.patch.object(auto_reply, "_expanded_window_signature", side_effect=lambda h: (h, "a", "b")):
+            auto_reply.init_stop_baselines(cfg, ["小華"])         # 熱重載只替新增的聊天室建基準線
+            self.assertEqual(auto_reply._STOP_SEEN_SIG, {"小華": (2, "a", "b")})
+            auto_reply.init_stop_baselines(cfg)
+            self.assertEqual(set(auto_reply._STOP_SEEN_SIG), {"Notify Bot", "小華"})
+        # 基準線之後簽章沒變：啟動前就留在聊天室的舊指令不會被檢查
+        calls = self._run_stop_rounds([(1, "a", "b")], windows=wins[:1], check=True)
+        self.assertEqual(calls, [])
+
+    def _run_chat_has_stop(self, *, fg_hwnd=77, own=True, found=True, window=True):
+        with mock.patch.object(auto_reply, "find_target_chat_window", return_value=[(77, "Notify Bot", "Qt", True)] if window else []), \
              mock.patch.object(auto_reply.time, "sleep"), \
-             mock.patch.object(auto_reply.win32gui, "GetForegroundWindow", side_effect=[hwnd if was_fg else 5] + [hwnd if fg_ok else 5] * 20), \
-             mock.patch.object(auto_reply.win32gui, "GetWindowText", return_value="小明"), \
-             mock.patch.object(auto_reply, "is_last_message_from_self_in_chat", return_value=self_sent), \
-             mock.patch.object(auto_reply, "last_left_message_is_media", return_value=media), \
-             mock.patch.object(auto_reply, "last_left_message_has_text", return_value=found) as rd, \
-             mock.patch.object(auto_reply, "_minimize_if_configured", side_effect=lambda h, c: minimized.append(h)), \
+             mock.patch.object(auto_reply.win32gui, "GetForegroundWindow", return_value=fg_hwnd), \
+             mock.patch.object(auto_reply.win32gui, "GetWindowText", return_value="Notify Bot"), \
+             mock.patch.object(auto_reply, "verify_message_sent_to_chat", return_value=own) as verify, \
+             mock.patch.object(auto_reply, "last_own_message_has_text", return_value=found) as rd, \
              mock.patch.object(auto_reply, "log_v"):
-            result = auto_reply._chat_has_stop_command("小明", "結束長輩圖機器人", {})
-        return result, rd.call_count, minimized
+            result = auto_reply._chat_has_stop_command("Notify Bot", "結束長輩圖機器人")
+        return result, verify.call_count, rd.call_count
 
     def test_chat_has_stop_command_cases(self):
-        self.assertEqual(self._run_chat_has_stop()[0], True)
-        self.assertEqual(self._run_chat_has_stop(found=False)[0], False)
-        res, reads, _ = self._run_chat_has_stop(self_sent=True)          # 自己傳的指令不算
-        self.assertEqual((res, reads), (False, 0))
-        res, reads, _ = self._run_chat_has_stop(media=True)              # 照片或貼圖不做 OCR
-        self.assertEqual((res, reads), (False, 0))
-        res, reads, minimized = self._run_chat_has_stop(media=None)      # 反覆無法判斷：不停止，並縮回視窗
-        self.assertEqual((res, reads, minimized), (False, 0, [77]))
-        res, reads, _ = self._run_chat_has_stop(found=None)              # OCR 取不到文字：重試後不停止
-        self.assertEqual((res, reads), (False, auto_reply.STOP_READ_ATTEMPTS))
-        self.assertEqual(self._run_chat_has_stop(fg_ok=False)[0], False)  # 視窗沒到前景：不停止
+        self.assertEqual(self._run_chat_has_stop(), (True, 1, 1))
+        self.assertEqual(self._run_chat_has_stop(found=False), (False, 0, 1))        # 沒有指令：不確認位置，視窗完全不動
+        self.assertEqual(self._run_chat_has_stop(window=False), (False, 0, 0))       # 找不到聊天室視窗
+        self.assertEqual(self._run_chat_has_stop(fg_hwnd=5), (False, 0, 0))          # 視窗不在前景：不搶焦點、不檢查
+        self.assertEqual(self._run_chat_has_stop(own=False), (False, 1, 1))          # 有指令但不是最後一則 (下面有官方帳號推來的新訊息)
+        res, verify, reads = self._run_chat_has_stop(found=None)                      # 讀不出字：重試後不停止
+        self.assertEqual((res, verify, reads), (False, 0, auto_reply.STOP_READ_ATTEMPTS))
 
-    def test_chat_has_stop_command_minimizes_window_after_check(self):
-        self.assertEqual(self._run_chat_has_stop()[2], [77])
+    def _own_bubble_shot(self, bubble_color=(141, 224, 85)):
+        from PIL import Image, ImageDraw
+        shot = Image.new("RGB", (400, 300), (255, 255, 255))
+        ImageDraw.Draw(shot).rectangle([250, 100, 375, 129], fill=bubble_color)
+        is_content = lambda px: sum(abs(px[i] - 255) for i in range(3)) > 30
+        return shot, is_content
 
-    def _run_has_text(self, texts, blocks=None, shot=None):
+    def test_own_bubble_box_crops_only_the_bubble(self):
+        shot, is_content = self._own_bubble_shot()
+        box = auto_reply._own_bubble_box(shot, 1.0, 216, 376, 100, 130, is_content)
+        self.assertEqual(box, (246, 96, 379, 135))                          # 氣泡左右各加 4px 邊，不含左側時間與已讀標籤
+
+    def test_own_bubble_box_none_for_photo(self):
         from PIL import Image
-        shot = shot or Image.new("RGB", (400, 300), (255, 255, 255))
-        blocks = blocks or [(250, 220), (150, 100)]
+        import random
+        rnd = random.Random(1)
+        shot = Image.new("RGB", (400, 300), (255, 255, 255))
+        for x in range(216, 376):
+            for y in range(100, 130):
+                shot.putpixel((x, y), (rnd.randrange(256), rnd.randrange(256), rnd.randrange(256)))
+        is_content = lambda px: sum(abs(px[i] - 255) for i in range(3)) > 30
+        self.assertIsNone(auto_reply._own_bubble_box(shot, 1.0, 216, 376, 100, 130, is_content))
+        self.assertIsNone(auto_reply._own_bubble_box(Image.new("RGB", (400, 300), (255, 255, 255)), 1.0, 216, 376, 100, 130, is_content))
+
+    def _run_own_text(self, texts, shot=None):
+        from PIL import Image
+        base, is_content = self._own_bubble_shot()
+        shot = shot or base
         seen = []
         queue = list(texts)
 
@@ -3380,38 +3466,102 @@ class TestLineGrandmaBotCore(unittest.TestCase):
                 raise item
             return item
 
-        with mock.patch.object(auto_reply, "_left_message_blocks", return_value=(shot, 1.0, 56, 216, lambda px: False, blocks)), \
+        with mock.patch.object(auto_reply, "_left_message_blocks", return_value=(shot, 1.0, 216, 376, is_content, [(130, 100)])) as blocks, \
              mock.patch.object(auto_reply, "ocr_image_text", side_effect=fake_ocr):
-            result = auto_reply.last_left_message_has_text(1, "結束長輩圖機器人")
+            result = auto_reply.last_own_message_has_text(1, "結束長輩圖機器人")
+        self.assertEqual(blocks.call_args.kwargs, {"side": "right"})        # 讀右側 (自己發的)，不是左側
         return result, seen
 
-    def test_last_left_message_has_text_any_variant_matches(self):
-        result, seen = self._run_has_text(["結束長輩", "結束長輩圖機器人"])
+    def test_last_own_message_has_text_any_variant_matches(self):
+        result, seen = self._run_own_text(["結束長輩", "結束長輩圖機器人"])
         self.assertTrue(result)
-        self.assertEqual(len(seen), 2)                                    # 第二種前處理讀到就停
-        self.assertFalse(os.path.exists(seen[0][1]))                      # 暫存圖檔已刪除
+        self.assertEqual(len(seen), 2)                                        # 第二種前處理讀到就停
+        self.assertFalse(os.path.exists(seen[0][1]))                          # 暫存圖檔已刪除
 
-    def test_last_left_message_has_text_false_and_none(self):
+    def test_last_own_message_has_text_crops_bubble_with_padding(self):
+        _, seen = self._run_own_text(["結束長輩圖機器人"])
+        up = auto_reply.STOP_OCR_UPSCALES[0]
+        # 氣泡截圖 133x39，加上下左右各 24 的白邊後放大
+        self.assertEqual(seen[0][0], ((133 + 48) * up, (39 + 48) * up))
+
+    def test_last_own_message_has_text_false_and_none(self):
         from PIL import Image
         n = len(list(auto_reply._stop_ocr_variants(Image.new("RGB", (50, 20)))))
-        result, seen = self._run_has_text(["早安"] * n)
-        self.assertIs(result, False)                                      # 讀得到字但不是指令
+        result, seen = self._run_own_text(["早安"] * n)
+        self.assertIs(result, False)                                          # 讀得到字但不是指令
         self.assertEqual(len(seen), n)
-        result, _ = self._run_has_text([""] * n)
-        self.assertIsNone(result)                                         # 全部讀不出字：無法確認
-        result, _ = self._run_has_text([RuntimeError("ocr")] * n)
-        self.assertIsNone(result)                                         # OCR 全部失敗：無法確認
-        result, _ = self._run_has_text(["", RuntimeError("x"), "早安"])
-        self.assertIs(result, False)                                      # 只要有一次讀到字就算讀得到
+        self.assertIsNone(self._run_own_text([""] * n)[0])                    # 全部讀不出字：無法確認
+        self.assertIsNone(self._run_own_text([RuntimeError("ocr")] * n)[0])   # OCR 全部失敗：無法確認
+        self.assertIs(self._run_own_text(["", RuntimeError("x"), "早安"])[0], False)   # 只要有一次讀到字就算讀得到
         with mock.patch.object(auto_reply, "_left_message_blocks", return_value=None):
-            self.assertIsNone(auto_reply.last_left_message_has_text(1, "x"))
+            self.assertIsNone(auto_reply.last_own_message_has_text(1, "x"))
 
-    def test_last_left_message_has_text_crops_only_last_block(self):
-        _, seen = self._run_has_text(["結束長輩圖機器人"])
-        # 截圖寬 = min(400*0.92, 56 + 560) - 56 = 312，加上下左右各 24 的白邊，放大 STOP_OCR_UPSCALES[0] 倍；
-        # 截圖高只含最底部區塊 (頂 220 - 4 到 底 250 + 4 + 1)，不含上一個區塊
-        up = auto_reply.STOP_OCR_UPSCALES[0]
-        self.assertEqual(seen[0][0], ((int(400 * 0.92) - 56 + 48) * up, (250 + 4 + 1 - (220 - 4) + 48) * up))
+    def test_last_own_message_has_text_skips_ocr_for_photo(self):
+        from PIL import Image
+        import random
+        rnd = random.Random(2)
+        shot = Image.new("RGB", (400, 300), (255, 255, 255))
+        for x in range(216, 376):
+            for y in range(100, 130):
+                shot.putpixel((x, y), (rnd.randrange(256), rnd.randrange(256), rnd.randrange(256)))
+        result, seen = self._run_own_text([], shot=shot)
+        self.assertIs(result, False)                                          # 自己傳的照片或貼圖不是指令，也不做 OCR
+        self.assertEqual(seen, [])
+
+    def test_left_message_blocks_right_side_finds_own_bubble(self):
+        from PIL import Image, ImageDraw
+        shot = Image.new("RGB", (400, 101), (255, 255, 255))
+        ImageDraw.Draw(shot).rectangle([250, 40, 375, 70], fill=(141, 224, 85))
+        with mock.patch.object(auto_reply.win32gui, "IsWindow", return_value=True), \
+             mock.patch.object(auto_reply.win32gui, "IsIconic", return_value=False), \
+             mock.patch.object(auto_reply.win32gui, "IsWindowVisible", return_value=True), \
+             mock.patch.object(auto_reply, "get_window_true_rect", return_value=(0, 0, 400, 300)), \
+             mock.patch.object(auto_reply.ImageGrab, "grab", return_value=shot):
+            found = auto_reply._left_message_blocks(1, side="right")
+            self.assertIsNotNone(found)
+            _, scale, x_start, x_end, _, blocks = found
+            self.assertEqual((x_start, x_end, blocks), (216, 376, [(70, 40)]))
+            self.assertIsNone(auto_reply._left_message_blocks(1, side="left"))   # 左側沒有內容：自己發的不算對方訊息
+
+    # ---------- 視窗太窄時暫時最大化再判斷左右 ----------
+    def _run_wide_judgment(self, *, placement=1, width=585, dpi=144, iconic=False, body_error=False, placement_error=False):
+        shows = []
+        with mock.patch.object(auto_reply.win32gui, "IsWindow", return_value=True),              mock.patch.object(auto_reply.win32gui, "IsIconic", return_value=iconic),              mock.patch.object(auto_reply.win32gui, "IsWindowVisible", return_value=True),              mock.patch.object(auto_reply.win32gui, "GetWindowPlacement", side_effect=RuntimeError("x") if placement_error else None, return_value=(0, placement, (0, 0), (0, 0), (0, 0, 0, 0))),              mock.patch.object(auto_reply.ctypes.windll.user32, "GetDpiForWindow", return_value=dpi),              mock.patch.object(auto_reply, "get_window_true_rect", return_value=(0, 0, width, 800)),              mock.patch.object(auto_reply.win32gui, "ShowWindow", side_effect=lambda h, c: shows.append(c)),              mock.patch.object(auto_reply.time, "sleep"):
+            try:
+                with auto_reply._wide_window_for_judgment(1):
+                    shows.append("body")
+                    if body_error:
+                        raise ValueError("boom")
+            except ValueError:
+                shows.append("raised")
+        return shows
+
+    def test_wide_window_judgment_maximizes_narrow_window_and_restores(self):
+        M, R = auto_reply.win32con.SW_MAXIMIZE, auto_reply.win32con.SW_RESTORE
+        self.assertEqual(self._run_wide_judgment(), [M, "body", R])                    # 585px / 1.5 = 390 邏輯像素：太窄
+        self.assertEqual(self._run_wide_judgment(body_error=True), [M, "body", R, "raised"])   # 判斷出錯也要還原
+
+    def test_wide_window_judgment_leaves_other_windows_alone(self):
+        self.assertEqual(self._run_wide_judgment(width=1942), ["body"])                # 已夠寬 (1942 / 1.5 = 1294)
+        self.assertEqual(self._run_wide_judgment(placement=auto_reply.win32con.SW_SHOWMAXIMIZED), ["body"])
+        self.assertEqual(self._run_wide_judgment(iconic=True), ["body"])               # 最小化：不彈出視窗
+        self.assertEqual(self._run_wide_judgment(placement_error=True), ["body"])      # 讀不到視窗狀態：不動
+
+    def test_left_right_judgments_run_inside_wide_window_context(self):
+        order = []
+
+        @contextlib.contextmanager
+        def fake_ctx(h):
+            order.append("max")
+            try:
+                yield
+            finally:
+                order.append("restore")
+
+        with mock.patch.object(auto_reply, "_wide_window_for_judgment", fake_ctx),              mock.patch.object(auto_reply, "_is_last_message_from_self_in_chat", side_effect=lambda h: order.append("self") or False),              mock.patch.object(auto_reply, "_verify_message_sent_to_chat", side_effect=lambda h: order.append("verify") or True):
+            self.assertFalse(auto_reply.is_last_message_from_self_in_chat(1))
+            self.assertTrue(auto_reply.verify_message_sent_to_chat(1))
+        self.assertEqual(order, ["max", "self", "restore", "max", "verify", "restore"])
 
     def test_countdown_sleep_abort_check_stops_wait(self):
         clock = {"t": 1000.0}
@@ -3455,54 +3605,6 @@ class TestLineGrandmaBotCore(unittest.TestCase):
             cfg = auto_reply.load_config()
         self.assertEqual(cfg["stop_command"], auto_reply.DEFAULT_CONFIG["stop_command"])   # 單字太容易誤停
 
-    def test_init_stop_baselines_ignores_old_unread_command(self):
-        auto_reply._STOP_SEEN_UNREAD.clear()
-        cfg = self._stop_cfg()
-        with mock.patch.object(auto_reply, "get_all_line_windows", return_value=[(1, "小明 (1)", "Qt", True)]):
-            auto_reply.init_stop_baselines(cfg)
-            self.assertEqual(auto_reply._STOP_SEEN_UNREAD["小明"], 1)
-            with mock.patch.object(auto_reply, "_chat_has_stop_command", return_value=True) as chk:
-                auto_reply.check_stop_command(cfg)                    # 啟動前就存在的未讀不檢查
-                chk.assert_not_called()
-        with mock.patch.object(auto_reply, "get_all_line_windows", return_value=[(1, "小明 (2)", "Qt", True)]), \
-             mock.patch.object(auto_reply, "_chat_has_stop_command", return_value=True) as chk:
-            with self.assertRaises(auto_reply.StopRequested):
-                auto_reply.check_stop_command(cfg)                    # 啟動後新增的未讀才檢查
-            self.assertEqual(chk.call_args.kwargs["count"], 1)
-
-    def test_check_stop_command_reads_two_blocks_when_two_new_messages(self):
-        auto_reply._STOP_SEEN_UNREAD.clear()
-        with mock.patch.object(auto_reply, "get_all_line_windows", return_value=[(1, "小明 (3)", "Qt", True)]), \
-             mock.patch.object(auto_reply, "_chat_has_stop_command", return_value=False) as chk:
-            auto_reply.check_stop_command(self._stop_cfg())
-            self.assertEqual(chk.call_args.kwargs["count"], 2)        # 上限 2 個區塊
-
-    def test_last_left_message_has_text_count_two_reads_second_block(self):
-        from PIL import Image
-        n = len(list(auto_reply._stop_ocr_variants(Image.new("RGB", (50, 20)))))
-        # 最底部區塊是「好」，指令在上一個區塊：count=1 讀不到，count=2 讀得到
-        result, seen = self._run_has_text(["好"] * n)
-        self.assertIs(result, False)
-        self.assertEqual(len(seen), n)
-        with mock.patch.object(auto_reply, "_left_message_blocks", return_value=(Image.new("RGB", (400, 300), (255, 255, 255)), 1.0, 56, 216, lambda px: False, [(250, 220), (150, 100)])), \
-             mock.patch.object(auto_reply, "ocr_image_text", side_effect=["好"] * n + ["結束長輩圖機器人"]):
-            self.assertTrue(auto_reply.last_left_message_has_text(1, "結束長輩圖機器人", count=2))
-
-    def test_chat_has_stop_command_skips_media_gate_for_multiple_messages(self):
-        with mock.patch.object(auto_reply, "find_target_chat_window", return_value=[(77, "小明", "Qt", True)]), \
-             mock.patch.object(auto_reply, "activate_window"), \
-             mock.patch.object(auto_reply.time, "sleep"), \
-             mock.patch.object(auto_reply.win32gui, "GetForegroundWindow", return_value=77), \
-             mock.patch.object(auto_reply.win32gui, "GetWindowText", return_value="小明"), \
-             mock.patch.object(auto_reply, "is_last_message_from_self_in_chat", return_value=False), \
-             mock.patch.object(auto_reply, "last_left_message_is_media", return_value=True) as media, \
-             mock.patch.object(auto_reply, "last_left_message_has_text", return_value=True) as has_text, \
-             mock.patch.object(auto_reply, "_minimize_if_configured"):
-            # 最後一則是貼圖，但指令在前一則：兩則以上時不能被 media 檢查擋掉
-            self.assertTrue(auto_reply._chat_has_stop_command("小明", "結束長輩圖機器人", {}, count=2))
-            media.assert_not_called()
-            self.assertEqual(has_text.call_args.args[2], 2)
-
     def test_test_mode_exits_with_stop_code_when_stop_requested(self):
         argv = ["auto_reply.py", "--test", "小明"]
         with mock.patch.object(sys, "argv", argv), \
@@ -3514,28 +3616,6 @@ class TestLineGrandmaBotCore(unittest.TestCase):
             with self.assertRaises(SystemExit) as cm:
                 auto_reply.main()
         self.assertEqual(cm.exception.code, auto_reply.STOP_EXIT_CODE)
-
-    def test_last_left_message_has_text_unreadable_second_block_is_inconclusive(self):
-        from PIL import Image
-        n = len(list(auto_reply._stop_ocr_variants(Image.new("RGB", (50, 20)))))
-        shot = Image.new("RGB", (400, 300), (255, 255, 255))
-        # 最底部區塊讀得到「好」，上一個區塊每種前處理都讀不出字：無法排除指令藏在那一塊，回傳 None
-        with mock.patch.object(auto_reply, "_left_message_blocks", return_value=(shot, 1.0, 56, 216, lambda px: False, [(250, 220), (150, 100)])), \
-             mock.patch.object(auto_reply, "ocr_image_text", side_effect=["好"] * n + [""] * n):
-            self.assertIsNone(auto_reply.last_left_message_has_text(1, "結束長輩圖機器人", count=2))
-
-    def test_init_stop_baselines_for_specific_chats_and_window_reopen(self):
-        auto_reply._STOP_SEEN_UNREAD.clear()
-        cfg = {"stop_command": "結束長輩圖機器人", "stop_command_chats": ["小明", "小華"]}
-        with mock.patch.object(auto_reply, "get_all_line_windows", return_value=[(1, "小明 (2)", "Qt", True), (2, "小華 (5)", "Qt", True)]):
-            auto_reply.init_stop_baselines(cfg, ["小華"])           # 熱重載只替新增的好友建基準線
-        self.assertEqual(auto_reply._STOP_SEEN_UNREAD, {"小華": 5})
-        # 視窗關閉 (找不到) 時清掉舊基準，重開後未讀數從頭計算
-        with mock.patch.object(auto_reply, "get_all_line_windows", return_value=[]), \
-             mock.patch.object(auto_reply, "_chat_has_stop_command") as chk:
-            auto_reply.check_stop_command({"stop_command": "結束長輩圖機器人", "stop_command_chats": ["小華"]})
-            chk.assert_not_called()
-        self.assertNotIn("小華", auto_reply._STOP_SEEN_UNREAD)
 
     def test_test_mode_sets_stop_baselines_before_sending(self):
         order = []
@@ -3561,74 +3641,6 @@ class TestLineGrandmaBotCore(unittest.TestCase):
             auto_reply.load_config()
         self.assertEqual(sum("stop_command" in str(c.args[0]) for c in warn.call_args_list), 1)
 
-    def test_chat_has_stop_command_keeps_window_open_when_user_was_viewing(self):
-        res, _, minimized = self._run_chat_has_stop(was_fg=True)
-        self.assertEqual((res, minimized), (True, []))                     # 使用者正在看的視窗，檢查完不縮小
-
-    def test_expanded_window_change_triggers_check_without_unread_count(self):
-        auto_reply._STOP_SEEN_UNREAD.clear()
-        auto_reply._STOP_SEEN_SIG.clear()
-        auto_reply._STOP_SIG_LAST_CHECK.clear()
-        calls = []
-        # 每輪呼叫簽章的次數：無觸發 1 次 (本輪)；有觸發 2 次 (本輪加檢查後重記)
-        sigs = iter([(10, "a", "b"),            # 第一輪：只建立基準，不檢查
-                     (10, "a", "b"),            # 第二輪：沒變，不檢查
-                     (11, "c", "a"), (11, "c", "a"),   # 第三輪：變了，檢查一次；檢查後簽章重記
-                     (11, "c", "a")])           # 第四輪：沒變，不再檢查
-        cfg = self._stop_cfg()
-        with mock.patch.object(auto_reply, "get_all_line_windows", return_value=[(5, "小明", "Qt", True)]), \
-             mock.patch.object(auto_reply, "_expanded_window_signature", side_effect=lambda h: next(sigs)), \
-             mock.patch.object(auto_reply, "_chat_has_stop_command", side_effect=lambda *a, **k: calls.append(k["count"]) or False):
-            for _ in range(4):
-                auto_reply.check_stop_command(cfg)
-        self.assertEqual(calls, [1])
-
-    def test_expanded_window_checks_are_throttled(self):
-        auto_reply._STOP_SEEN_UNREAD.clear()
-        auto_reply._STOP_SEEN_SIG.clear()
-        auto_reply._STOP_SIG_LAST_CHECK.clear()
-        auto_reply._STOP_SEEN_SIG["小明"] = (10, "a", "b")
-        calls = []
-        clock = {"t": 1000.0}
-        # 捲動歷史訊息：簽章每輪都變。第一次檢查後 5 秒內不再檢查，間隔過後才再查一次
-        sigs = iter([(11, "c", "a"), (11, "c", "a"), (12, "d", "c"), (13, "e", "d"), (13, "e", "d")])
-        with mock.patch.object(auto_reply, "get_all_line_windows", return_value=[(5, "小明", "Qt", True)]),              mock.patch.object(auto_reply.time, "time", lambda: clock["t"]),              mock.patch.object(auto_reply, "_expanded_window_signature", side_effect=lambda h: next(sigs)),              mock.patch.object(auto_reply, "_chat_has_stop_command", side_effect=lambda *a, **k: calls.append(1) or False):
-            auto_reply.check_stop_command(self._stop_cfg())      # 檢查 (簽章 11、重記 11)
-            clock["t"] += 1
-            auto_reply.check_stop_command(self._stop_cfg())      # 簽章變成 12，距上次 1 秒：略過，保留舊簽章
-            self.assertEqual(len(calls), 1)
-            clock["t"] += auto_reply.STOP_SIG_MIN_INTERVAL
-            auto_reply.check_stop_command(self._stop_cfg())      # 簽章 13，間隔已過：再檢查
-        self.assertEqual(len(calls), 2)
-
-    def test_expanded_window_stop_command_raises(self):
-        auto_reply._STOP_SEEN_UNREAD.clear()
-        auto_reply._STOP_SEEN_SIG.clear()
-        auto_reply._STOP_SIG_LAST_CHECK.clear()
-        auto_reply._STOP_SEEN_SIG["小明"] = (10, "a", "b")
-        sigs = iter([(11, "c", "a"), (11, "c", "a")])
-        with mock.patch.object(auto_reply, "get_all_line_windows", return_value=[(5, "小明", "Qt", True)]), \
-             mock.patch.object(auto_reply, "_expanded_window_signature", side_effect=lambda h: next(sigs)), \
-             mock.patch.object(auto_reply, "_chat_has_stop_command", return_value=True):
-            with self.assertRaises(auto_reply.StopRequested):
-                auto_reply.check_stop_command(self._stop_cfg())
-
-    def test_minimized_window_drops_signature_and_rebuilds_after_restore(self):
-        auto_reply._STOP_SEEN_UNREAD.clear()
-        auto_reply._STOP_SEEN_SIG.clear()
-        auto_reply._STOP_SIG_LAST_CHECK.clear()
-        auto_reply._STOP_SEEN_SIG["小明"] = (10, "a", "b")
-        calls = []
-        sigs = iter([None, (12, "x", "y")])    # 縮小時為 None；還原後第一次只重建基準，不檢查
-        with mock.patch.object(auto_reply, "get_all_line_windows", return_value=[(5, "小明", "Qt", True)]), \
-             mock.patch.object(auto_reply, "_expanded_window_signature", side_effect=lambda h: next(sigs)), \
-             mock.patch.object(auto_reply, "_chat_has_stop_command", side_effect=lambda *a, **k: calls.append(1) or False):
-            auto_reply.check_stop_command(self._stop_cfg())
-            self.assertNotIn("小明", auto_reply._STOP_SEEN_SIG)
-            auto_reply.check_stop_command(self._stop_cfg())
-        self.assertEqual(calls, [])
-        self.assertEqual(auto_reply._STOP_SEEN_SIG["小明"], (12, "x", "y"))
-
     def test_expanded_window_signature_none_when_minimized(self):
         with mock.patch.object(auto_reply.win32gui, "IsIconic", return_value=True):
             self.assertIsNone(auto_reply._expanded_window_signature(1))
@@ -3640,6 +3652,38 @@ class TestLineGrandmaBotCore(unittest.TestCase):
         self.assertEqual(auto_reply._window_hwnd(wins, "小明"), 2)
         self.assertEqual(auto_reply._window_hwnd(wins, "別人"), 3)
         self.assertIsNone(auto_reply._window_hwnd(wins, "不存在"))
+
+    def test_load_config_sanitizes_notify_settings(self):
+        path = os.path.join(self.temp_dir.name, "notify_cfg.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"targets": ["a"], "notify_log": True, "notify_monthly_cap": "80"}, f)
+        with mock.patch.object(auto_reply, "CONFIG_PATH", path):
+            cfg = auto_reply.load_config()
+        self.assertEqual((cfg["notify_log"], cfg["notify_monthly_cap"]), (True, 80))
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"targets": ["a"], "notify_log": "yes", "notify_monthly_cap": "lots"}, f)
+        with mock.patch.object(auto_reply, "CONFIG_PATH", path):
+            cfg = auto_reply.load_config()
+        self.assertEqual((cfg["notify_log"], cfg["notify_monthly_cap"]), (False, 150))   # 型別錯誤沿用預設：預設關閉
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"targets": ["a"], "notify_monthly_cap": 0}, f)
+        with mock.patch.object(auto_reply, "CONFIG_PATH", path):
+            self.assertEqual(auto_reply.load_config()["notify_monthly_cap"], 1)           # 至少 1
+
+    def test_configure_notifier_passes_settings(self):
+        with mock.patch.object(auto_reply.notifier, "configure") as conf:
+            auto_reply.configure_notifier({"notify_log": True, "notify_monthly_cap": 90})
+            conf.assert_called_once_with(True, 90, auto_reply.NOTIFY_STATE_PATH)
+            conf.reset_mock()
+            auto_reply.configure_notifier({})                                             # 沒設定：關閉
+            conf.assert_called_once_with(False, 150, auto_reply.NOTIFY_STATE_PATH)
+
+    def test_log_v_forwards_message_to_notifier_and_survives_its_errors(self):
+        with mock.patch.object(auto_reply.notifier, "on_log") as on_log, mock.patch("builtins.print"):
+            auto_reply.log_v("[警告] x")
+            on_log.assert_called_once_with("[警告] x")
+        with mock.patch.object(auto_reply.notifier, "on_log", side_effect=RuntimeError("boom")), mock.patch("builtins.print"):
+            auto_reply.log_v("[警告] y")                                                   # 推播出錯不能影響主程式
 
     def test_load_config_sanitizes_stop_command(self):
         path = os.path.join(self.temp_dir.name, "stop_cfg.json")

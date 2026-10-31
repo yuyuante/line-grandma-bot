@@ -1,6 +1,6 @@
 # LINE 長輩圖智慧自動回覆機器人 (line-grandma-bot)
 
-[![Version](https://img.shields.io/badge/version-2.5.1-blue.svg)](auto_reply.py)
+[![Version](https://img.shields.io/badge/version-2.6.0-blue.svg)](auto_reply.py)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D6.svg)](https://microsoft.com)
 [![Python](https://img.shields.io/badge/python-3.10%2B-green.svg)](https://python.org)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey.svg)](LICENSE)
@@ -45,7 +45,7 @@
 
 ```text
 line-grandma-bot/
-├── auto_reply.py        # 核心自動回覆常駐程式 (v2.5.1)
+├── auto_reply.py        # 核心自動回覆常駐程式 (v2.6.0)
 ├── crawl_images.py      # 台塑貼圖酷長輩圖抓取與過期清理模組
 ├── config.example.json  # 設定檔範本
 ├── config.json          # 個人實際設定檔 (已列入 .gitignore 保護隱私)
@@ -110,7 +110,9 @@ copy config.example.json config.json
   "close_window_after_send": true,
   "time_aware_images": true,
   "stop_command": "結束長輩圖機器人",
-  "stop_command_chats": []
+  "stop_command_chats": [],
+  "notify_log": false,
+  "notify_monthly_cap": 150
 }
 ```
 
@@ -130,8 +132,10 @@ copy config.example.json config.json
 | `min_image_pool` | `10` | 圖庫最低儲備數量，低於此數量時自動連網補充。 |
 | `auto_crawl_images` | `true` | 是否允許圖庫不足時自動連網下載補充。 |
 | `close_window_after_send` | `true` | 發送完成後是否自動將對話框最小化至工作列，維持後續未讀狀態。 |
-| `stop_command` | `"結束長輩圖機器人"` | 遠端停止指令的文字。`stop_command_chats` 內的好友傳來含此文字的訊息，程式立即結束。比對時忽略空白與標點，OCR 認錯一字也算（例如「結束長輩圖機器八」）。 |
-| `stop_command_chats` | `[]` | 可下達停止指令的好友名單，名稱需與 LINE 顯示名稱完全相符；空白代表停用此功能。只認該好友「傳來」的訊息，自己送出的不算。 |
+| `stop_command` | `"結束長輩圖機器人"` | 停止指令的文字。你在 `stop_command_chats` 內的聊天室自己發了含此文字的訊息，程式立即結束。比對時忽略空白與標點，OCR 認錯一字也算（例如「結束長輩圖機器八」）。 |
+| `stop_command_chats` | `[]` | 接受你下停止指令的聊天室名單，名稱需與 LINE 顯示名稱完全相符（例如官方帳號 `Notify Bot`）；空白代表停用此功能。只認「你自己發」的訊息，對方傳來的不算；聊天室需開成獨立視窗並保持展開（不能最小化）。 |
+| `notify_log` | `false` | 把啟動、回覆、停止與警告/錯誤推播到 LINE 官方帳號（例如 `Notify Bot`），在聊天室裡看程式的狀況。需要先建立憑證檔，見下方「Notify Bot 推播」。修改後即時生效。 |
+| `notify_monthly_cap` | `150` | 每月最多推播則數。官方帳號免費方案每月上限 200 則（整個帳號共用），預設留 50 則給手動測試。達到上限後只記在本機，下個月恢復。 |
 | `time_aware_images` | `true` | 依時段挑圖：05-11 時只送早安或無時段字樣的圖，11-17 時送午安，17-05 時送晚安。以 OCR 辨識圖上字樣並快取於 `image_tags.json`；沒有該時段的圖時，改用已標記為 `neutral`（無時段字樣）的圖代替；兩者皆無才不發送。OCR 找不到問候語的圖視為未知，不會被挑選，請用 `--tag-image` 手動標記。 |
 
 ---
@@ -183,9 +187,48 @@ python auto_reply.py --tag-image grandma_xxx.jpg neutral
 python auto_reply.py --unbind "媽媽"
 ```
 
+### Notify Bot 推播
+
+把程式的重要事件推到你的 LINE，不用一直看電腦。需要一個 LINE 官方帳號（Messaging API），並先加為好友：
+
+1. 在 `~/.line-notify.env`（可用環境變數 `LINE_NOTIFY_ENV` 指定路徑；找不到時改讀 `~/.line-test.env`）寫入：
+   ```
+   LINE_TOKEN=<Channel access token (long-lived)>
+   LINE_USER_ID=<你的 User ID，U 開頭>
+   ```
+2. `config.json` 設 `"notify_log": true`。
+3. 推播的內容：
+   - 🟢 啟動（版本、監控名單、停止指令聊天室）
+   - 📨 每次回覆長輩圖（對象與檔名）
+   - 🔴 停止（Ctrl+C 或停止指令）
+   - ⚠️ 警告與錯誤：`[安全隔離]`、`[警告]`、`[錯誤]`、`[例外防護]` 開頭的 log，以及 logging 的 WARNING 以上。同一類 30 分鐘最多推一次，全部每小時最多 6 則。完整 log 仍在本機。
+4. 額度保護：本機用 `notify_state.json` 記本月用量，每次啟動後第一次推播會向 LINE 查實際用量（手動測試用掉的也算），達到 `notify_monthly_cap` 就不再推；LINE 回 429 也視為本月用完。推播在背景執行，網路慢或失敗不會影響監聽，只在本機印出「[通知]」提示。
+
+**注意**：如果推播的聊天室同時在 `targets` 裡，且 `trigger_mode` 為 `all`，推來的文字會被當成對方訊息而觸發回覆；請用預設的 `photo_and_sticker`。
+
 ---
 
 ## 📝 版本異動紀錄 (Changelog)
+
+### [v2.6.0] - 2026-10-31
+#### 停止指令改成「你自己在聊天室發」
+- **改動（不相容）**：停止指令不再看好友傳來的訊息，改成你自己在 `stop_command_chats` 內的聊天室，用自己的帳號發含 `stop_command` 的文字。好友傳來的指令不再生效；設定檔的欄位名稱與格式不變，但意義改了，請確認名單內是你要下指令的聊天室（例如 `Notify Bot`）。
+- **運作方式**：自己發的訊息不會產生未讀數，所以靠訊息列表簽章偵測變化。只在聊天室視窗已在前景（你正在打字）、列表有變化、且最底部是你自己發的文字氣泡時，才用 OCR 讀右側氣泡內容，讀法與先前相同（3 種前處理任一讀到就停，都讀不到字時不停止）。檢查不再把視窗切到前景，也不再替你縮小視窗，所以不會再和回圖流程搶視窗。
+- **限制**：聊天室視窗縮小或沒開時你不可能在裡面打字，所以不檢查。啟動後若聊天室最底部還留著上一次的停止指令，之後視窗簽章變化（例如調整視窗大小）時會被當成新指令再次停止；先在聊天室發任何一則訊息，或刪除那則指令即可。官方帳號推來的訊息（最底部在左側）不會被當成指令。
+- **內部整理**：移除好友路徑相關的未讀數檢查與左側文字 OCR（`last_left_message_has_text`）；`_left_message_blocks` 新增 `side` 參數，右側取樣帶為距右緣 24px 往左 160px。
+
+#### 窄視窗下左右判斷出錯
+- **修正**：聊天視窗很窄時，最底部訊息在左側也會被判成「自己發的」（實測：視窗 390 邏輯像素寬時誤判，最大化後正確）。這會讓「自循環保護」誤攔本該送出的長輩圖，也會影響送出後的送達驗證。現在 `is_last_message_from_self_in_chat` 與 `verify_message_sent_to_chat` 在視窗邏輯寬度小於 800px 時，先暫時最大化、判斷完還原（已最大化、最小化或讀不到視窗狀態時不動視窗）。
+- **停止指令**：改成先 OCR 看有沒有指令，讀到才最大化確認它是聊天室最後一則（避免上方留著舊指令、下面已有新訊息時誤停），平常在聊天室打字不會動你的視窗。
+
+#### 開發中（已簽入，尚未驗證完成）
+- **圖庫來源可設定**：`crawl_images.py` 新增 `image_sources`（網址範本含 `{n}`、`start`~`end` 編號範圍、選填 `category` 與 `pad`）。空白使用預設的 Formosa 貼圖酷每日問候攝影與插畫。節慶類是特定節日的圖、`note-short` 是短影片，所以沒有收進預設。
+- **識別長輩圖才回覆**：新增 `require_grandma_image`（預設 `true`）。對方傳來的圖要通過 `is_authentic_grandma_image`（邊長至少 250px，且 OCR 以多種前處理任一種讀到關鍵字）才回覆；貼圖、生活照、讀不出字的、只傳文字的都不理會（回傳 `SKIPPED_NOT_GRANDMA`，不啟動冷卻也不重試）。**尚無單元測試，也還沒真機驗證**。
+- **無時段圖自動替代**：新增 `auto_neutral_images`（**預設 `false`**）。實測 30 張隨機圖只有 2 張讀得到問候語，OCR 沒讀到問候語絕大多數是辨識失敗，不是真的無時段，所以先不開；比較可靠的路是「來源本身標明時段」（`image_sources` 的 `category`）。細節見下一版的規劃。
+
+#### Notify Bot 推播
+- **新增**：`notify_log` 開啟後，啟動、回覆、停止與警告/錯誤會推播到 LINE 官方帳號（新增 `notifier.py`，只用標準函式庫）。節流、每月額度保護與憑證設定見上方「Notify Bot 推播」。`notify_state.json` 已加入 `.gitignore`。
+- **限制**：每月 200 則額度是整個官方帳號共用的，推播聊天室與你手動測試共用；警告與錯誤只推「標籤開頭」的 log（約定俗成的標記），沒有標籤的 log 不會推。
 
 ### [v2.5.1] - 2026-10-31
 #### 遠端停止指令：視窗展開時也能停

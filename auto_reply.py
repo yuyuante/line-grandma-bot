@@ -36,10 +36,12 @@ import psutil
 from PIL import Image, ImageGrab, ImageOps
 import pyautogui
 
+import notifier
 from crawl_images import (crawl_grandma_images, clean_expired_images, retire_image,
-                          download_and_validate_image, get_existing_md5s, build_candidate_urls)
+                          download_and_validate_image, get_existing_md5s, build_candidate_urls,
+                          build_candidates, normalize_sources)
 
-VERSION = "2.5.1"
+VERSION = "2.6.0"
 
 # 0. 全系統單一執行個體鎖 (Windows Named Mutex)，防止重複啟動繞過斷路器
 _app_mutex_handle = None
@@ -94,6 +96,10 @@ def log_v(msg):
             print(full_text.encode(enc, errors="replace").decode(enc, errors="replace"))
         except Exception:
             print(full_text.encode("ascii", errors="replace").decode("ascii", errors="replace"))
+    try:
+        notifier.on_log(msg)             # 警告/錯誤標籤開頭的訊息 (已啟用 notify_log 時) 同步推播到 Notify Bot
+    except Exception:
+        pass
 
 # 設定檔與歷史記錄路徑
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -101,6 +107,7 @@ CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
 HISTORY_PATH = os.path.join(SCRIPT_DIR, "contact_history.json")
 IMAGE_TAGS_PATH = os.path.join(SCRIPT_DIR, "image_tags.json")
 CHAT_MAP_PATH = os.path.join(SCRIPT_DIR, "chat_dirs.json")
+NOTIFY_STATE_PATH = os.path.join(SCRIPT_DIR, "notify_state.json")   # 本月已推播則數 (見 notifier.py)
 
 def atomic_save_json(file_path, data):
     """使用暫存檔與原子替換 (os.replace)，防止當機或意外中斷損毀 JSON 檔案"""
@@ -148,12 +155,21 @@ DEFAULT_CONFIG = {
     "auto_crawl_images": True,
     "close_window_after_send": True,
     "time_aware_images": True,          # 依時段挑圖：早上不送晚安圖、晚上不送早安圖 (標記為 neutral 的無時段字樣圖不受限)
-    "stop_command": "結束長輩圖機器人",   # 遠端停止指令：stop_command_chats 內的好友傳來含此文字的訊息，程式立即結束
-    "stop_command_chats": []            # 可下達停止指令的好友名單 (預設空白 = 停用)
+    "stop_command": "結束長輩圖機器人",   # 停止指令：你在 stop_command_chats 內的聊天室自己發了含此文字的訊息，程式立即結束
+    "stop_command_chats": [],            # 接受你下停止指令的聊天室名單 (預設空白 = 停用)
+    "image_sources": [],                # 圖庫來源 (網址範本、編號範圍、選填時段類別，見 crawl_images.py)；空白 = 預設的 Formosa 貼圖酷每日問候攝影與插畫
+    "require_grandma_image": True,      # 對方傳來的圖要先辨識為長輩圖才回覆；貼圖、生活照、無法辨識的一律不理會
+    "auto_neutral_images": False,       # 【開發中，預設關閉】沒有符合目前時段的圖時，用 OCR 讀得到字、但沒有問候語與節慶字樣的圖代替。實測 OCR 常讀不出藝術字的問候語，開啟會把早安圖誤判成無時段
+    "notify_log": False,                # 把啟動、回覆、停止與警告/錯誤推播到 LINE 官方帳號 (需 ~/.line-notify.env，見 notifier.py)
+    "notify_monthly_cap": 150           # 每月最多推播則數 (官方帳號免費方案上限 200，留一些給手動測試)
 }
 
 last_reply_times = {}
 _last_valid_config = None
+
+def configure_notifier(config):
+    """依設定啟用或停用 Notify Bot 推播 (主迴圈每輪呼叫，改 config.json 即時生效)"""
+    notifier.configure(config.get("notify_log", False), config.get("notify_monthly_cap", DEFAULT_CONFIG["notify_monthly_cap"]), NOTIFY_STATE_PATH)
 
 def load_config():
     global _last_valid_config
@@ -197,7 +213,8 @@ def load_config():
                     sanitized[k] = max(1, int(cfg[k]))
                 except Exception:
                     pass
-        for k in ("replace_after_send", "collect_incoming_images", "auto_crawl_images", "close_window_after_send", "time_aware_images"):
+        for k in ("replace_after_send", "collect_incoming_images", "auto_crawl_images", "close_window_after_send", "time_aware_images",
+                  "require_grandma_image", "auto_neutral_images"):
             if k in cfg and isinstance(cfg[k], bool):
                 sanitized[k] = cfg[k]
         if isinstance(cfg.get("stop_command"), str) and cfg["stop_command"].strip():
@@ -207,6 +224,20 @@ def load_config():
                 if "stop_command_short" not in _WARNED_ONCE:
                     _WARNED_ONCE.add("stop_command_short")   # 主迴圈每秒讀一次設定，只警告一次
                     logging.warning(f"stop_command 太短 (少於 {STOP_COMMAND_MIN_LEN} 字)，容易誤停，改用預設值。")
+        if isinstance(cfg.get("image_sources"), list):
+            if cfg["image_sources"]:
+                srcs, skipped = normalize_sources(cfg["image_sources"])
+                sanitized["image_sources"] = srcs
+                for msg in skipped:
+                    if msg not in _WARNED_ONCE:
+                        _WARNED_ONCE.add(msg)            # 主迴圈每秒讀一次設定，同一則警告只印一次
+                        logging.warning(f"image_sources {msg}")
+        if isinstance(cfg.get("notify_log"), bool):
+            sanitized["notify_log"] = cfg["notify_log"]
+        try:
+            sanitized["notify_monthly_cap"] = max(1, int(cfg.get("notify_monthly_cap", DEFAULT_CONFIG["notify_monthly_cap"])))
+        except Exception:
+            pass
         if isinstance(cfg.get("stop_command_chats"), list):
             sanitized["stop_command_chats"] = [str(t).strip() for t in cfg["stop_command_chats"] if str(t).strip()]
         if "images_dir" in cfg and isinstance(cfg["images_dir"], str):
@@ -379,7 +410,7 @@ def get_images(images_dir, auto_replenish=True, min_pool=10):
         needed = min_pool - len(images)
         log_v(f"[庫存提示] 目前長輩圖庫存僅 {len(images)} 張 (低於設定值 {min_pool})，自動連網下載補充 {needed} 張備用...")
         try:
-            crawl_grandma_images(target_count=needed, save_dir=abs_dir)
+            crawl_images_now(needed, abs_dir)
             images = _scan_images(abs_dir)
         except Exception as e:
             log_v(f"[警告] 自動補充長輩圖失敗: {e}")
@@ -429,20 +460,94 @@ try {
     proc = subprocess.run(cmd, capture_output=True, timeout=8, env=ocr_env)
     return proc.stdout.decode("utf-8", errors="ignore").replace(" ", "").replace("\r", "").replace("\n", "")
 
-def is_authentic_grandma_image(image_path):
+_IMAGE_SOURCES = None           # config 的 image_sources (None = 預設來源)
+_AUTO_NEUTRAL = False           # config 的 auto_neutral_images
+
+def configure_image_options(config):
+    """依設定更新圖庫來源與無時段圖自動替代 (主迴圈每輪呼叫，改 config.json 即時生效)"""
+    global _IMAGE_SOURCES, _AUTO_NEUTRAL
+    _IMAGE_SOURCES = config.get("image_sources") or None
+    _AUTO_NEUTRAL = bool(config.get("auto_neutral_images", False))
+
+def _tag_source_category(path, category):
+    """來源標明了時段的圖，下載後直接寫入時段標記，不必再靠 OCR 猜"""
+    if category:
+        set_image_slots(path, [category])
+
+def crawl_images_now(target_count, save_dir):
+    """依設定的來源下載新長輩圖，並記下來源標明的時段"""
+    return crawl_grandma_images(target_count=target_count, save_dir=save_dir, sources=_IMAGE_SOURCES, on_saved=_tag_source_category)
+
+OCR_VARIANT_MAX_SIDE = 1600     # 前處理後的圖最長邊上限 (太大辨識很慢)
+OCR_VARIANT_MIN_SIDE = 700      # 最長邊低於此值就放大 2 倍 (小字放大後較容易辨識)
+
+def ocr_image_text_variants(image_path):
     """
-    使用 Windows 內建 OCR 檢驗圖片是否為真正的長輩圖 (早安/平安/祝福/喜樂/問候等)。
-    若為寵物照、生活照、自拍、截圖等非長輩圖，則回傳 False 拒絕收納進長輩圖庫！
+    依序產生同一張圖用不同前處理辨識出的文字：原圖、灰階拉對比、反相 (深色底白字)、二值化。
+    Windows OCR 對藝術字很挑剔，同一張圖不同前處理會讀到不同的字 (停止指令的 OCR 也是同樣做法)。
+    這是產生器，呼叫端找到想要的字就可以停止，不必跑完 (每次辨識都要啟動 PowerShell，約數秒)。
+    任何一種辨識失敗就產生空字串。
     """
     try:
-        raw_text = ocr_image_text(image_path)
-        keywords = [
-            "早安", "晚安", "午安", "日安", "晨", "平安", "喜樂", "順心", "問候", "祝",
-            "感恩", "幸福", "吉祥", "健康", "如意", "快樂", "笑口常開", "佛", "南無",
-            "慈悲", "福", "蓮花", "認同請分享", "知足", "心靈", "語錄", "美麗", "微笑",
-            "美好", "珍惜", "善", "緣", "善緣", "祝福"
-        ]
-        return any(kw in raw_text for kw in keywords)
+        yield ocr_image_text(image_path)
+    except Exception:
+        yield ""
+    try:
+        with Image.open(image_path) as im:
+            gray = ImageOps.autocontrast(im.convert("L"))
+    except Exception:
+        return
+    w, h = gray.size
+    longest = max(w, h)
+    if longest > OCR_VARIANT_MAX_SIDE:
+        ratio = OCR_VARIANT_MAX_SIDE / longest
+        gray = gray.resize((max(1, int(w * ratio)), max(1, int(h * ratio))), Image.LANCZOS)
+    elif longest < OCR_VARIANT_MIN_SIDE:
+        gray = gray.resize((w * 2, h * 2), Image.LANCZOS)
+    for variant in (gray, ImageOps.invert(gray), gray.point(lambda v: 0 if v < 140 else 255)):
+        fd, tmp = tempfile.mkstemp(suffix=".png")
+        os.close(fd)
+        try:
+            variant.save(tmp)
+            yield ocr_image_text(tmp)
+        except Exception:
+            yield ""
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+GRANDMA_MIN_SIDE = 250          # 邊長低於此值的圖 (LINE 貼圖、縮圖) 不是長輩圖
+GRANDMA_KEYWORDS = (
+    "早安", "晚安", "午安", "日安", "晨", "平安", "喜樂", "順心", "問候", "祝",
+    "感恩", "幸福", "吉祥", "健康", "如意", "快樂", "笑口常開", "佛", "南無",
+    "慈悲", "福", "蓮花", "認同請分享", "知足", "心靈", "語錄", "美麗", "微笑",
+    "美好", "珍惜", "善", "緣", "善緣", "祝福"
+)
+_GRANDMA_ID_CACHE = {}          # {圖片 MD5: 是否為長輩圖}，同一張圖在同一次執行只辨識一次 (回覆前辨識、收納時再問一次會直接用快取)
+
+def is_authentic_grandma_image(image_path):
+    """
+    判斷圖片是不是真正的長輩圖：邊長至少 GRANDMA_MIN_SIDE，且 Windows OCR (多種前處理，任何一種讀到即可)
+    讀得到早安、平安、祝福、喜樂等關鍵字。寵物照、生活照、自拍、截圖、LINE 貼圖都回傳 False。
+    OCR 讀不出字也回傳 False (Fail-Closed：不回覆、不收納)。
+    """
+    try:
+        md5 = get_file_md5(image_path)
+        if md5 in _GRANDMA_ID_CACHE:
+            return _GRANDMA_ID_CACHE[md5]
+        with Image.open(image_path) as img:
+            width, height = img.size
+        result = False
+        if min(width, height) >= GRANDMA_MIN_SIDE:
+            for text in ocr_image_text_variants(image_path):
+                if any(kw in text for kw in GRANDMA_KEYWORDS):
+                    result = True
+                    break
+        if md5:
+            _GRANDMA_ID_CACHE[md5] = result
+        return result
     except Exception:
         return False
 
@@ -548,14 +653,35 @@ def set_image_slots(image_path, slots):
     tags[md5] = valid
     return atomic_save_json(IMAGE_TAGS_PATH, tags)
 
+NEUTRAL_MIN_CJK = 6             # 自動判定無時段字樣時，至少要有一種前處理讀到這麼多中文字 (證明 OCR 對這張圖有效)
+FESTIVAL_KEYWORDS = ("節", "新年", "新春", "春節", "元宵", "清明", "端午", "七夕", "中秋", "重陽", "除夕", "元旦",
+                     "父親", "母親", "情人", "聖誕", "萬聖", "生日", "週年", "周年", "畢業", "婚")   # 特定節日或場合的圖，不是通用圖
+
+def _slots_from_text(text):
+    """從 OCR 文字找問候語，回傳適用時段清單 (沒有回傳空清單)"""
+    text = text.lower()
+    slots = []
+    if "早安" in text or "早上好" in text or "晨" in text or "goodmorning" in text:
+        slots.append("morning")
+    if "午安" in text or "中午好" in text or "下午好" in text or "goodafternoon" in text:
+        slots.append("noon")
+    if "晚安" in text or "晚上好" in text or "夜安" in text or "好夢" in text or "goodnight" in text or "goodevening" in text:
+        slots.append("evening")
+    return slots
+
+def _cjk_count(text):
+    return sum(1 for ch in text if "一" <= ch <= "鿿")
+
 def classify_image_slots(image_path):
     """
-    回傳圖片適用時段清單 (morning / noon / evening；["neutral"] 表示已確認無時段字樣，任何時段皆可用)；
+    回傳圖片適用時段清單 (morning / noon / evening；["neutral"] 表示無時段字樣，任何時段皆可用)；
     未知回傳 None (Fail-Closed，不被挑選)。
-    - 先查 image_tags.json 快取 (以 MD5 為鍵；舊版留下的空清單視為未知)。
+    - 先查 image_tags.json 快取 (以 MD5 為鍵；舊版留下的空清單視為未知)。來源標明時段的圖、`--tag-image` 手動標記的圖都在這裡。
     - 未快取時以 OCR 找問候語 (早安/早上好/晨 -> morning、午安/中午好 -> noon、晚安/晚上好 -> evening)，
-      命中才快取。OCR 沒找到問候語不代表無時段字樣 (藝術字常辨識不出)，一律視為未知，
-      必須用 `--tag-image` 手動標記為 neutral 才會被當成無時段字樣。
+      命中才快取。OCR 沒找到問候語不代表沒有 (藝術字常辨識不出)，所以預設視為未知。
+    - 開啟 auto_neutral_images 時：改用多種前處理逐一辨識，任何一種讀到問候語就以它為準；全部都沒有問候語，
+      而且至少一種讀到 NEUTRAL_MIN_CJK 個以上中文字、沒有節慶字樣，才判定為 neutral 並快取
+      (同時記在 image_tags.json 的 _auto_neutral 清單，方便檢查；要推翻就用 `--tag-image` 重新標記)。
     """
     md5 = get_file_md5(image_path)
     if not md5:
@@ -566,25 +692,33 @@ def classify_image_slots(image_path):
     if (isinstance(cached, list) and cached and all(x in valid_slots for x in cached)
             and not ("neutral" in cached and len(cached) > 1)):
         return cached
+
+    def read_texts():
+        if _AUTO_NEUTRAL:
+            yield from ocr_image_text_variants(image_path)
+        else:
+            yield ocr_image_text(image_path)
+
+    union = ""
+    best_cjk = 0
     try:
-        text = ocr_image_text(image_path)
+        for text in read_texts():
+            slots = _slots_from_text(text)
+            if slots:
+                tags[md5] = slots
+                atomic_save_json(IMAGE_TAGS_PATH, tags)
+                return slots
+            union += text
+            best_cjk = max(best_cjk, _cjk_count(text))
     except Exception:
         return None
-    if not text:
+    if not _AUTO_NEUTRAL or best_cjk < NEUTRAL_MIN_CJK or any(k in union for k in FESTIVAL_KEYWORDS):
         return None
-    text = text.lower()
-    slots = []
-    if "早安" in text or "早上好" in text or "晨" in text or "goodmorning" in text:
-        slots.append("morning")
-    if "午安" in text or "中午好" in text or "下午好" in text or "goodafternoon" in text:
-        slots.append("noon")
-    if "晚安" in text or "晚上好" in text or "夜安" in text or "好夢" in text or "goodnight" in text or "goodevening" in text:
-        slots.append("evening")
-    if not slots:
-        return None
-    tags[md5] = slots
+    tags[md5] = ["neutral"]
+    auto = tags.get("_auto_neutral")
+    tags["_auto_neutral"] = (auto if isinstance(auto, list) else []) + [md5]
     atomic_save_json(IMAGE_TAGS_PATH, tags)
-    return slots
+    return ["neutral"]
 
 def filter_images_by_time_slot(candidates, slot, max_ocr=8):
     """
@@ -657,8 +791,9 @@ def image_category(image_path):
 
 def fill_image_pool(images_dir, total=30, max_attempts=250):
     """
-    把圖庫補到 total 張：已手動標記為 neutral (無時段字樣) 的圖照單計入，其餘名額由早安、午安、晚安平均分配。
-    只收 OCR 找得到問候語的圖 (未知的圖丟棄)，所以不會自動新增 neutral 圖，須以 `--tag-image` 手動標記。
+    把圖庫補到 total 張：已標記為 neutral (無時段字樣) 的圖照單計入，其餘名額由早安、午安、晚安平均分配。
+    開啟 auto_neutral_images 時，neutral 另外保留約 1/5 的名額 (讓沒有符合時段的圖時有圖可替代)。
+    來源標明時段的圖直接依來源歸類；其餘靠 OCR，OCR 讀不出來的圖 (未知) 丟棄。
     既有圖片先分類計數 (超額者保留不刪)；再逐張下載，類別已滿的新圖立即丟棄。
     回傳 {類別: 張數}。
     """
@@ -670,15 +805,16 @@ def fill_image_pool(images_dir, total=30, max_attempts=250):
         if cat:
             counts[cat] += 1
     slot_cats = [c for c in IMAGE_CATEGORIES if c != "neutral"]
-    base, extra = divmod(max(0, total - counts["neutral"]), len(slot_cats))
+    neutral_quota = max(counts["neutral"], total // 5) if _AUTO_NEUTRAL else counts["neutral"]
+    base, extra = divmod(max(0, total - neutral_quota), len(slot_cats))
     quota = {c: base + (1 if i < extra else 0) for i, c in enumerate(slot_cats)}
-    quota["neutral"] = counts["neutral"]
+    quota["neutral"] = neutral_quota
     log_v(f"[圖庫分配] 目前 {counts}，目標 {quota}")
 
     existing_md5s = get_existing_md5s(abs_dir)
-    urls = build_candidate_urls()[:max_attempts]
+    candidates = build_candidates(_IMAGE_SOURCES)[:max_attempts]
     fails = 0
-    for url in urls:
+    for url, source_category in candidates:
         if all(counts[c] >= quota[c] for c in IMAGE_CATEGORIES):
             break
         if fails >= 10:
@@ -689,6 +825,7 @@ def fill_image_pool(images_dir, total=30, max_attempts=250):
             fails += 1
             continue
         fails = 0
+        _tag_source_category(saved, source_category)
         cat = image_category(saved)
         if cat is None or counts[cat] >= quota[cat]:
             try:
@@ -737,7 +874,7 @@ def pick_unique_image(images, target_name, config):
         log_v(f" -> 正在自動連網下載 5 張全新長輩圖，確保絕不重複...")
         target_dir = os.path.join(SCRIPT_DIR, config.get("images_dir", "images"))
         try:
-            crawl_grandma_images(target_count=5, save_dir=target_dir)
+            crawl_images_now(5, target_dir)
             fresh_images = get_images(config.get("images_dir", "images"), auto_replenish=False)
             for img in fresh_images:
                 m = get_file_md5(img)
@@ -1847,7 +1984,48 @@ def record_reply_sent(target):
             log_v(f"[斷路器就地鎖定]「{target}」在 5 分鐘內已達 2 次上限，立即啟動 30 分鐘冷卻保護！")
         save_circuit_breaker_state()
 
+WIDE_JUDGE_MIN_WIDTH = 800      # 聊天視窗邏輯寬度低於此值時，左右判斷 (自己發或對方發) 不可靠，判斷前先暫時最大化
+WIDE_JUDGE_SETTLE = 1.0         # 最大化後等待 LINE 重新排版與繪製的時間 (秒)
+
+@contextlib.contextmanager
+def _wide_window_for_judgment(chat_hwnd):
+    """
+    窄視窗下 LINE 的氣泡位置會讓左右判斷出錯 (實測：最後一則在左側，視窗窄時被判成自己發的)。
+    視窗不夠寬時暫時最大化，離開時還原成原本的大小與位置；已最大化、最小化、不可見或任何例外都不動視窗。
+    """
+    restore = False
+    try:
+        if (win32gui.IsWindow(chat_hwnd) and not win32gui.IsIconic(chat_hwnd) and win32gui.IsWindowVisible(chat_hwnd)
+                and win32gui.GetWindowPlacement(chat_hwnd)[1] != win32con.SW_SHOWMAXIMIZED):
+            scale = 1.0
+            try:
+                dpi = ctypes.windll.user32.GetDpiForWindow(chat_hwnd)
+                if dpi > 0:
+                    scale = dpi / 96.0
+            except Exception:
+                pass
+            rect = get_window_true_rect(chat_hwnd)
+            if (rect[2] - rect[0]) / scale < WIDE_JUDGE_MIN_WIDTH:
+                win32gui.ShowWindow(chat_hwnd, win32con.SW_MAXIMIZE)
+                restore = True
+                time.sleep(WIDE_JUDGE_SETTLE)
+    except Exception:
+        restore = False
+    try:
+        yield
+    finally:
+        if restore:
+            try:
+                win32gui.ShowWindow(chat_hwnd, win32con.SW_RESTORE)
+            except Exception:
+                pass
+
 def is_last_message_from_self_in_chat(chat_hwnd):
+    """最底部訊息是否為自己發的 (Fail-Closed)；視窗太窄時先暫時最大化再判斷，細節見 _is_last_message_from_self_in_chat"""
+    with _wide_window_for_judgment(chat_hwnd):
+        return _is_last_message_from_self_in_chat(chat_hwnd)
+
+def _is_last_message_from_self_in_chat(chat_hwnd):
     """
     實體位置方向判定 (Fail-Closed)：檢查目標聊天視窗最底部訊息是否位於右側 (本機送出)。
     - 若視窗最小化、不可見、或非前景視窗，一律回傳 True (安全攔截，不回覆)。
@@ -1970,11 +2148,13 @@ MEDIA_NOISE_MAX_HEIGHT = 12     # 非氣泡區塊低於此高度視為細線、�
 MEDIA_STICKER_MIN_HEIGHT = 40   # 連結列上方的區塊至少要有此高度才算照片
 MEDIA_ACTION_GAP_MAX = 16       # 連結列與上方照片之間的最大間距
 
-def _left_message_blocks(chat_hwnd):
+def _left_message_blocks(chat_hwnd, side="left"):
     """
-    截取聊天室歷史區並找出左側 (對方) 訊息的內容區塊。回傳 (shot, scale, x_start, x_end, is_content, blocks)，
-    blocks 為由下往上最多兩個 (底, 頂) 區塊；暫時無法判斷 (視窗縮小/被遮住/太窄、左側無內容) 回傳 None。
-    取樣帶固定自 56px 起寬 160px (避開頭像)，連續約 6px 無內容即分開區塊；背景色取 10 個取樣點中位數。
+    截取聊天室歷史區並找出左側 (對方) 或右側 (自己，side="right") 訊息的內容區塊。回傳
+    (shot, scale, x_start, x_end, is_content, blocks)，blocks 為由下往上最多兩個 (底, 頂) 區塊；
+    暫時無法判斷 (視窗縮小/被遮住/太窄、該側無內容) 回傳 None。
+    左側取樣帶固定自 56px 起寬 160px (避開頭像)；右側取樣帶為距右緣 24px 往左 160px (氣泡靠右對齊，沒有頭像)。
+    連續約 6px 無內容即分開區塊；背景色取 10 個取樣點中位數。
     """
     if not win32gui.IsWindow(chat_hwnd) or win32gui.IsIconic(chat_hwnd) or not win32gui.IsWindowVisible(chat_hwnd):
         return None
@@ -2000,8 +2180,12 @@ def _left_message_blocks(chat_hwnd):
     def is_content(px):
         return (abs(px[0] - bg[0]) + abs(px[1] - bg[1]) + abs(px[2] - bg[2])) > 30
 
-    x_start = int(56 * scale)
-    x_end = min(x_start + int(160 * scale), int(w * 0.5))
+    if side == "right":
+        x_end = w - int(24 * scale)
+        x_start = max(int(w * 0.5), x_end - int(160 * scale))
+    else:
+        x_start = int(56 * scale)
+        x_end = min(x_start + int(160 * scale), int(w * 0.5))
 
     def row_has_content(y):
         return any(is_content(shot.getpixel((x, y))) for x in range(x_start, x_end, 4))
@@ -2082,16 +2266,14 @@ def last_left_message_is_media(chat_hwnd):
         return None
 
 
-# 遠端停止指令 (stop_command_chats 內的好友傳來含 stop_command 的文字訊息時，程式立即結束)
+# 停止指令 (你在 stop_command_chats 內的聊天室自己發了含 stop_command 的文字訊息時，程式立即結束)
 STOP_EXIT_CODE = 3              # 結束碼：run_auto_reply.bat 看到此值會直接關閉視窗
 STOP_FUZZY_RATIO = 0.85         # OCR 偶爾認錯一字，整句相似度達此值也視為指令
-STOP_OCR_MAX_WIDTH = 560        # OCR 截圖寬度上限 (邏輯像素)：LINE 文字氣泡寬度有上限，截太寬的空白區 OCR 會失敗
 STOP_OCR_UPSCALES = (2, 4)      # OCR 截圖放大倍數 (小字放大後辨識較準，各倍數結果不同，都試)
 STOP_SIG_MIN_INTERVAL = 5.0       # 視窗簽章觸發的檢查最短間隔 (秒)，避免使用者捲動歷史訊息時每秒都做 OCR
-STOP_READ_ATTEMPTS = 3          # 視窗在前景時，讀不到訊息最多再試幾次 (視窗切到前景後未讀數即清除，無法事後重來)
-_STOP_SEEN_UNREAD = {}          # {好友: 已檢查過的未讀數}
-_STOP_SIG_LAST_CHECK = {}        # {好友: 上次因視窗簽章變化而檢查的時間}
-_STOP_SEEN_SIG = {}             # {好友: 視窗展開時最後一次記下的訊息列表簽章}
+STOP_READ_ATTEMPTS = 3          # 視窗在前景時，讀不到你發的訊息最多再試幾次
+_STOP_SIG_LAST_CHECK = {}        # {聊天室: 上次因視窗簽章變化而檢查的時間}
+_STOP_SEEN_SIG = {}             # {聊天室: 視窗展開時最後一次記下的訊息列表簽章}
 
 class StopRequested(BaseException):
     """收到遠端停止指令。繼承 BaseException，避免被監聽迴圈的 except Exception 吞掉"""
@@ -2119,87 +2301,104 @@ def _stop_ocr_variants(crop):
     binary = ImageOps.expand(gray.point(lambda v: 0 if v < 160 else 255), border=24, fill=255)
     yield binary.resize((binary.width * 3, binary.height * 3), Image.LANCZOS)
 
-def last_left_message_has_text(chat_hwnd, phrase, count=1):
+OWN_BUBBLE_MIN_RATIO = 0.55     # 自己的文字氣泡是單一填色：最多的顏色占區塊內容比例達此值才算文字 (照片、貼圖不做 OCR)
+OWN_BUBBLE_COLOR_TOLERANCE = 8  # 判斷像素屬於氣泡底色的每通道容差
+
+def _own_bubble_box(shot, scale, x_start, x_end, top, bottom, is_content):
     """
-    用 OCR 讀對方最底部的 count 個左側區塊 (一般只讀最後一則；對方連傳兩則以上時 count 為 2，
-    避免指令後面緊接「好」之類的訊息而漏掉)，任何一種前處理讀到 phrase 就回傳 True。
-    每個區塊都讀得到字、但都不含 phrase 回傳 False；截不到圖，或任何一個區塊讀不出字 (無法排除指令藏在
-    那一塊) 回傳 None (無法確認)。
+    由右側區塊 (底, 頂) 找出自己的文字氣泡範圍，回傳 (左, 上, 右, 下) 截圖座標；區塊不是純色氣泡 (照片、貼圖、
+    連結預覽) 回傳 None。氣泡底色取區塊內最多的內容色，左右邊界取該底色出現的最左與最右像素，
+    讓 OCR 只讀氣泡本身，不會讀到氣泡左側的時間與已讀標籤。
     """
-    found = _left_message_blocks(chat_hwnd)
+    counts = {}
+    total = 0
+    for y in range(top, bottom + 1, 2):
+        for x in range(x_start, x_end, 4):
+            px = shot.getpixel((x, y))
+            if is_content(px):
+                total += 1
+                counts[px] = counts.get(px, 0) + 1
+    if total == 0:
+        return None
+    base, base_n = max(counts.items(), key=lambda kv: kv[1])
+    if base_n / total < OWN_BUBBLE_MIN_RATIO:
+        return None
+
+    def near_base(px):
+        return all(abs(px[i] - base[i]) <= OWN_BUBBLE_COLOR_TOLERANCE for i in range(3))
+
+    left = right = None
+    for y in range(top, bottom + 1, 2):
+        for x in range(0, shot.width, 2):
+            if near_base(shot.getpixel((x, y))):
+                if left is None or x < left:
+                    left = x
+                if right is None or x > right:
+                    right = x
+    if left is None:
+        return None
+    pad = int(4 * scale)
+    return (max(0, left - pad), max(0, top - pad), min(shot.width, right + pad + 1), min(shot.height, bottom + pad + 1))
+
+def last_own_message_has_text(chat_hwnd, phrase):
+    """
+    用 OCR 讀自己最底部的文字氣泡 (右側)，任何一種前處理讀到 phrase 就回傳 True。
+    讀得到字但不含 phrase、或最底部不是文字氣泡 (照片、貼圖) 回傳 False；
+    截不到圖，或每種前處理都讀不出字 (無法排除指令在那裡) 回傳 None。
+    """
+    found = _left_message_blocks(chat_hwnd, side="right")
     if found is None:
         return None
-    shot, scale, x_start, _, _, blocks = found
-    pad = int(4 * scale)
-    right = min(int(shot.width * 0.92), x_start + int(STOP_OCR_MAX_WIDTH * scale))
-    all_blocks_read = True
-    for bottom, top in blocks[:max(1, count)]:
-        read_block = False
-        crop = shot.crop((x_start, max(0, top - pad), right, min(shot.height, bottom + pad + 1)))
-        for variant in _stop_ocr_variants(crop):
-            fd, tmp_path = tempfile.mkstemp(suffix=".png")
-            os.close(fd)
+    shot, scale, x_start, x_end, is_content, blocks = found
+    bottom, top = blocks[0]
+    box = _own_bubble_box(shot, scale, x_start, x_end, top, bottom, is_content)
+    if box is None:
+        return False
+    crop = shot.crop(box)
+    read = False
+    for variant in _stop_ocr_variants(crop):
+        fd, tmp_path = tempfile.mkstemp(suffix=".png")
+        os.close(fd)
+        try:
+            variant.save(tmp_path)
+            text = ocr_image_text(tmp_path)
+        except Exception:
+            continue
+        finally:
             try:
-                variant.save(tmp_path)
-                text = ocr_image_text(tmp_path)
-            except Exception:
-                continue
-            finally:
-                try:
-                    os.remove(tmp_path)
-                except OSError:
-                    pass
-            if text:
-                read_block = True
-                if text_matches_stop_command(text, phrase):
-                    return True
-        all_blocks_read = all_blocks_read and read_block
-    return False if all_blocks_read else None
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        if text:
+            read = True
+            if text_matches_stop_command(text, phrase):
+                return True
+    return False if read else None
 
-def _chat_has_stop_command(chat, phrase, config, count=1):
+def _chat_has_stop_command(chat, phrase):
     """
-    把好友視窗切到前景，確認對方最後一則是文字且含指令。回傳 True (是指令)、False (不是，
-    或試了 STOP_READ_ATTEMPTS 次仍無法確認，依 Fail-Closed 不停止)。檢查完依設定把視窗縮回去。
+    確認該聊天室你發的最底部文字含停止指令，而且它是整個聊天室的最後一則。回傳 True (是指令) 或 False (不是，
+    或試了 STOP_READ_ATTEMPTS 次仍無法確認，依 Fail-Closed 不停止)。
+    你在聊天室打字時視窗一定在前景，所以只在視窗已是前景時檢查，不會為了檢查搶焦點或縮小視窗；
+    只有讀到指令時才可能暫時最大化視窗 (確認它是最後一則)，平常打字聊天不會動你的視窗。
     """
     matched = find_target_chat_window(chat)
     if not matched:
         return False
     hwnd = matched[0][0]
-    was_foreground = win32gui.GetForegroundWindow() == hwnd   # 使用者正在看這個視窗時，檢查完不替他縮小
-    try:
-        activate_window(hwnd)
-        for _ in range(STOP_READ_ATTEMPTS):
+    for _ in range(STOP_READ_ATTEMPTS):
+        if win32gui.GetForegroundWindow() != hwnd or win32gui.GetWindowText(hwnd).strip().lower() != chat.lower():
+            return False
+        found = last_own_message_has_text(hwnd, phrase)
+        if found is None:
             time.sleep(0.8)
-            if win32gui.GetForegroundWindow() != hwnd or win32gui.GetWindowText(hwnd).strip().lower() != chat.lower():
-                continue
-            if is_last_message_from_self_in_chat(hwnd):
-                return False
-            if count <= 1:
-                # 只有一則新訊息：照片或貼圖不做 OCR；兩則以上時最後一則可能是照片，直接逐區塊 OCR
-                is_media = last_left_message_is_media(hwnd)
-                if is_media:
-                    return False
-                if is_media is None:
-                    continue
-            found = last_left_message_has_text(hwnd, phrase, count)
-            if found is None:
-                continue
-            return found
-        log_v(f"[停止指令待確認]「{chat}」最後一則訊息無法讀取，本次不停止。")
-        return False
-    finally:
-        if not was_foreground:
-            _minimize_if_configured(hwnd, config)
-
-def _window_unread_count(windows, chat):
-    """從視窗標題讀好友目前的未讀數 (標題無括號數字為 0)；找不到該好友視窗回傳 None"""
-    for _, title, _, _ in windows:
-        m = re.search(r"^(.*?)\s*[\(\uFF08](\d+\+?)[\)\uFF09]\s*$", title)
-        if m and m.group(1).strip().lower() == chat.lower():
-            return parse_unread_count(m.group(2))
-        if title.strip().lower() == chat.lower():
-            return 0
-    return None
+            continue
+        if not found:
+            return False                      # 沒有指令：視窗完全不動
+        # 看到指令才確認它是最底部一則 (而不是上面留著的舊指令，下面已有官方帳號推來的新訊息)；視窗太窄時這一步會暫時最大化
+        return verify_message_sent_to_chat(hwnd)
+    log_v(f"[停止指令待確認]「{chat}」最底部你發的訊息無法讀取，本次不停止。")
+    return False
 
 def _window_hwnd(windows, chat):
     """好友視窗的控制代碼 (標題可帶未讀數)；找不到回傳 None"""
@@ -2235,12 +2434,9 @@ def _expanded_window_signature(hwnd):
         return None
 
 def init_stop_baselines(config, chats=None):
-    """啟動 (或熱重載新增好友) 時記下停止指令好友目前的未讀數與視窗簽章，避免先前傳來的舊指令在之後立刻停止程式"""
+    """啟動 (或熱重載新增聊天室時) 記下停止指令聊天室目前的視窗簽章，避免先前留在聊天室的舊指令在啟動後立刻停止程式"""
     windows = get_all_line_windows()
     for chat in (config.get("stop_command_chats") or []) if chats is None else chats:
-        unread = _window_unread_count(windows, chat)
-        if unread is not None:
-            _STOP_SEEN_UNREAD[chat] = unread
         hwnd = _window_hwnd(windows, chat)
         sig = _expanded_window_signature(hwnd) if hwnd else None
         if sig is not None:
@@ -2248,9 +2444,10 @@ def init_stop_baselines(config, chats=None):
 
 def check_stop_command(config):
     """
-    檢查 stop_command_chats 內好友是否傳來停止指令，是的話擲出 StopRequested。
-    兩種觸發：視窗標題未讀數增加 (視窗縮小或在背景時)；視窗展開時標題沒有未讀數，改看訊息列表簽章
-    是否改變。每個未讀數、每次列表變化只檢查一次。
+    檢查 stop_command_chats 內的聊天室，你是否在裡面發了停止指令，是的話擲出 StopRequested。
+    你自己發的訊息不會產生未讀數，所以靠訊息列表簽章 (項目數加最末兩個項目的位置) 偵測變化：
+    列表一有變化，且視窗在前景 (你正在打字)、最底部是自己發的文字氣泡，才用 OCR 讀內容。
+    視窗縮小或沒開時你不可能在裡面打字，直接略過；視窗在背景時保留舊簽章，回到前景再查。
     """
     chats = config.get("stop_command_chats") or []
     phrase = config.get("stop_command") or ""
@@ -2259,43 +2456,23 @@ def check_stop_command(config):
     windows = get_all_line_windows()
     for chat in chats:
         try:
-            unread = _window_unread_count(windows, chat)
-            if unread is None:
-                _STOP_SEEN_UNREAD.pop(chat, None)   # 視窗被關閉：重開後未讀數重新計算
-                _STOP_SEEN_SIG.pop(chat, None)
-                continue
-            seen = _STOP_SEEN_UNREAD.get(chat, 0)
-            count = 0
-            if unread < seen or unread == 0:
-                _STOP_SEEN_UNREAD[chat] = unread
-            elif unread > seen:
-                _STOP_SEEN_UNREAD[chat] = unread
-                count = min(2, unread - seen)
-
             hwnd = _window_hwnd(windows, chat)
             sig = _expanded_window_signature(hwnd) if hwnd else None
-            old_sig = _STOP_SEEN_SIG.get(chat)
             if sig is None:
-                _STOP_SEEN_SIG.pop(chat, None)      # 視窗縮小：改靠未讀數，展開後重新建立簽章
-            elif count == 0 and old_sig is not None and sig != old_sig:
-                if time.time() - _STOP_SIG_LAST_CHECK.get(chat, 0.0) < STOP_SIG_MIN_INTERVAL:
-                    continue                        # 太密集 (例如使用者在捲動歷史訊息)：保留舊簽章，間隔過後再查
-                _STOP_SEEN_SIG[chat] = sig
-                count = 1
-            else:
-                _STOP_SEEN_SIG[chat] = sig
-            if count == 0:
+                _STOP_SEEN_SIG.pop(chat, None)      # 視窗關閉或縮小：展開後重新建立簽章
                 continue
+            old_sig = _STOP_SEEN_SIG.get(chat)
+            if old_sig is None or sig == old_sig:
+                _STOP_SEEN_SIG[chat] = sig
+                continue
+            if time.time() - _STOP_SIG_LAST_CHECK.get(chat, 0.0) < STOP_SIG_MIN_INTERVAL:
+                continue                            # 太密集 (例如捲動歷史訊息)：保留舊簽章，間隔過後再查
+            if win32gui.GetForegroundWindow() != hwnd:
+                continue                            # 背景視窗 (例如官方帳號推來 log)：不搶焦點，保留舊簽章
+            _STOP_SEEN_SIG[chat] = sig
             _STOP_SIG_LAST_CHECK[chat] = time.time()
-            found = _chat_has_stop_command(chat, phrase, config, count=count)
-            if hwnd:
-                after = _expanded_window_signature(hwnd)   # 檢查過程可能改變視窗，重記避免自己觸發自己
-                if after is None:
-                    _STOP_SEEN_SIG.pop(chat, None)
-                else:
-                    _STOP_SEEN_SIG[chat] = after
-            if found:
-                raise StopRequested(f"收到「{chat}」傳來的停止指令")
+            if _chat_has_stop_command(chat, phrase):
+                raise StopRequested(f"你在「{chat}」聊天室發了停止指令")
         except StopRequested:
             raise
         except Exception as e:
@@ -2341,6 +2518,11 @@ def get_chat_visual_hash(chat_hwnd):
     return None
 
 def verify_message_sent_to_chat(chat_hwnd):
+    """最底部訊息是否明確在右側 (自己發的)；視窗太窄時先暫時最大化再判斷，細節見 _verify_message_sent_to_chat"""
+    with _wide_window_for_judgment(chat_hwnd):
+        return _verify_message_sent_to_chat(chat_hwnd)
+
+def _verify_message_sent_to_chat(chat_hwnd):
     """
     發送後實體送達驗證 (三態邏輯中的明確 OUTGOING 判定)：
     - 嚴格要求 chat_hwnd 目前必須為前景視窗；若失焦、最小化或不可見，一律回傳 False。
@@ -2429,6 +2611,14 @@ def verify_message_sent_to_chat(chat_hwnd):
 def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_file=None):
     """執行長輩圖發送"""
     global last_global_reply_time
+    # 識別關卡 (Fail-Closed)：對方傳來的必須是長輩圖才回。貼圖、生活照、無法辨識的、沒有圖可驗證的 (例如只傳文字) 一律不理會
+    if config.get("require_grandma_image", True):
+        if not triggered_file or not is_authentic_grandma_image(triggered_file):
+            log_v(f"[非長輩圖略過]「{target_name}」傳來的不是長輩圖 (或無法辨識)，不回覆。")
+            md5 = get_file_md5(triggered_file) if triggered_file else None
+            if md5:
+                record_contact_received(target_name, md5, max_rounds=config.get("history_rounds", 100))
+            return "SKIPPED_NOT_GRANDMA"
     # 借花獻佛：僅精確收納本次觸發該回覆的圖片，絕不掃描其他聊天室快取
     if config.get("collect_incoming_images", True) and triggered_file:
         max_rounds = config.get("history_rounds", 100)
@@ -2630,6 +2820,7 @@ def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_f
             except Exception as e:
                 log_v(f"[圖庫汰換] 自動汰換圖片失敗: {e}")
 
+        notifier.notify(f"📨 已回覆「{target_name}」長輩圖：{os.path.basename(selected_image)}")
         if verified_bubble:
             log_v(f"[送達確認]「{target_name}」聊天視窗右側氣泡驗證通過，長輩圖確認已成功送出！")
             return "SENT_CONFIRMED"
@@ -3038,9 +3229,9 @@ def check_for_incoming_messages(config):
         prev_reply_time = last_reply_times.get(target_to_reply, 0)
         send_result = send_grandma_image(target_to_reply, config, triggered_file=new_image_found)
         # 對方只傳文字而略過時沒有送出任何東西，不啟動冷卻 (避免擋住隨後真正的新圖)
-        last_reply_times[target_to_reply] = prev_reply_time if send_result == "SKIPPED_TEXT" else time.time()
+        last_reply_times[target_to_reply] = prev_reply_time if send_result in ("SKIPPED_TEXT", "SKIPPED_NOT_GRANDMA") else time.time()
 
-        if send_result in ("SENT_CONFIRMED", "SENT_UNCERTAIN", "SKIPPED_TEXT"):
+        if send_result in ("SENT_CONFIRMED", "SENT_UNCERTAIN", "SKIPPED_TEXT", "SKIPPED_NOT_GRANDMA"):
             # 為防重複刷屏一律視為已處理並更新基準線 (SKIPPED_TEXT：對方只傳文字，同樣標記已處理且不重試)
             if new_image_found:
                 try:
@@ -3251,6 +3442,7 @@ def main():
         ensure_single_instance()
 
     config = load_config()
+    configure_image_options(config)
 
     if args.clear_history:
         log_v("=== 清除歷史發送紀錄 ===")
@@ -3287,7 +3479,7 @@ def main():
     if args.crawl:
         count = args.crawl
         target_dir = os.path.join(SCRIPT_DIR, config.get("images_dir", "images"))
-        crawl_grandma_images(target_count=count, save_dir=target_dir)
+        crawl_images_now(count, target_dir)
         return
 
     if args.list_images:
@@ -3447,7 +3639,7 @@ def main():
     print(f"防洗版冷卻 (cooldown)    : {config.get('cooldown_seconds', 30)} 秒")
     print(f"回覆後安全最小化         : {config.get('close_window_after_send', True)}")
     stop_chats = config.get("stop_command_chats", [])
-    print(f"遠端停止指令             : {'「' + config.get('stop_command', '') + '」，限 ' + '、'.join(stop_chats) if stop_chats else '未啟用'}")
+    print(f"停止指令                 : {'在 ' + '、'.join(stop_chats) + ' 聊天室自己發「' + config.get('stop_command', '') + '」' if stop_chats else '未啟用'}")
     print("-" * 65)
     print("說明：")
     print("1. 對方傳長輩圖來時，程式會隨機等待數秒，並挑選一張不同的長輩圖回傳。")
@@ -3464,6 +3656,11 @@ def main():
     log_v("快取監聽基準線已就緒，正靜態待命中...")
     print("-" * 65)
 
+    configure_notifier(config)
+    notifier.install_logging_handler()
+    stop_chats_desc = "、".join(config.get("stop_command_chats", [])) or "未啟用"
+    notifier.notify(f"🟢 長輩圖機器人 v{VERSION} 已啟動\n監控：{'、'.join(config.get('targets', [])) or '無'}\n停止指令：{stop_chats_desc}")
+
     last_cleanup_time = 0
     current_targets = list(config.get("targets", []))
     current_stop_chats = list(config.get("stop_command_chats", []))
@@ -3472,6 +3669,8 @@ def main():
         while True:
             try:
                 config = load_config()
+                configure_notifier(config)
+                configure_image_options(config)
 
                 # 熱重載偵測：若背景修改了 config.json 中的名單，即時印出提示
                 new_targets = config.get("targets", [])
@@ -3509,8 +3708,12 @@ def main():
             time.sleep(1)
     except KeyboardInterrupt:
         log_v("\n程式已停止。")
+        notifier.notify("🔴 長輩圖機器人已停止 (Ctrl+C)")
+        notifier.flush()
     except StopRequested as e:
         log_v(f"\n[遠端停止] {e}，程式立即結束。")
+        notifier.notify(f"🔴 長輩圖機器人已停止：{e}")
+        notifier.flush()
         sys.exit(STOP_EXIT_CODE)
 
 if __name__ == "__main__":

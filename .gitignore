@@ -11,6 +11,7 @@ config.json
 contact_history.json
 chat_dirs.json
 circuit_breaker.json
+notify_state.json
 review_diff.patch
 
 *.emergency_copy
