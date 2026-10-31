@@ -116,6 +116,7 @@ def open_chat_window(name, ui, read_boxes=ocr_engine.read_boxes, log=lambda msg:
             pass
         if original_tab is not None:
             try:
+                ui.bring_to_front(main)                     # 剛開好的聊天視窗會搶走前景，select_tab 要主視窗在前景才肯動
                 ui.select_tab(main, original_tab)           # 把使用者原本的分頁還原 (視窗還是寬的時候才看得到分頁)
             except Exception:
                 pass

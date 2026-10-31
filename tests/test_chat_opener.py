@@ -144,7 +144,7 @@ class TestOpenChatWindow(unittest.TestCase):
             ("select_tab", 0),
             ("set_search_text", ""), ("set_search_text", "Notify Bot"), ("screenshot",),
             ("double_click", 100 + 267, 50 + 225),
-            ("clear_search",), ("select_tab", 1)])                                       # 使用者原本的分頁要切回去
+            ("clear_search",), ("bring_to_front", MAIN), ("select_tab", 1)])             # 使用者原本的分頁要切回去 (先把主視窗帶回前景)
         self.assertEqual(ui.tab, 1)
 
     def test_not_found_while_already_on_the_all_tab_gives_up_without_switching(self):
@@ -172,7 +172,7 @@ class TestOpenChatWindow(unittest.TestCase):
         ok, _ = run(ui, [ECHO])
         self.assertFalse(ok)
         self.assertNotIn("double_click", ui.names())
-        self.assertEqual(ui.events[-2:], [("clear_search",), ("select_tab", 1)])
+        self.assertEqual(ui.events[-3:], [("clear_search",), ("bring_to_front", MAIN), ("select_tab", 1)])
 
     def test_narrow_window_is_widened_and_always_restored(self):
         ui = FakeUi(narrow=True)
