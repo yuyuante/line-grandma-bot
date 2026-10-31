@@ -1,6 +1,6 @@
 # LINE 長輩圖智慧自動回覆機器人 (line-grandma-bot)
 
-[![Version](https://img.shields.io/badge/version-2.7.0-blue.svg)](auto_reply.py)
+[![Version](https://img.shields.io/badge/version-2.8.0-blue.svg)](auto_reply.py)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D6.svg)](https://microsoft.com)
 [![Python](https://img.shields.io/badge/python-3.10%2B-green.svg)](https://python.org)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey.svg)](LICENSE)
@@ -49,7 +49,7 @@ line-grandma-bot/
 ├── image_kind.py        # 由圖上文字判斷性質：節日、時段問候、平安叮嚀、祝福鼓勵、心靈雞湯；競選圖一律不回
 ├── image_library.py     # 圖庫性質索引、挑圖規則、沒庫存時立即上網抓圖
 ├── reply_budget.py      # 每個聊天室每天的回覆次數上限
-├── auto_reply.py        # 核心自動回覆常駐程式 (v2.7.0)
+├── auto_reply.py        # 核心自動回覆常駐程式 (v2.8.0)
 ├── crawl_images.py      # 台塑貼圖酷長輩圖抓取與過期清理模組
 ├── config.example.json  # 設定檔範本
 ├── config.json          # 個人實際設定檔 (已列入 .gitignore 保護隱私)
@@ -222,8 +222,17 @@ python auto_reply.py --unbind "媽媽"
 
 ## 📝 版本異動紀錄 (Changelog)
 
-### [Unreleased]
-- **自動開啟聊天視窗**（`chat_opener.py`、`auto_open_chat_window`）：不必事先把聊天室開成獨立視窗；找不到時從主視窗搜尋欄搜尋、辨識結果列後雙擊。每一步都檢查主視窗在前景、結果名稱完全相符，結束一定清掉搜尋欄、還原分頁與視窗大小。
+### [v2.8.0] - 2026-11-01
+#### 不必事先把聊天室開成獨立視窗
+- **自動開啟聊天視窗**（`chat_opener.py`、`auto_open_chat_window`，預設開啟）：偵測到某個對象傳新圖、或準備回覆時找不到他的獨立視窗，就從 LINE 主視窗的搜尋欄搜尋，辨識結果列後雙擊開啟。啟動時不會一次把名單全部開起來，只開需要的那一個。
+- **搜尋只認完全相符**：結果列的名稱必須和 `targets` 一字不差（含「Notify Bot 通知群」這類包含但不相同的一律不點）；搜尋欄裡自己打的字不算結果。雙擊後必須出現標題完全相符的視窗才算成功，否則放棄。
+- **官方帳號要到「全部」分頁才搜得到**：先在目前的分頁搜，找不到才切到「全部」再搜，結束後把使用者原本的分頁切回去（分頁的位置與選取狀態從 UIA 讀，切換只用滑鼠點，絕不拖曳——分頁列屬於標題列，拖曳會拖動整個主視窗）。
+- **主視窗太窄時暫時拉寬**（至少 960px，位置與高度不變）：LINE 會把分頁捲到看不見；做完一定縮回原本的位置與大小。
+- **每一步都有保險**：動作前確認主視窗在前景（搜尋後、切分頁前、雙擊前都重查）、不在前景就什麼都不做；搜尋欄用 UIA 直接寫入與清空（不經剪貼簿、不需要焦點，也不受中文輸入法影響）；不論成功失敗，最後一定清掉搜尋欄。
+- **修正**：成功開出聊天視窗後它會搶走前景，導致切回原本分頁被拒絕、分頁停在「全部」。現在還原分頁前先把主視窗帶回前景。
+- **真機驗證**：關掉 Notify Bot 的獨立視窗後啟動機器人，傳晚安圖 → 自動開視窗、辨識為晚安、回另一張晚安圖並確認送達；主視窗大小與分頁都還原。
+- **新增設定** `auto_open_chat_window`；`config.example.json` 已同步。
+- **已知限制**：新對象的快取頻道要先綁定（`--bind-view`）才會被回覆；同時出現多個未知頻道時為了安全會拒絕自動綁定。
 
 ### [v2.7.0] - 2026-10-31
 #### 依對方傳來的圖，回同性質但不同張的圖
