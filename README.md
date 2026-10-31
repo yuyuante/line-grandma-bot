@@ -1,6 +1,6 @@
 # LINE 長輩圖智慧自動回覆機器人 (line-grandma-bot)
 
-[![Version](https://img.shields.io/badge/version-2.5.0-blue.svg)](auto_reply.py)
+[![Version](https://img.shields.io/badge/version-2.5.1-blue.svg)](auto_reply.py)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D6.svg)](https://microsoft.com)
 [![Python](https://img.shields.io/badge/python-3.10%2B-green.svg)](https://python.org)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey.svg)](LICENSE)
@@ -45,7 +45,7 @@
 
 ```text
 line-grandma-bot/
-├── auto_reply.py        # 核心自動回覆常駐程式 (v2.5.0)
+├── auto_reply.py        # 核心自動回覆常駐程式 (v2.5.1)
 ├── crawl_images.py      # 台塑貼圖酷長輩圖抓取與過期清理模組
 ├── config.example.json  # 設定檔範本
 ├── config.json          # 個人實際設定檔 (已列入 .gitignore 保護隱私)
@@ -186,6 +186,12 @@ python auto_reply.py --unbind "媽媽"
 ---
 
 ## 📝 版本異動紀錄 (Changelog)
+
+### [v2.5.1] - 2026-10-31
+#### 遠端停止指令：視窗展開時也能停
+- **修正**：好友視窗展開（沒有最小化，即使被別的視窗蓋住）時，LINE 不在標題顯示未讀數，v2.5.0 偵測不到停止指令。現在視窗展開時改看訊息列表的簽章（項目數加最末兩個項目的位置），列表一有變化就檢查最底部的左側文字氣泡；視窗縮小或在背景時仍用未讀數。
+- **取捨**：因簽章變化觸發的檢查，同一好友至少間隔 5 秒（使用者捲動歷史訊息時不會每秒都做 OCR）；檢查期間（數秒）新到的訊息會被併入基準而不再檢查，指令若恰好在這個空檔連同其他訊息送達可能漏停，重傳一次即可。
+- **副作用**：視窗展開時，列表每次變化（包含你自己在該視窗打字送出）都會做一次檢查；檢查會把視窗切到前景。檢查前視窗若已經在前景（你正在看），檢查完不會替你縮小；否則照 `close_window_after_send` 縮小。
 
 ### [v2.5.0] - 2026-10-31
 #### 遠端停止指令

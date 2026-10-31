@@ -39,7 +39,7 @@ import pyautogui
 from crawl_images import (crawl_grandma_images, clean_expired_images, retire_image,
                           download_and_validate_image, get_existing_md5s, build_candidate_urls)
 
-VERSION = "2.5.0"
+VERSION = "2.5.1"
 
 # 0. 全系統單一執行個體鎖 (Windows Named Mutex)，防止重複啟動繞過斷路器
 _app_mutex_handle = None
@@ -2087,8 +2087,11 @@ STOP_EXIT_CODE = 3              # 結束碼：run_auto_reply.bat 看到此值會
 STOP_FUZZY_RATIO = 0.85         # OCR 偶爾認錯一字，整句相似度達此值也視為指令
 STOP_OCR_MAX_WIDTH = 560        # OCR 截圖寬度上限 (邏輯像素)：LINE 文字氣泡寬度有上限，截太寬的空白區 OCR 會失敗
 STOP_OCR_UPSCALES = (2, 4)      # OCR 截圖放大倍數 (小字放大後辨識較準，各倍數結果不同，都試)
+STOP_SIG_MIN_INTERVAL = 5.0       # 視窗簽章觸發的檢查最短間隔 (秒)，避免使用者捲動歷史訊息時每秒都做 OCR
 STOP_READ_ATTEMPTS = 3          # 視窗在前景時，讀不到訊息最多再試幾次 (視窗切到前景後未讀數即清除，無法事後重來)
 _STOP_SEEN_UNREAD = {}          # {好友: 已檢查過的未讀數}
+_STOP_SIG_LAST_CHECK = {}        # {好友: 上次因視窗簽章變化而檢查的時間}
+_STOP_SEEN_SIG = {}             # {好友: 視窗展開時最後一次記下的訊息列表簽章}
 
 class StopRequested(BaseException):
     """收到遠端停止指令。繼承 BaseException，避免被監聽迴圈的 except Exception 吞掉"""
@@ -2162,6 +2165,7 @@ def _chat_has_stop_command(chat, phrase, config, count=1):
     if not matched:
         return False
     hwnd = matched[0][0]
+    was_foreground = win32gui.GetForegroundWindow() == hwnd   # 使用者正在看這個視窗時，檢查完不替他縮小
     try:
         activate_window(hwnd)
         for _ in range(STOP_READ_ATTEMPTS):
@@ -2184,7 +2188,8 @@ def _chat_has_stop_command(chat, phrase, config, count=1):
         log_v(f"[停止指令待確認]「{chat}」最後一則訊息無法讀取，本次不停止。")
         return False
     finally:
-        _minimize_if_configured(hwnd, config)
+        if not was_foreground:
+            _minimize_if_configured(hwnd, config)
 
 def _window_unread_count(windows, chat):
     """從視窗標題讀好友目前的未讀數 (標題無括號數字為 0)；找不到該好友視窗回傳 None"""
@@ -2196,18 +2201,56 @@ def _window_unread_count(windows, chat):
             return 0
     return None
 
+def _window_hwnd(windows, chat):
+    """好友視窗的控制代碼 (標題可帶未讀數)；找不到回傳 None"""
+    for hwnd, title, _, _ in windows:
+        m = re.search(r"^(.*?)\s*[\(\uFF08](\d+\+?)[\)\uFF09]\s*$", title)
+        name = m.group(1).strip() if m else title.strip()
+        if name.lower() == chat.lower():
+            return hwnd
+    return None
+
+def _expanded_window_signature(hwnd):
+    """
+    視窗展開 (未最小化) 時的訊息列表簽章：項目數加最末兩個項目的位置。LINE 在視窗展開時不在標題顯示未讀數，
+    新訊息只能從列表變化看出來。視窗最小化、讀取失敗回傳 None。
+    """
+    try:
+        if win32gui.IsIconic(hwnd) or not win32gui.IsWindowVisible(hwnd):
+            return None
+        import uiautomation as auto
+        view = auto.ControlFromHandle(hwnd).ListControl(ClassName="LcListView")
+        if not view.Exists(0, 0):
+            return None
+        items = view.GetChildren()
+        if not items:
+            return None
+
+        def rect(item):
+            r = item.BoundingRectangle
+            return (r.left, r.top, r.right, r.bottom)
+
+        return (len(items), rect(items[-1]), rect(items[-2]) if len(items) > 1 else None)
+    except Exception:
+        return None
+
 def init_stop_baselines(config, chats=None):
-    """啟動 (或熱重載新增好友) 時記下停止指令好友目前的未讀數，避免先前傳來的舊指令在之後立刻停止程式"""
+    """啟動 (或熱重載新增好友) 時記下停止指令好友目前的未讀數與視窗簽章，避免先前傳來的舊指令在之後立刻停止程式"""
     windows = get_all_line_windows()
     for chat in (config.get("stop_command_chats") or []) if chats is None else chats:
         unread = _window_unread_count(windows, chat)
         if unread is not None:
             _STOP_SEEN_UNREAD[chat] = unread
+        hwnd = _window_hwnd(windows, chat)
+        sig = _expanded_window_signature(hwnd) if hwnd else None
+        if sig is not None:
+            _STOP_SEEN_SIG[chat] = sig
 
 def check_stop_command(config):
     """
     檢查 stop_command_chats 內好友是否傳來停止指令，是的話擲出 StopRequested。
-    只在該好友的視窗標題未讀數增加時才檢查 (視窗在背景或最小化時才有未讀數)，每個未讀數只檢查一次。
+    兩種觸發：視窗標題未讀數增加 (視窗縮小或在背景時)；視窗展開時標題沒有未讀數，改看訊息列表簽章
+    是否改變。每個未讀數、每次列表變化只檢查一次。
     """
     chats = config.get("stop_command_chats") or []
     phrase = config.get("stop_command") or ""
@@ -2219,15 +2262,39 @@ def check_stop_command(config):
             unread = _window_unread_count(windows, chat)
             if unread is None:
                 _STOP_SEEN_UNREAD.pop(chat, None)   # 視窗被關閉：重開後未讀數重新計算
+                _STOP_SEEN_SIG.pop(chat, None)
                 continue
             seen = _STOP_SEEN_UNREAD.get(chat, 0)
+            count = 0
             if unread < seen or unread == 0:
                 _STOP_SEEN_UNREAD[chat] = unread
+            elif unread > seen:
+                _STOP_SEEN_UNREAD[chat] = unread
+                count = min(2, unread - seen)
+
+            hwnd = _window_hwnd(windows, chat)
+            sig = _expanded_window_signature(hwnd) if hwnd else None
+            old_sig = _STOP_SEEN_SIG.get(chat)
+            if sig is None:
+                _STOP_SEEN_SIG.pop(chat, None)      # 視窗縮小：改靠未讀數，展開後重新建立簽章
+            elif count == 0 and old_sig is not None and sig != old_sig:
+                if time.time() - _STOP_SIG_LAST_CHECK.get(chat, 0.0) < STOP_SIG_MIN_INTERVAL:
+                    continue                        # 太密集 (例如使用者在捲動歷史訊息)：保留舊簽章，間隔過後再查
+                _STOP_SEEN_SIG[chat] = sig
+                count = 1
+            else:
+                _STOP_SEEN_SIG[chat] = sig
+            if count == 0:
                 continue
-            if unread <= seen:
-                continue
-            _STOP_SEEN_UNREAD[chat] = unread
-            if _chat_has_stop_command(chat, phrase, config, count=min(2, unread - seen)):
+            _STOP_SIG_LAST_CHECK[chat] = time.time()
+            found = _chat_has_stop_command(chat, phrase, config, count=count)
+            if hwnd:
+                after = _expanded_window_signature(hwnd)   # 檢查過程可能改變視窗，重記避免自己觸發自己
+                if after is None:
+                    _STOP_SEEN_SIG.pop(chat, None)
+                else:
+                    _STOP_SEEN_SIG[chat] = after
+            if found:
                 raise StopRequested(f"收到「{chat}」傳來的停止指令")
         except StopRequested:
             raise

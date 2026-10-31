@@ -3332,13 +3332,13 @@ class TestLineGrandmaBotCore(unittest.TestCase):
              mock.patch.object(auto_reply, "log_v"):
             auto_reply.check_stop_command(self._stop_cfg())   # 一般例外只記錄，不擲出
 
-    def _run_chat_has_stop(self, *, self_sent=False, media=False, found=True, fg_ok=True):
+    def _run_chat_has_stop(self, *, self_sent=False, media=False, found=True, fg_ok=True, was_fg=False):
         hwnd = 77
         minimized = []
         with mock.patch.object(auto_reply, "find_target_chat_window", return_value=[(hwnd, "小明", "Qt", True)]), \
              mock.patch.object(auto_reply, "activate_window"), \
              mock.patch.object(auto_reply.time, "sleep"), \
-             mock.patch.object(auto_reply.win32gui, "GetForegroundWindow", return_value=hwnd if fg_ok else 5), \
+             mock.patch.object(auto_reply.win32gui, "GetForegroundWindow", side_effect=[hwnd if was_fg else 5] + [hwnd if fg_ok else 5] * 20), \
              mock.patch.object(auto_reply.win32gui, "GetWindowText", return_value="小明"), \
              mock.patch.object(auto_reply, "is_last_message_from_self_in_chat", return_value=self_sent), \
              mock.patch.object(auto_reply, "last_left_message_is_media", return_value=media), \
@@ -3560,6 +3560,86 @@ class TestLineGrandmaBotCore(unittest.TestCase):
             auto_reply.load_config()
             auto_reply.load_config()
         self.assertEqual(sum("stop_command" in str(c.args[0]) for c in warn.call_args_list), 1)
+
+    def test_chat_has_stop_command_keeps_window_open_when_user_was_viewing(self):
+        res, _, minimized = self._run_chat_has_stop(was_fg=True)
+        self.assertEqual((res, minimized), (True, []))                     # 使用者正在看的視窗，檢查完不縮小
+
+    def test_expanded_window_change_triggers_check_without_unread_count(self):
+        auto_reply._STOP_SEEN_UNREAD.clear()
+        auto_reply._STOP_SEEN_SIG.clear()
+        auto_reply._STOP_SIG_LAST_CHECK.clear()
+        calls = []
+        # 每輪呼叫簽章的次數：無觸發 1 次 (本輪)；有觸發 2 次 (本輪加檢查後重記)
+        sigs = iter([(10, "a", "b"),            # 第一輪：只建立基準，不檢查
+                     (10, "a", "b"),            # 第二輪：沒變，不檢查
+                     (11, "c", "a"), (11, "c", "a"),   # 第三輪：變了，檢查一次；檢查後簽章重記
+                     (11, "c", "a")])           # 第四輪：沒變，不再檢查
+        cfg = self._stop_cfg()
+        with mock.patch.object(auto_reply, "get_all_line_windows", return_value=[(5, "小明", "Qt", True)]), \
+             mock.patch.object(auto_reply, "_expanded_window_signature", side_effect=lambda h: next(sigs)), \
+             mock.patch.object(auto_reply, "_chat_has_stop_command", side_effect=lambda *a, **k: calls.append(k["count"]) or False):
+            for _ in range(4):
+                auto_reply.check_stop_command(cfg)
+        self.assertEqual(calls, [1])
+
+    def test_expanded_window_checks_are_throttled(self):
+        auto_reply._STOP_SEEN_UNREAD.clear()
+        auto_reply._STOP_SEEN_SIG.clear()
+        auto_reply._STOP_SIG_LAST_CHECK.clear()
+        auto_reply._STOP_SEEN_SIG["小明"] = (10, "a", "b")
+        calls = []
+        clock = {"t": 1000.0}
+        # 捲動歷史訊息：簽章每輪都變。第一次檢查後 5 秒內不再檢查，間隔過後才再查一次
+        sigs = iter([(11, "c", "a"), (11, "c", "a"), (12, "d", "c"), (13, "e", "d"), (13, "e", "d")])
+        with mock.patch.object(auto_reply, "get_all_line_windows", return_value=[(5, "小明", "Qt", True)]),              mock.patch.object(auto_reply.time, "time", lambda: clock["t"]),              mock.patch.object(auto_reply, "_expanded_window_signature", side_effect=lambda h: next(sigs)),              mock.patch.object(auto_reply, "_chat_has_stop_command", side_effect=lambda *a, **k: calls.append(1) or False):
+            auto_reply.check_stop_command(self._stop_cfg())      # 檢查 (簽章 11、重記 11)
+            clock["t"] += 1
+            auto_reply.check_stop_command(self._stop_cfg())      # 簽章變成 12，距上次 1 秒：略過，保留舊簽章
+            self.assertEqual(len(calls), 1)
+            clock["t"] += auto_reply.STOP_SIG_MIN_INTERVAL
+            auto_reply.check_stop_command(self._stop_cfg())      # 簽章 13，間隔已過：再檢查
+        self.assertEqual(len(calls), 2)
+
+    def test_expanded_window_stop_command_raises(self):
+        auto_reply._STOP_SEEN_UNREAD.clear()
+        auto_reply._STOP_SEEN_SIG.clear()
+        auto_reply._STOP_SIG_LAST_CHECK.clear()
+        auto_reply._STOP_SEEN_SIG["小明"] = (10, "a", "b")
+        sigs = iter([(11, "c", "a"), (11, "c", "a")])
+        with mock.patch.object(auto_reply, "get_all_line_windows", return_value=[(5, "小明", "Qt", True)]), \
+             mock.patch.object(auto_reply, "_expanded_window_signature", side_effect=lambda h: next(sigs)), \
+             mock.patch.object(auto_reply, "_chat_has_stop_command", return_value=True):
+            with self.assertRaises(auto_reply.StopRequested):
+                auto_reply.check_stop_command(self._stop_cfg())
+
+    def test_minimized_window_drops_signature_and_rebuilds_after_restore(self):
+        auto_reply._STOP_SEEN_UNREAD.clear()
+        auto_reply._STOP_SEEN_SIG.clear()
+        auto_reply._STOP_SIG_LAST_CHECK.clear()
+        auto_reply._STOP_SEEN_SIG["小明"] = (10, "a", "b")
+        calls = []
+        sigs = iter([None, (12, "x", "y")])    # 縮小時為 None；還原後第一次只重建基準，不檢查
+        with mock.patch.object(auto_reply, "get_all_line_windows", return_value=[(5, "小明", "Qt", True)]), \
+             mock.patch.object(auto_reply, "_expanded_window_signature", side_effect=lambda h: next(sigs)), \
+             mock.patch.object(auto_reply, "_chat_has_stop_command", side_effect=lambda *a, **k: calls.append(1) or False):
+            auto_reply.check_stop_command(self._stop_cfg())
+            self.assertNotIn("小明", auto_reply._STOP_SEEN_SIG)
+            auto_reply.check_stop_command(self._stop_cfg())
+        self.assertEqual(calls, [])
+        self.assertEqual(auto_reply._STOP_SEEN_SIG["小明"], (12, "x", "y"))
+
+    def test_expanded_window_signature_none_when_minimized(self):
+        with mock.patch.object(auto_reply.win32gui, "IsIconic", return_value=True):
+            self.assertIsNone(auto_reply._expanded_window_signature(1))
+        with mock.patch.object(auto_reply.win32gui, "IsIconic", side_effect=RuntimeError("bad hwnd")):
+            self.assertIsNone(auto_reply._expanded_window_signature(1))
+
+    def test_window_hwnd_matches_title_with_or_without_unread(self):
+        wins = [(1, "LINE", "Qt", True), (2, "小明 (3)", "Qt", True), (3, "別人", "Qt", True)]
+        self.assertEqual(auto_reply._window_hwnd(wins, "小明"), 2)
+        self.assertEqual(auto_reply._window_hwnd(wins, "別人"), 3)
+        self.assertIsNone(auto_reply._window_hwnd(wins, "不存在"))
 
     def test_load_config_sanitizes_stop_command(self):
         path = os.path.join(self.temp_dir.name, "stop_cfg.json")
