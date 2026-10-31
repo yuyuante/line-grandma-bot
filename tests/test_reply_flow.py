@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -371,7 +372,7 @@ class TestSendFlow(_Base):
         self.slot = "morning"
 
     def run_flow(self, *, recognize=((True, MID_AUTUMN, "中秋節快樂"),), choose=None, attach=True, config=None,
-                 triggered=True, slots=None):
+                 triggered=True, slots=None, find_results=None, opener=False):
         mocks = {}
         minimized = []
         patches = {
@@ -380,7 +381,10 @@ class TestSendFlow(_Base):
             "attach": mock.patch.object(auto_reply, "send_image_via_attach_dialog", return_value=attach),
             "slot": mock.patch.object(auto_reply, "current_time_slot", side_effect=slots or (lambda: self.slot)),
             "contact_received": mock.patch.object(auto_reply, "record_contact_received"),
-            "find": mock.patch.object(auto_reply, "find_target_chat_window", return_value=[(CHAT, "小明", "Qt", True)]),
+            "find": mock.patch.object(auto_reply, "find_target_chat_window",
+                                      **({"side_effect": list(find_results)} if find_results is not None
+                                         else {"return_value": [(CHAT, "小明", "Qt", True)]})),
+            "opener": mock.patch.object(auto_reply, "open_missing_chat_window", return_value=opener),
             "harvest": mock.patch.object(auto_reply, "harvest_line_incoming_images"),
             "get_images": mock.patch.object(auto_reply, "get_images", return_value=[]),
             "countdown": mock.patch.object(auto_reply, "countdown_sleep"),
@@ -449,6 +453,30 @@ class TestSendFlow(_Base):
         result, _, _ = self.run_flow(attach=False)                                           # 送出失敗
         self.assertEqual(result, "NOT_SENT")
         self.assertEqual(self.today(), 0)
+
+    def test_closed_chat_window_is_reopened_before_sending(self):
+        window = [(CHAT, "小明", "Qt", True)]
+        # 依序：辨識前的提前查詢 (視窗不見)、找視窗 (不見)、開窗成功後再找 (出現)
+        result, m, _ = self.run_flow(find_results=[[], [], window], opener=True)
+        self.assertEqual(result, "SENT_CONFIRMED")
+        m["opener"].assert_called_once_with("小明", mock.ANY)
+        self.assertEqual(self.today(), 1)
+
+    def test_window_that_cannot_be_reopened_means_nothing_is_sent(self):
+        result, m, _ = self.run_flow(find_results=[[], [], []], opener=False)
+        self.assertEqual(result, "NOT_SENT")                                                # 維持原本的保守行為：不送、走重試
+        m["attach"].assert_not_called()
+        self.assertEqual(self.today(), 0)
+
+    def test_existing_window_is_never_reopened(self):
+        result, m, _ = self.run_flow()
+        self.assertEqual(result, "SENT_CONFIRMED")
+        m["opener"].assert_not_called()
+
+    def test_no_image_to_send_does_not_open_any_window(self):
+        result, m, _ = self.run_flow(choose=[None], find_results=[[]])
+        self.assertEqual(result, "SKIPPED_NO_IMAGE")
+        m["opener"].assert_not_called()                                                     # 沒有要回的圖就不必動主視窗
 
     def test_campaign_image_is_skipped_with_its_own_log_and_not_counted(self):
         result, m, _ = self.run_flow(recognize=[(False, None, "3號議員候選人全力衝刺")])
@@ -558,7 +586,75 @@ class TestStartup(_Base):
         self.assertTrue(any("預先辨識圖庫失敗" in l for l in logs))
 
 
+class TestDetectionReopensTheWindow(_Base):
+    """偵測階段：頻道已綁定、但好友的獨立視窗不見了，不再直接丟掉事件，先試著把視窗開回來"""
+
+    def run_detection(self, window_open, opener_result, config_extra=None):
+        cache = os.path.join(self.tmp.name, "cache")
+        fake_hash = "888803ef1234567890abcdef1234567890abcdef"
+        chat_m = os.path.join(cache, fake_hash, "m")
+        os.makedirs(chat_m, exist_ok=True)
+        img = os.path.join(chat_m, "t.eimg")
+        with open(img, "wb") as f:
+            f.write(b"\x00" * 300000)
+        now = time.time()
+        os.utime(img, (now, now))
+        sent = []
+        state = {"open": window_open}
+        window = [(CHAT, "小明", "Qt", True)]
+
+        def open_it(name, config):
+            state["open"] = bool(opener_result)                     # 開窗成功之後，視窗就找得到了
+            return opener_result
+
+        cfg = {"targets": ["小明"], "trigger_mode": "photo_and_sticker", "cooldown_seconds": 0, "min_delay_seconds": 0, "max_delay_seconds": 0}
+        cfg.update(config_extra or {})
+        with mock.patch.object(auto_reply, "CHAT_MAP_PATH", os.path.join(self.tmp.name, "chat_dirs.json")):
+            with auto_reply.locked_chat_dirs() as m:
+                m[fake_hash] = "小明"
+            with mock.patch.object(auto_reply, "get_active_line_cache_dir", return_value=cache), \
+                 mock.patch.object(auto_reply, "find_target_chat_window", side_effect=lambda t: window if state["open"] else []), \
+                 mock.patch.object(auto_reply, "is_valid_image_or_eimg", return_value=True), \
+                 mock.patch.object(auto_reply, "open_missing_chat_window", side_effect=open_it) as opener, \
+                 mock.patch.object(auto_reply, "send_grandma_image", side_effect=lambda t, c, **kw: sent.append(t) or "SENT_CONFIRMED"), \
+                 mock.patch.object(auto_reply, "check_circuit_breaker", return_value=True):
+                auto_reply.last_global_reply_time = 0.0
+                auto_reply.last_reply_times.pop("小明", None)
+                auto_reply.PROCESSED_CACHE_FILES.clear()
+                auto_reply.last_seen_cache_mtime = now - 1.0
+                auto_reply.check_for_incoming_messages(cfg)
+        return sent, opener
+
+    def test_missing_window_is_reopened_and_the_reply_goes_ahead(self):
+        sent, opener = self.run_detection(window_open=False, opener_result=True)
+        self.assertEqual(sent, ["小明"])
+        opener.assert_called_once_with("小明", mock.ANY)
+
+    def test_window_that_cannot_be_reopened_still_drops_the_event(self):
+        sent, opener = self.run_detection(window_open=False, opener_result=False)
+        self.assertEqual(sent, [])                                                          # 維持原本的安全略過
+        self.assertIn("桌面無該好友專屬視窗", NL.join(str(c.args[0]) for c in self.log.call_args_list))
+        opener.assert_called_once()
+
+    def test_present_window_does_not_trigger_the_opener(self):
+        sent, opener = self.run_detection(window_open=True, opener_result=True)
+        self.assertEqual(sent, ["小明"])
+        opener.assert_not_called()
+
+
 class TestConfigKeys(_Base):
+    def test_example_config_lists_every_setting_and_loads_cleanly(self):
+        # 範本漏掉新設定項時，使用者複製範本就看不到那些選項
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.example.json")
+        with open(path, encoding="utf-8") as f:
+            example = json.load(f)
+        obsolete = {"auto_neutral_images"}                        # 已被新的挑圖規則取代的舊選項
+        self.assertEqual(sorted(set(auto_reply.DEFAULT_CONFIG) - obsolete - set(example)), [])
+        self.assertEqual(sorted(set(example) - set(auto_reply.DEFAULT_CONFIG)), [])        # 範本也不能有程式不認得的設定項
+        loaded = self.load(example)
+        for key in set(auto_reply.DEFAULT_CONFIG) - obsolete - {"targets"}:
+            self.assertEqual(loaded[key], example[key], key)                                # 範本的值都能被原樣接受
+
     def load(self, data):
         path = os.path.join(self.tmp.name, "cfg.json")
         with open(path, "w", encoding="utf-8") as f:

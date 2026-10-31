@@ -60,3 +60,29 @@ def read_text(image, fallback=None):
     if fallback is None:
         raise RuntimeError("RapidOCR 不能用，也沒有後備 OCR")
     return fallback(image)
+
+
+def read_boxes(image):
+    """
+    讀出圖片上每一段文字和它的中心位置，回傳 [(文字, (中心x, 中心y))]，座標是圖片內的像素。
+    只在 RapidOCR 能用時才有位置資訊，不能用或失敗回傳空清單 (呼叫端要把「讀不到」當成找不到)。
+    image 可以是檔案路徑或 PIL 圖片。
+    """
+    engine = _get_engine()
+    if engine is None:
+        return []
+    try:
+        source = image
+        if not isinstance(image, (str, bytes)) and hasattr(image, "convert"):
+            import numpy as np
+            source = np.array(image.convert("RGB"))[:, :, ::-1]
+        result, _ = engine(source)
+        boxes = []
+        for item in result or []:
+            points = item[0]
+            xs = [p[0] for p in points]
+            ys = [p[1] for p in points]
+            boxes.append((item[1], ((min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2)))
+        return boxes
+    except Exception:
+        return []

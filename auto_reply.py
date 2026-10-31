@@ -42,6 +42,7 @@ import image_kind
 import image_library
 import reply_budget
 import crawl_images
+import chat_opener
 from crawl_images import (crawl_grandma_images, clean_expired_images, retire_image,
                           download_and_validate_image, get_existing_md5s, build_candidate_urls,
                           build_candidates, normalize_sources)
@@ -170,6 +171,7 @@ DEFAULT_CONFIG = {
     "image_sources": [],                # 圖庫來源 (網址範本、編號範圍、選填時段類別，見 crawl_images.py)；空白 = 預設的 Formosa 貼圖酷每日問候攝影與插畫
     "require_grandma_image": True,      # 對方傳來的圖要先辨識為長輩圖才回覆；貼圖、生活照、無法辨識的一律不理會
     "auto_neutral_images": False,       # 【開發中，預設關閉】沒有符合目前時段的圖時，用 OCR 讀得到字、但沒有問候語與節慶字樣的圖代替。實測 OCR 常讀不出藝術字的問候語，開啟會把早安圖誤判成無時段
+    "auto_open_chat_window": True,      # 好友的獨立聊天視窗不見時，自動從 LINE 主視窗的搜尋欄開回來 (關閉則找不到視窗就略過該則訊息)
     "notify_log": False,                # 把啟動、回覆、停止與警告/錯誤推播到 LINE 官方帳號 (需 ~/.line-notify.env，見 notifier.py)
     "notify_monthly_cap": 150           # 每月最多推播則數 (官方帳號免費方案上限 200，留一些給手動測試)
 }
@@ -224,7 +226,7 @@ def load_config():
                 except Exception:
                     pass
         for k in ("replace_after_send", "collect_incoming_images", "auto_crawl_images", "close_window_after_send", "time_aware_images",
-                  "require_grandma_image", "auto_neutral_images"):
+                  "require_grandma_image", "auto_neutral_images", "auto_open_chat_window"):
             if k in cfg and isinstance(cfg[k], bool):
                 sanitized[k] = cfg[k]
         if isinstance(cfg.get("stop_command"), str) and cfg["stop_command"].strip():
@@ -1406,6 +1408,118 @@ def find_line_main_window():
         if title == "LINE" and vis:
             return hwnd
     return None
+
+class LineMainUi:
+    """chat_opener 用的介面：實際操作 LINE 主視窗 (UIA 寫入搜尋欄、截圖、雙擊搜尋結果)"""
+
+    def find_chat_window(self, name):
+        return find_target_chat_window(name)
+
+    def main_window(self):
+        self._main = find_line_main_window()
+        return self._main
+
+    def bring_to_front(self, hwnd):
+        if win32gui.IsIconic(hwnd):
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+        activate_window(hwnd)
+
+    def is_front(self, hwnd):
+        return win32gui.GetForegroundWindow() == hwnd
+
+    def _search_edit(self, hwnd):
+        import uiautomation as auto
+        edit = auto.ControlFromHandle(hwnd).EditControl(ClassName="LcTextField")
+        return edit if edit.Exists(1, 0.2) else None
+
+    def search_box_rect(self, hwnd):
+        edit = self._search_edit(hwnd)
+        if edit is None:
+            return None
+        r = edit.BoundingRectangle
+        return r.left, r.top, r.right, r.bottom
+
+    def set_search_text(self, text):
+        self._search_edit(self._main).GetValuePattern().SetValue(text)
+
+    def clear_search(self):
+        edit = self._search_edit(self._main)
+        if edit is not None:
+            edit.GetValuePattern().SetValue("")
+
+    def double_click(self, x, y):
+        pyautogui.doubleClick(x, y)
+
+    # --- 分頁列 (全部 / 好友 / 群組 / ...)：UIA 的預設動作對它沒有作用，只能用滑鼠點；位置與選取狀態可以從 UIA 讀 ---
+    MIN_MAIN_WIDTH = 960            # 主視窗至少這麼寬，LINE 才會把分頁全部排出來
+
+    def ensure_wide(self, hwnd):
+        """主視窗太窄就暫時拉寬 (位置與高度不變)，回傳原本的 (左, 上, 右, 下) 讓呼叫端還原；不需要拉寬回傳 None"""
+        left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+        if right - left >= self.MIN_MAIN_WIDTH:
+            return None
+        win32gui.MoveWindow(hwnd, left, top, self.MIN_MAIN_WIDTH, bottom - top, True)
+        time.sleep(0.8)
+        return left, top, right, bottom
+
+    def restore_rect(self, hwnd, rect):
+        left, top, right, bottom = rect
+        win32gui.MoveWindow(hwnd, left, top, right - left, bottom - top, True)
+
+    @staticmethod
+    def _descendants(ctrl, depth=0, max_depth=6):
+        if depth > max_depth:
+            return
+        for child in ctrl.GetChildren():
+            yield child
+            yield from LineMainUi._descendants(child, depth + 1, max_depth)
+
+    def _tab_buttons(self, hwnd):
+        import uiautomation as auto
+        bar = auto.ControlFromHandle(hwnd).GroupControl(ClassName="TabBar")
+        if not bar.Exists(1, 0.2):
+            return None, []
+        return bar, [c for c in self._descendants(bar) if c.ClassName == "TabButton"]
+
+    def selected_tab(self, hwnd):
+        """目前選取的分頁索引 (被選取的分頁底下有一條 3px 高的底線)；讀不到回傳 None"""
+        _, buttons = self._tab_buttons(hwnd)
+        for index, button in enumerate(buttons):
+            for c in self._descendants(button, max_depth=3):
+                r = c.BoundingRectangle
+                if c.ClassName == "LcWidget" and 0 < r.bottom - r.top <= 4 and r.right - r.left > 20:
+                    return index
+        return None
+
+    def select_tab(self, hwnd, index):
+        """
+        切到指定分頁並驗證 (底線標記要移過去)。分頁被捲到看不見、主視窗不在前景、點擊位置不在主視窗內都不動，
+        回傳是否成功。絕不在分頁列上拖曳 (分頁列屬於標題列，拖曳會拖動整個視窗)。
+        """
+        bar, buttons = self._tab_buttons(hwnd)
+        if bar is None or index >= len(buttons) or not self.is_front(hwnd):
+            return False
+        view, tab = bar.BoundingRectangle, buttons[index].BoundingRectangle
+        if tab.left < view.left or tab.right > view.right:
+            return False
+        x, y = (tab.left + tab.right) // 2, (tab.top + tab.bottom) // 2
+        left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+        if not (left <= x < right and top <= y < bottom):
+            return False
+        pyautogui.click(x, y)
+        time.sleep(0.6)
+        return self.selected_tab(hwnd) == index
+
+    def screenshot(self, hwnd):
+        rect = get_window_true_rect(hwnd)
+        return ImageGrab.grab(bbox=rect, all_screens=True), (rect[0], rect[1])
+
+def open_missing_chat_window(name, config):
+    """好友的獨立聊天視窗不見了：從 LINE 主視窗的搜尋欄開回來 (auto_open_chat_window 關閉時不做)；成功回傳 True"""
+    if not config.get("auto_open_chat_window", True):
+        return False
+    log_v(f" -> 找不到「{name}」的獨立聊天視窗，嘗試從 LINE 主視窗開啟...")
+    return chat_opener.open_chat_window(name, LineMainUi(), log=log_v)
 
 def activate_window(hwnd):
     try:
@@ -3008,8 +3122,10 @@ def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_f
             return "SKIPPED_NO_IMAGE"
         log_v(f" -> [時段重驗] 改選圖片: {os.path.basename(selected_image)}")
 
-    # 尋找現有聊天視窗 (嚴格 Fail-Closed，絕不盲目模擬搜尋或開啟其他視窗)
+    # 尋找現有聊天視窗 (嚴格 Fail-Closed)；視窗不見時只會用 chat_opener 做「完全相符」的開啟，絕不盲目開啟其他視窗
     matched = find_target_chat_window(target_name)
+    if not matched and open_missing_chat_window(target_name, config):
+        matched = find_target_chat_window(target_name)
     if not matched:
         log_v(f"[錯誤] 無法取得「{target_name}」的聊天視窗，為防誤傳終止發送。請在 LINE 中保持該視窗開啟。")
         return "NOT_SENT"
@@ -3489,6 +3605,8 @@ def check_for_incoming_messages(config):
 
                     if cand_target and cand_target in targets:
                         matched = find_target_chat_window(cand_target)
+                        if not matched and open_missing_chat_window(cand_target, config):
+                            matched = find_target_chat_window(cand_target)
                         if matched:
                             # 電腦版獨立視窗標題正常為好友名稱 (不帶括號未讀數)，視窗上線即刻確認
                             chosen_candidate = cand_path

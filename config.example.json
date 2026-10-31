@@ -17,5 +17,13 @@
   "close_window_after_send": true,
   "time_aware_images": true,
   "stop_command": "結束長輩圖機器人",
-  "stop_command_chats": []
+  "stop_command_chats": [],
+  "max_replies_per_day": 3,
+  "max_image_pool": 120,
+  "instant_crawl_max_downloads": 40,
+  "image_sources": [],
+  "require_grandma_image": true,
+  "notify_log": false,
+  "notify_monthly_cap": 150,
+  "auto_open_chat_window": true
 }
