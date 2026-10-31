@@ -1,6 +1,6 @@
 # LINE 長輩圖智慧自動回覆機器人 (line-grandma-bot)
 
-[![Version](https://img.shields.io/badge/version-2.4.2-blue.svg)](auto_reply.py)
+[![Version](https://img.shields.io/badge/version-2.5.0-blue.svg)](auto_reply.py)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D6.svg)](https://microsoft.com)
 [![Python](https://img.shields.io/badge/python-3.10%2B-green.svg)](https://python.org)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey.svg)](LICENSE)
@@ -45,7 +45,7 @@
 
 ```text
 line-grandma-bot/
-├── auto_reply.py        # 核心自動回覆常駐程式 (v2.4.2)
+├── auto_reply.py        # 核心自動回覆常駐程式 (v2.5.0)
 ├── crawl_images.py      # 台塑貼圖酷長輩圖抓取與過期清理模組
 ├── config.example.json  # 設定檔範本
 ├── config.json          # 個人實際設定檔 (已列入 .gitignore 保護隱私)
@@ -108,7 +108,9 @@ copy config.example.json config.json
   "min_image_pool": 10,
   "auto_crawl_images": true,
   "close_window_after_send": true,
-  "time_aware_images": true
+  "time_aware_images": true,
+  "stop_command": "結束長輩圖機器人",
+  "stop_command_chats": []
 }
 ```
 
@@ -128,6 +130,8 @@ copy config.example.json config.json
 | `min_image_pool` | `10` | 圖庫最低儲備數量，低於此數量時自動連網補充。 |
 | `auto_crawl_images` | `true` | 是否允許圖庫不足時自動連網下載補充。 |
 | `close_window_after_send` | `true` | 發送完成後是否自動將對話框最小化至工作列，維持後續未讀狀態。 |
+| `stop_command` | `"結束長輩圖機器人"` | 遠端停止指令的文字。`stop_command_chats` 內的好友傳來含此文字的訊息，程式立即結束。比對時忽略空白與標點，OCR 認錯一字也算（例如「結束長輩圖機器八」）。 |
+| `stop_command_chats` | `[]` | 可下達停止指令的好友名單，名稱需與 LINE 顯示名稱完全相符；空白代表停用此功能。只認該好友「傳來」的訊息，自己送出的不算。 |
 | `time_aware_images` | `true` | 依時段挑圖：05-11 時只送早安或無時段字樣的圖，11-17 時送午安，17-05 時送晚安。以 OCR 辨識圖上字樣並快取於 `image_tags.json`；沒有該時段的圖時，改用已標記為 `neutral`（無時段字樣）的圖代替；兩者皆無才不發送。OCR 找不到問候語的圖視為未知，不會被挑選，請用 `--tag-image` 手動標記。 |
 
 ---
@@ -182,6 +186,14 @@ python auto_reply.py --unbind "媽媽"
 ---
 
 ## 📝 版本異動紀錄 (Changelog)
+
+### [v2.5.0] - 2026-10-31
+#### 遠端停止指令
+- **新增**：`stop_command_chats` 名單內的好友（例如你自己的另一個帳號）傳來含 `stop_command`（預設「結束長輩圖機器人」，去除空白與標點後至少 4 字，否則改用預設值）的文字訊息，程式立即結束。訊息只要含指令全文就成立（例如「不要結束長輩圖機器人」也會停止）；對方連傳兩則以上時，讀最底部兩個訊息區塊。啟動時（或熱重載新增好友時）該好友已有的未讀訊息不算。停止時日誌印出「[遠端停止]」。結束碼為 3，`run_auto_reply.bat` 看到後直接關閉視窗。預設名單為空，等於不啟用。
+- **運作方式**：LINE 視窗不提供訊息文字，所以改用截圖加 Windows OCR。只在該好友的視窗標題未讀數增加時才檢查，每個未讀數只檢查一次；檢查時會把該視窗切到前景、讀最底部左側（對方）的文字氣泡，讀完依 `close_window_after_send` 縮回去。只有一則新訊息時，照片、貼圖與自己送出的訊息一律略過；連傳兩則以上時逐一讀最底部兩個區塊（指令可能在貼圖之前）。已知限制：兩則氣泡間距小於約 6 px 時會被當成同一個區塊，第二個區塊可能是更早的舊訊息。OCR 對淺灰氣泡裡的小字不穩定，所以同一張截圖用 3 種前處理各讀一次，任何一次讀到指令就停止；3 次嘗試都讀不到字時不停止（Fail-Closed）。
+- **倒數期間也生效**：回圖倒數（最長 15 分鐘）期間每 3 秒檢查一次，不必等倒數結束。
+- **限制**：好友的視窗已在前景、正在被你看著時，標題沒有未讀數，偵測不到；請讓聊天視窗維持縮小或在背景。檢查時視窗被切到前景會清掉該好友的未讀數，所以 `trigger_mode` 為 `all` 時，該好友的純文字訊息不會再觸發回覆（照片與貼圖走快取通道，不受影響）。
+- **內部整理**：左側訊息區塊切分抽成 `_left_message_blocks`，供文字或照片判斷與停止指令共用，判斷邏輯不變。
 
 ### [v2.4.2] - 2026-10-30
 #### 時段挑圖只採用明確標記的圖

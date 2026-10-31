@@ -26,19 +26,20 @@ import threading
 from io import BytesIO
 import re
 import contextlib
+import difflib
 
 import win32gui
 import win32con
 import win32process
 import win32clipboard
 import psutil
-from PIL import Image, ImageGrab
+from PIL import Image, ImageGrab, ImageOps
 import pyautogui
 
 from crawl_images import (crawl_grandma_images, clean_expired_images, retire_image,
                           download_and_validate_image, get_existing_md5s, build_candidate_urls)
 
-VERSION = "2.4.2"
+VERSION = "2.5.0"
 
 # 0. 全系統單一執行個體鎖 (Windows Named Mutex)，防止重複啟動繞過斷路器
 _app_mutex_handle = None
@@ -129,6 +130,9 @@ def atomic_save_json(file_path, data):
                 pass
         return False
 
+_WARNED_ONCE = set()            # 已印過的一次性警告
+STOP_COMMAND_MIN_LEN = 4        # stop_command 去除空白與標點後的最少字數，太短 (例如單字) 會讓一般對話誤停程式
+
 DEFAULT_CONFIG = {
     "targets": [],
     "images_dir": "images",
@@ -143,7 +147,9 @@ DEFAULT_CONFIG = {
     "min_image_pool": 10,
     "auto_crawl_images": True,
     "close_window_after_send": True,
-    "time_aware_images": True           # 依時段挑圖：早上不送晚安圖、晚上不送早安圖 (標記為 neutral 的無時段字樣圖不受限)
+    "time_aware_images": True,          # 依時段挑圖：早上不送晚安圖、晚上不送早安圖 (標記為 neutral 的無時段字樣圖不受限)
+    "stop_command": "結束長輩圖機器人",   # 遠端停止指令：stop_command_chats 內的好友傳來含此文字的訊息，程式立即結束
+    "stop_command_chats": []            # 可下達停止指令的好友名單 (預設空白 = 停用)
 }
 
 last_reply_times = {}
@@ -194,6 +200,15 @@ def load_config():
         for k in ("replace_after_send", "collect_incoming_images", "auto_crawl_images", "close_window_after_send", "time_aware_images"):
             if k in cfg and isinstance(cfg[k], bool):
                 sanitized[k] = cfg[k]
+        if isinstance(cfg.get("stop_command"), str) and cfg["stop_command"].strip():
+            if len(re.sub(r"[\W_]+", "", cfg["stop_command"])) >= STOP_COMMAND_MIN_LEN:
+                sanitized["stop_command"] = cfg["stop_command"].strip()
+            else:
+                if "stop_command_short" not in _WARNED_ONCE:
+                    _WARNED_ONCE.add("stop_command_short")   # 主迴圈每秒讀一次設定，只警告一次
+                    logging.warning(f"stop_command 太短 (少於 {STOP_COMMAND_MIN_LEN} 字)，容易誤停，改用預設值。")
+        if isinstance(cfg.get("stop_command_chats"), list):
+            sanitized["stop_command_chats"] = [str(t).strip() for t in cfg["stop_command_chats"] if str(t).strip()]
         if "images_dir" in cfg and isinstance(cfg["images_dir"], str):
             candidate_raw = cfg["images_dir"].strip()
             if candidate_raw and candidate_raw not in (".", ".."):
@@ -603,15 +618,26 @@ def filter_images_by_time_slot(candidates, slot, max_ocr=8):
             break
     return neutral
 
-def countdown_sleep(total_seconds):
-    """倒數等待：剩餘時間每跨過 60 秒的倍數、以及 30/10 秒時印出一次，讓長時間等待時看得到進度"""
+def countdown_sleep(total_seconds, abort_check=None, check_every=3.0):
+    """
+    倒數等待：剩餘時間每跨過 60 秒的倍數、以及 30/10 秒時印出一次，讓長時間等待時看得到進度。
+    abort_check：選用，每 check_every 秒呼叫一次 (用於等待期間仍能收到遠端停止指令)；
+    它擲出 StopRequested 時會直接中斷等待，其他例外只記錄不中斷。
+    """
     end = time.monotonic() + total_seconds
+    next_check = time.monotonic() + check_every
     marks = {m for m in set(range(60, int(total_seconds) + 1, 60)) | {30, 10} if m < total_seconds}
     announced = set()
     while True:
         remain = end - time.monotonic()
         if remain <= 0:
             break
+        if abort_check is not None and time.monotonic() >= next_check:
+            next_check = time.monotonic() + check_every
+            try:
+                abort_check()
+            except Exception as e:
+                log_v(f"[警告] 等待期間的停止指令檢查發生例外: {e}")
         due = [m for m in marks if remain <= m and m not in announced]
         if due:
             m = max(due)
@@ -1944,72 +1970,82 @@ MEDIA_NOISE_MAX_HEIGHT = 12     # 非氣泡區塊低於此高度視為細線、�
 MEDIA_STICKER_MIN_HEIGHT = 40   # 連結列上方的區塊至少要有此高度才算照片
 MEDIA_ACTION_GAP_MAX = 16       # 連結列與上方照片之間的最大間距
 
+def _left_message_blocks(chat_hwnd):
+    """
+    截取聊天室歷史區並找出左側 (對方) 訊息的內容區塊。回傳 (shot, scale, x_start, x_end, is_content, blocks)，
+    blocks 為由下往上最多兩個 (底, 頂) 區塊；暫時無法判斷 (視窗縮小/被遮住/太窄、左側無內容) 回傳 None。
+    取樣帶固定自 56px 起寬 160px (避開頭像)，連續約 6px 無內容即分開區塊；背景色取 10 個取樣點中位數。
+    """
+    if not win32gui.IsWindow(chat_hwnd) or win32gui.IsIconic(chat_hwnd) or not win32gui.IsWindowVisible(chat_hwnd):
+        return None
+    rect = get_window_true_rect(chat_hwnd)
+    w = rect[2] - rect[0]
+    h = rect[3] - rect[1]
+    if w < 300 or h < 200:
+        return None
+    scale = 1.0
+    try:
+        dpi = ctypes.windll.user32.GetDpiForWindow(chat_hwnd)
+        if dpi > 0:
+            scale = dpi / 96.0
+    except Exception:
+        pass
+    crop_y = rect[1] + int(h * 0.18)
+    crop_h = max(50, h - int(h * 0.18) - int(145 * scale))
+    shot = ImageGrab.grab(bbox=(rect[0], crop_y, rect[0] + w, crop_y + crop_h), all_screens=True)
+
+    pts = [shot.getpixel((int(w * fx), y)) for fx in (0.3, 0.4, 0.5, 0.6, 0.7) for y in (10, 30) if y < crop_h]
+    bg = tuple(sorted(c[i] for c in pts)[len(pts) // 2] for i in range(3))
+
+    def is_content(px):
+        return (abs(px[0] - bg[0]) + abs(px[1] - bg[1]) + abs(px[2] - bg[2])) > 30
+
+    x_start = int(56 * scale)
+    x_end = min(x_start + int(160 * scale), int(w * 0.5))
+
+    def row_has_content(y):
+        return any(is_content(shot.getpixel((x, y))) for x in range(x_start, x_end, 4))
+
+    # 由下往上分區塊 [(底, 頂)]，只需最底部兩個
+    blocks = []
+    cur_bottom = cur_top = None
+    gap = 0
+    for y in range(crop_h - 1, 0, -2):
+        if row_has_content(y):
+            if cur_bottom is None:
+                cur_bottom = y
+            cur_top, gap = y, 0
+        elif cur_bottom is not None:
+            gap += 2
+            if gap > 4:
+                blocks.append((cur_bottom, cur_top))
+                cur_bottom = cur_top = None
+                gap = 0
+                if len(blocks) >= 2:
+                    break
+    if cur_bottom is not None and len(blocks) < 2:
+        blocks.append((cur_bottom, cur_top))
+    if not blocks:
+        return None
+    return shot, scale, x_start, x_end, is_content, blocks
+
 def last_left_message_is_media(chat_hwnd):
     """
     判斷聊天室最底部「左側 (對方)」訊息是否為照片/貼圖。回傳 True (照片/貼圖)、False (文字)、
     None (暫時無法判斷：視窗縮小/被遮住/太窄、截圖失敗、左側無內容)。
-    由下往上把左側取樣帶 (固定自 56px 起寬 160px，避開頭像) 的內容列分成區塊 (連續約 6px 無內容即分開)，
-    只看最底部區塊 B。只有明確的文字氣泡才算文字，其餘一律視為照片或貼圖 (含透明背景被分段的貼圖片段與
-    照片下方的「儲存｜另存新檔｜分享」連結列)，避免貼圖被誤略過：
+    只看最底部區塊 B (區塊切分見 _left_message_blocks)。只有明確的文字氣泡才算文字，其餘一律視為照片或貼圖
+    (含透明背景被分段的貼圖片段與照片下方的「儲存｜另存新檔｜分享」連結列)，避免貼圖被誤略過：
     - B 為文字氣泡：LINE 接收氣泡為單一淺灰填色，占區塊內容 55% 以上，文字 (不論高度，長文字也算)。
     - B 非氣泡且高度 (邏輯像素，已除以 DPI 縮放) 達 MEDIA_NOISE_MAX_HEIGHT：照片或貼圖。
     - B 非氣泡且低於該高度：若緊貼 (間距 <= MEDIA_ACTION_GAP_MAX) 在上方非氣泡且達 MEDIA_STICKER_MIN_HEIGHT
       的區塊下方，是照片的連結列，視為照片；否則是細線或雜訊，文字。
     已知取捨：網址預覽卡片 (白底) 不是氣泡，對方只傳連結時會被當成照片而回覆。
-    背景色取 10 個取樣點中位數，避免取樣點剛好落在氣泡上。
     """
     try:
-        if not win32gui.IsWindow(chat_hwnd) or win32gui.IsIconic(chat_hwnd) or not win32gui.IsWindowVisible(chat_hwnd):
+        found = _left_message_blocks(chat_hwnd)
+        if found is None:
             return None
-        rect = get_window_true_rect(chat_hwnd)
-        w = rect[2] - rect[0]
-        h = rect[3] - rect[1]
-        if w < 300 or h < 200:
-            return None
-        scale = 1.0
-        try:
-            dpi = ctypes.windll.user32.GetDpiForWindow(chat_hwnd)
-            if dpi > 0:
-                scale = dpi / 96.0
-        except Exception:
-            pass
-        crop_y = rect[1] + int(h * 0.18)
-        crop_h = max(50, h - int(h * 0.18) - int(145 * scale))
-        shot = ImageGrab.grab(bbox=(rect[0], crop_y, rect[0] + w, crop_y + crop_h), all_screens=True)
-
-        pts = [shot.getpixel((int(w * fx), y)) for fx in (0.3, 0.4, 0.5, 0.6, 0.7) for y in (10, 30) if y < crop_h]
-        bg = tuple(sorted(c[i] for c in pts)[len(pts) // 2] for i in range(3))
-
-        def is_content(px):
-            return (abs(px[0] - bg[0]) + abs(px[1] - bg[1]) + abs(px[2] - bg[2])) > 30
-
-        x_start = int(56 * scale)
-        x_end = min(x_start + int(160 * scale), int(w * 0.5))
-
-        def row_has_content(y):
-            return any(is_content(shot.getpixel((x, y))) for x in range(x_start, x_end, 4))
-
-        # 由下往上分區塊 [(底, 頂)]，只需最底部兩個
-        blocks = []
-        cur_bottom = cur_top = None
-        gap = 0
-        for y in range(crop_h - 1, 0, -2):
-            if row_has_content(y):
-                if cur_bottom is None:
-                    cur_bottom = y
-                cur_top, gap = y, 0
-            elif cur_bottom is not None:
-                gap += 2
-                if gap > 4:
-                    blocks.append((cur_bottom, cur_top))
-                    cur_bottom = cur_top = None
-                    gap = 0
-                    if len(blocks) >= 2:
-                        break
-        if cur_bottom is not None and len(blocks) < 2:
-            blocks.append((cur_bottom, cur_top))
-        if not blocks:
-            return None
+        shot, scale, x_start, x_end, is_content, blocks = found
 
         def height(blk):
             return int((blk[0] - blk[1] + 1) / scale)
@@ -2044,6 +2080,159 @@ def last_left_message_is_media(chat_hwnd):
     except Exception as e:
         log_v(f"[警告] 訊息類型量測發生例外: {e}，視為無法判斷 (Fail-Closed)。")
         return None
+
+
+# 遠端停止指令 (stop_command_chats 內的好友傳來含 stop_command 的文字訊息時，程式立即結束)
+STOP_EXIT_CODE = 3              # 結束碼：run_auto_reply.bat 看到此值會直接關閉視窗
+STOP_FUZZY_RATIO = 0.85         # OCR 偶爾認錯一字，整句相似度達此值也視為指令
+STOP_OCR_MAX_WIDTH = 560        # OCR 截圖寬度上限 (邏輯像素)：LINE 文字氣泡寬度有上限，截太寬的空白區 OCR 會失敗
+STOP_OCR_UPSCALES = (2, 4)      # OCR 截圖放大倍數 (小字放大後辨識較準，各倍數結果不同，都試)
+STOP_READ_ATTEMPTS = 3          # 視窗在前景時，讀不到訊息最多再試幾次 (視窗切到前景後未讀數即清除，無法事後重來)
+_STOP_SEEN_UNREAD = {}          # {好友: 已檢查過的未讀數}
+
+class StopRequested(BaseException):
+    """收到遠端停止指令。繼承 BaseException，避免被監聽迴圈的 except Exception 吞掉"""
+
+def text_matches_stop_command(text, phrase):
+    """去除空白與標點後，訊息含指令全文，或整句與指令高度相似 (容許 OCR 認錯一字) 即成立"""
+    t = re.sub(r"[\W_]+", "", text or "")
+    p = re.sub(r"[\W_]+", "", phrase or "")
+    if not t or not p:
+        return False
+    if p in t:
+        return True
+    return len(t) <= len(p) + 2 and difflib.SequenceMatcher(None, t, p).ratio() >= STOP_FUZZY_RATIO
+
+def _stop_ocr_variants(crop):
+    """
+    產生同一張訊息截圖的幾種前處理版本。Windows OCR 對淺灰氣泡裡的小字很挑剔 (是否有白邊、放大倍數、
+    是否二值化都會讓某個字漏掉)，實測同一則六字訊息不同版本會漏掉不同的字，
+    所以多試幾種，任何一種讀到指令就算數。
+    """
+    gray = ImageOps.autocontrast(crop.convert("L"))
+    for up in STOP_OCR_UPSCALES:
+        padded = ImageOps.expand(gray, border=24, fill=255)
+        yield padded.resize((padded.width * up, padded.height * up), Image.LANCZOS)
+    binary = ImageOps.expand(gray.point(lambda v: 0 if v < 160 else 255), border=24, fill=255)
+    yield binary.resize((binary.width * 3, binary.height * 3), Image.LANCZOS)
+
+def last_left_message_has_text(chat_hwnd, phrase, count=1):
+    """
+    用 OCR 讀對方最底部的 count 個左側區塊 (一般只讀最後一則；對方連傳兩則以上時 count 為 2，
+    避免指令後面緊接「好」之類的訊息而漏掉)，任何一種前處理讀到 phrase 就回傳 True。
+    每個區塊都讀得到字、但都不含 phrase 回傳 False；截不到圖，或任何一個區塊讀不出字 (無法排除指令藏在
+    那一塊) 回傳 None (無法確認)。
+    """
+    found = _left_message_blocks(chat_hwnd)
+    if found is None:
+        return None
+    shot, scale, x_start, _, _, blocks = found
+    pad = int(4 * scale)
+    right = min(int(shot.width * 0.92), x_start + int(STOP_OCR_MAX_WIDTH * scale))
+    all_blocks_read = True
+    for bottom, top in blocks[:max(1, count)]:
+        read_block = False
+        crop = shot.crop((x_start, max(0, top - pad), right, min(shot.height, bottom + pad + 1)))
+        for variant in _stop_ocr_variants(crop):
+            fd, tmp_path = tempfile.mkstemp(suffix=".png")
+            os.close(fd)
+            try:
+                variant.save(tmp_path)
+                text = ocr_image_text(tmp_path)
+            except Exception:
+                continue
+            finally:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+            if text:
+                read_block = True
+                if text_matches_stop_command(text, phrase):
+                    return True
+        all_blocks_read = all_blocks_read and read_block
+    return False if all_blocks_read else None
+
+def _chat_has_stop_command(chat, phrase, config, count=1):
+    """
+    把好友視窗切到前景，確認對方最後一則是文字且含指令。回傳 True (是指令)、False (不是，
+    或試了 STOP_READ_ATTEMPTS 次仍無法確認，依 Fail-Closed 不停止)。檢查完依設定把視窗縮回去。
+    """
+    matched = find_target_chat_window(chat)
+    if not matched:
+        return False
+    hwnd = matched[0][0]
+    try:
+        activate_window(hwnd)
+        for _ in range(STOP_READ_ATTEMPTS):
+            time.sleep(0.8)
+            if win32gui.GetForegroundWindow() != hwnd or win32gui.GetWindowText(hwnd).strip().lower() != chat.lower():
+                continue
+            if is_last_message_from_self_in_chat(hwnd):
+                return False
+            if count <= 1:
+                # 只有一則新訊息：照片或貼圖不做 OCR；兩則以上時最後一則可能是照片，直接逐區塊 OCR
+                is_media = last_left_message_is_media(hwnd)
+                if is_media:
+                    return False
+                if is_media is None:
+                    continue
+            found = last_left_message_has_text(hwnd, phrase, count)
+            if found is None:
+                continue
+            return found
+        log_v(f"[停止指令待確認]「{chat}」最後一則訊息無法讀取，本次不停止。")
+        return False
+    finally:
+        _minimize_if_configured(hwnd, config)
+
+def _window_unread_count(windows, chat):
+    """從視窗標題讀好友目前的未讀數 (標題無括號數字為 0)；找不到該好友視窗回傳 None"""
+    for _, title, _, _ in windows:
+        m = re.search(r"^(.*?)\s*[\(\uFF08](\d+\+?)[\)\uFF09]\s*$", title)
+        if m and m.group(1).strip().lower() == chat.lower():
+            return parse_unread_count(m.group(2))
+        if title.strip().lower() == chat.lower():
+            return 0
+    return None
+
+def init_stop_baselines(config, chats=None):
+    """啟動 (或熱重載新增好友) 時記下停止指令好友目前的未讀數，避免先前傳來的舊指令在之後立刻停止程式"""
+    windows = get_all_line_windows()
+    for chat in (config.get("stop_command_chats") or []) if chats is None else chats:
+        unread = _window_unread_count(windows, chat)
+        if unread is not None:
+            _STOP_SEEN_UNREAD[chat] = unread
+
+def check_stop_command(config):
+    """
+    檢查 stop_command_chats 內好友是否傳來停止指令，是的話擲出 StopRequested。
+    只在該好友的視窗標題未讀數增加時才檢查 (視窗在背景或最小化時才有未讀數)，每個未讀數只檢查一次。
+    """
+    chats = config.get("stop_command_chats") or []
+    phrase = config.get("stop_command") or ""
+    if not chats or not phrase:
+        return
+    windows = get_all_line_windows()
+    for chat in chats:
+        try:
+            unread = _window_unread_count(windows, chat)
+            if unread is None:
+                _STOP_SEEN_UNREAD.pop(chat, None)   # 視窗被關閉：重開後未讀數重新計算
+                continue
+            seen = _STOP_SEEN_UNREAD.get(chat, 0)
+            if unread < seen or unread == 0:
+                _STOP_SEEN_UNREAD[chat] = unread
+                continue
+            if unread <= seen:
+                continue
+            _STOP_SEEN_UNREAD[chat] = unread
+            if _chat_has_stop_command(chat, phrase, config, count=min(2, unread - seen)):
+                raise StopRequested(f"收到「{chat}」傳來的停止指令")
+        except StopRequested:
+            raise
+        except Exception as e:
+            log_v(f"[警告] 檢查「{chat}」的停止指令時發生例外: {e}")
 
 
 def get_chat_history_image(chat_hwnd):
@@ -2198,7 +2387,7 @@ def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_f
     max_d = max(min_d, config.get("max_delay_seconds", 900))
     delay = random.randint(min_d, max_d)
     log_v(f" -> 為了模擬真人自然反應，本次隨機等待 {delay} 秒後發送...")
-    countdown_sleep(delay)
+    countdown_sleep(delay, abort_check=lambda: check_stop_command(config))
 
     # 等待期間時段可能已跨越 (例如 10:55 挑早安圖、11:10 才送出)：送出前重驗，不符則重新挑圖
     if config.get("time_aware_images", False):
@@ -2421,6 +2610,7 @@ def check_for_incoming_messages(config):
     cooldown = config.get("cooldown_seconds", 30)
     current_time = time.time()
     update_target_window_fingerprints(targets)
+    check_stop_command(config)
 
     # 全域防洗版保護：只要剛送出過任何圖片，在冷卻時間內絕不再次觸發！
     if current_time - last_global_reply_time < cooldown:
@@ -3165,7 +3355,12 @@ def main():
         if not check_circuit_breaker(target, max_replies=2, window_seconds=300):
             log_v(f"❌ [斷路器鎖定]「{target}」在 5 分鐘內已達發送上限，已啟動防禦退避鎖定，拒絕發送！")
             return
-        result = send_grandma_image(target, config)
+        init_stop_baselines(config)
+        try:
+            result = send_grandma_image(target, config)
+        except StopRequested as e:
+            log_v(f"\n[遠端停止] {e}，程式立即結束。")
+            sys.exit(STOP_EXIT_CODE)
         log_v(f"手動測試結果: {result}")
         return
 
@@ -3184,6 +3379,8 @@ def main():
     print(f"舊圖保存期限 (TTL)       : {config.get('image_ttl_days', 7)} 天")
     print(f"防洗版冷卻 (cooldown)    : {config.get('cooldown_seconds', 30)} 秒")
     print(f"回覆後安全最小化         : {config.get('close_window_after_send', True)}")
+    stop_chats = config.get("stop_command_chats", [])
+    print(f"遠端停止指令             : {'「' + config.get('stop_command', '') + '」，限 ' + '、'.join(stop_chats) if stop_chats else '未啟用'}")
     print("-" * 65)
     print("說明：")
     print("1. 對方傳長輩圖來時，程式會隨機等待數秒，並挑選一張不同的長輩圖回傳。")
@@ -3195,12 +3392,14 @@ def main():
     # 建立目前快取基準線，確保啟動後只監聽「新傳入」的圖片，絕不觸發舊圖或剛才發送的圖
     advance_cache_mtime_to_current()
     init_unread_baselines()
+    init_stop_baselines(config)
     init_target_window_fingerprints(config.get("targets", []))
     log_v("快取監聽基準線已就緒，正靜態待命中...")
     print("-" * 65)
 
     last_cleanup_time = 0
     current_targets = list(config.get("targets", []))
+    current_stop_chats = list(config.get("stop_command_chats", []))
 
     try:
         while True:
@@ -3217,6 +3416,13 @@ def main():
                         init_unread_baselines(added_targets)
                         init_target_window_fingerprints(added_targets)
                     current_targets = list(new_targets)
+
+                new_stop_chats = config.get("stop_command_chats", [])
+                if new_stop_chats != current_stop_chats:
+                    added_stop = [c for c in new_stop_chats if c not in current_stop_chats]
+                    if added_stop:
+                        init_stop_baselines(config, added_stop)
+                    current_stop_chats = list(new_stop_chats)
 
                 # 每 1 小時檢查一次過期長輩圖
                 if time.time() - last_cleanup_time > 3600:
@@ -3236,6 +3442,9 @@ def main():
             time.sleep(1)
     except KeyboardInterrupt:
         log_v("\n程式已停止。")
+    except StopRequested as e:
+        log_v(f"\n[遠端停止] {e}，程式立即結束。")
+        sys.exit(STOP_EXIT_CODE)
 
 if __name__ == "__main__":
     main()

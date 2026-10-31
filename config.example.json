@@ -15,5 +15,7 @@
   "min_image_pool": 10,
   "auto_crawl_images": true,
   "close_window_after_send": true,
-  "time_aware_images": true
+  "time_aware_images": true,
+  "stop_command": "結束長輩圖機器人",
+  "stop_command_chats": []
 }
