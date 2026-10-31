@@ -527,11 +527,19 @@ GRANDMA_KEYWORDS = (
 )
 _GRANDMA_ID_CACHE = {}          # {圖片 MD5: 是否為長輩圖}，同一張圖在同一次執行只辨識一次 (回覆前辨識、收納時再問一次會直接用快取)
 
+def _grandma_keywords_in_variants(image_path):
+    """多種前處理的 OCR 任一種讀到長輩圖關鍵字就回傳 True (找到就停，不再跑後面的前處理)"""
+    for text in ocr_image_text_variants(image_path):
+        if any(kw in text for kw in GRANDMA_KEYWORDS):
+            return True
+    return False
+
 def is_authentic_grandma_image(image_path):
     """
-    判斷圖片是不是真正的長輩圖：邊長至少 GRANDMA_MIN_SIDE，且 Windows OCR (多種前處理，任何一種讀到即可)
+    判斷圖片檔是不是真正的長輩圖：邊長至少 GRANDMA_MIN_SIDE，且 Windows OCR (多種前處理，任何一種讀到即可)
     讀得到早安、平安、祝福、喜樂等關鍵字。寵物照、生活照、自拍、截圖、LINE 貼圖都回傳 False。
     OCR 讀不出字也回傳 False (Fail-Closed：不回覆、不收納)。
+    注意：LINE 的快取檔 (.eimg) 是加密的，Pillow 打不開，這裡一律回傳 False；識別對方傳來的圖請用 identify_incoming_image。
     """
     try:
         md5 = get_file_md5(image_path)
@@ -539,17 +547,92 @@ def is_authentic_grandma_image(image_path):
             return _GRANDMA_ID_CACHE[md5]
         with Image.open(image_path) as img:
             width, height = img.size
-        result = False
-        if min(width, height) >= GRANDMA_MIN_SIDE:
-            for text in ocr_image_text_variants(image_path):
-                if any(kw in text for kw in GRANDMA_KEYWORDS):
-                    result = True
-                    break
+        result = min(width, height) >= GRANDMA_MIN_SIDE and _grandma_keywords_in_variants(image_path)
         if md5:
             _GRANDMA_ID_CACHE[md5] = result
         return result
     except Exception:
         return False
+
+GRANDMA_SCREEN_MIN_WIDTH = 200  # 聊天室截圖裡，圖片內容寬度 (邏輯像素) 低於此值視為貼圖 (LINE 貼圖約 120~180px，照片縮圖 250px 以上)
+GRANDMA_MEDIA_CROP_WIDTH = 420  # 截圖時從左側取樣帶起算的最大寬度 (邏輯像素)，涵蓋圖片縮圖又不會取到太多空白
+
+def _can_decode_image(path):
+    """Pillow 打不打得開這個檔案 (LINE 快取的 .eimg 是加密的，打不開)"""
+    try:
+        with Image.open(path):
+            return True
+    except Exception:
+        return False
+
+def _incoming_media_crop(chat_hwnd):
+    """
+    截取聊天室最底部左側 (對方) 圖片訊息的縮圖區域，回傳 (截圖, 圖片內容寬度 (邏輯像素))；
+    視窗縮小、被遮住、太窄或找不到夠高的區塊回傳 None。最底部若是「儲存｜另存新檔｜分享」連結列 (很矮)，
+    圖片在它上方的區塊，所以在最底部兩個區塊裡挑第一個夠高的。
+    """
+    found = _left_message_blocks(chat_hwnd, side="left")
+    if found is None:
+        return None
+    shot, scale, x_start, x_end, is_content, blocks = found
+    media = next((b for b in blocks[:2] if int((b[0] - b[1] + 1) / scale) >= MEDIA_STICKER_MIN_HEIGHT), None)
+    if media is None:
+        return None
+    bottom, top = media
+    right = min(shot.width, x_start + int(GRANDMA_MEDIA_CROP_WIDTH * scale))
+    xs = [x for x in range(x_start, right, 2) for y in range(top, bottom + 1, 8) if is_content(shot.getpixel((x, y)))]
+    if not xs:
+        return None
+    pad = int(4 * scale)
+    box = (max(0, min(xs) - pad), max(0, top - pad), min(shot.width, max(xs) + pad + 1), min(shot.height, bottom + pad + 1))
+    return shot.crop(box), int((max(xs) - min(xs) + 1) / scale)
+
+def _grandma_in_chat_screenshot(chat_hwnd):
+    """用聊天室截圖識別最底部左側的圖：True (長輩圖)、False (貼圖或不是長輩圖)、None (暫時無法判斷)"""
+    found = _incoming_media_crop(chat_hwnd)
+    if found is None:
+        return None
+    crop, content_width = found
+    if content_width < GRANDMA_SCREEN_MIN_WIDTH:
+        return False
+    fd, tmp = tempfile.mkstemp(suffix=".png")
+    os.close(fd)
+    try:
+        crop.save(tmp)
+        return _grandma_keywords_in_variants(tmp)
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+def identify_incoming_image(triggered_file, chat_hwnd=None):
+    """
+    識別對方傳來的圖是不是長輩圖：True / False / None (None = 現在無法判斷，要等視窗在前景再問一次)。
+    - 沒有觸發檔 (例如只傳文字)：False。
+    - 快取檔是一般圖片：直接 OCR 檔案。
+    - 快取檔是加密的 .eimg (LINE 電腦版的實際情況)：改截聊天視窗裡那張圖的縮圖來 OCR。
+      只在視窗已是前景時才截圖 (視窗被別的視窗蓋住時截到的是別人的畫面)，否則回傳 None 延後判斷。
+    """
+    if not triggered_file:
+        return False
+    if _can_decode_image(triggered_file):
+        return is_authentic_grandma_image(triggered_file)
+    try:
+        if (chat_hwnd is not None and win32gui.IsWindow(chat_hwnd) and not win32gui.IsIconic(chat_hwnd)
+                and win32gui.IsWindowVisible(chat_hwnd) and win32gui.GetForegroundWindow() == chat_hwnd):
+            return _grandma_in_chat_screenshot(chat_hwnd)
+    except Exception:
+        pass
+    return None
+
+def _skip_not_grandma(target_name, triggered_file, config):
+    """略過不是長輩圖的來訊：記下對方傳過這張 (百輪內不回送給本人)，回傳結果代碼"""
+    log_v(f"[非長輩圖略過]「{target_name}」傳來的不是長輩圖 (或無法辨識)，不回覆。")
+    md5 = get_file_md5(triggered_file) if triggered_file else None
+    if md5:
+        record_contact_received(target_name, md5, max_rounds=config.get("history_rounds", 100))
+    return "SKIPPED_NOT_GRANDMA"
 
 def harvest_line_incoming_images(images_dir, sender_name=None, max_rounds=100, specific_file_path=None):
     """
@@ -2213,6 +2296,20 @@ def _left_message_blocks(chat_hwnd, side="left"):
         return None
     return shot, scale, x_start, x_end, is_content, blocks
 
+MEDIA_CHECK_ATTEMPTS = 3        # 剛把視窗還原並帶到前景時，LINE 可能還沒重繪完，判斷不出來就稍等再試
+MEDIA_CHECK_RETRY_WAIT = 0.8    # 每次重試前等待的秒數
+
+def _media_type_with_retry(chat_hwnd):
+    """last_left_message_is_media 加上重試：回傳 True (照片或貼圖)、False (文字)、None (試完仍無法判斷)"""
+    result = None
+    for attempt in range(MEDIA_CHECK_ATTEMPTS):
+        result = last_left_message_is_media(chat_hwnd)
+        if result is not None:
+            return result
+        if attempt < MEDIA_CHECK_ATTEMPTS - 1:
+            time.sleep(MEDIA_CHECK_RETRY_WAIT)
+    return result
+
 def last_left_message_is_media(chat_hwnd):
     """
     判斷聊天室最底部「左側 (對方)」訊息是否為照片/貼圖。回傳 True (照片/貼圖)、False (文字)、
@@ -2612,13 +2709,15 @@ def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_f
     """執行長輩圖發送"""
     global last_global_reply_time
     # 識別關卡 (Fail-Closed)：對方傳來的必須是長輩圖才回。貼圖、生活照、無法辨識的、沒有圖可驗證的 (例如只傳文字) 一律不理會
+    deferred_identify = False
     if config.get("require_grandma_image", True):
-        if not triggered_file or not is_authentic_grandma_image(triggered_file):
-            log_v(f"[非長輩圖略過]「{target_name}」傳來的不是長輩圖 (或無法辨識)，不回覆。")
-            md5 = get_file_md5(triggered_file) if triggered_file else None
-            if md5:
-                record_contact_received(target_name, md5, max_rounds=config.get("history_rounds", 100))
-            return "SKIPPED_NOT_GRANDMA"
+        early = find_target_chat_window(target_name)
+        verdict = identify_incoming_image(triggered_file, early[0][0] if early else None)
+        if verdict is False:
+            return _skip_not_grandma(target_name, triggered_file, config)
+        if verdict:
+            log_v(f" -> [長輩圖識別]「{target_name}」傳來的圖通過長輩圖識別。")
+        deferred_identify = verdict is None     # 加密快取且視窗不在前景：等實際要回覆、視窗已帶到前景時再用截圖判斷
     # 借花獻佛：僅精確收納本次觸發該回覆的圖片，絕不掃描其他聊天室快取
     if config.get("collect_incoming_images", True) and triggered_file:
         max_rounds = config.get("history_rounds", 100)
@@ -2704,9 +2803,9 @@ def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_f
 
     # 訊息類型核驗 (Fail-Closed)：對方最後一則若只是文字氣泡，不需回應 (trigger_mode="all" 時文字也要回，不套用)
     if config.get("trigger_mode", "photo_and_sticker") != "all":
-        is_media = last_left_message_is_media(chat_hwnd)
+        is_media = _media_type_with_retry(chat_hwnd)
         if is_media is None:
-            # 暫時無法判斷 (截圖失敗、視窗被遮住等)：不丟棄，走既有重試流程
+            # 重試後仍無法判斷 (截圖失敗、視窗被遮住等)：不丟棄，走既有重試流程
             log_v(f"[訊息類型待確認]「{target_name}」暫時無法判斷最後一則訊息類型，本次不發送，稍後重試。")
             _minimize_if_configured(chat_hwnd, config)
             return "NOT_SENT"
@@ -2714,6 +2813,18 @@ def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_f
             log_v(f"[文字訊息略過]「{target_name}」最後一則訊息為文字，不需回應。")
             _minimize_if_configured(chat_hwnd, config)
             return "SKIPPED_TEXT"
+
+    # 延後的長輩圖識別：視窗此時已在前景，用截圖判斷對方那張圖是不是長輩圖 (Fail-Closed)
+    if deferred_identify:
+        verdict = identify_incoming_image(triggered_file, chat_hwnd)
+        if verdict is None:
+            log_v(f"[長輩圖識別待確認]「{target_name}」暫時無法識別對方傳來的圖，本次不發送，稍後重試。")
+            _minimize_if_configured(chat_hwnd, config)
+            return "NOT_SENT"
+        if not verdict:
+            _minimize_if_configured(chat_hwnd, config)
+            return _skip_not_grandma(target_name, triggered_file, config)
+        log_v(f" -> [長輩圖識別]「{target_name}」傳來的圖通過長輩圖識別 (視窗截圖)。")
 
     # 發送前先對快取進行檔案集合快照 (包含 mtime 與大小)
     active_cache = get_active_line_cache_dir()

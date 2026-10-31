@@ -3117,7 +3117,7 @@ class TestLineGrandmaBotCore(unittest.TestCase):
             return path
 
         orig = (auto_reply.download_and_validate_image, auto_reply.get_existing_md5s,
-                auto_reply.build_candidate_urls, auto_reply.image_category)
+                auto_reply.build_candidates, auto_reply.image_category)
         order = {"i": 0}
 
         def fake_category(path):
@@ -3127,13 +3127,13 @@ class TestLineGrandmaBotCore(unittest.TestCase):
 
         auto_reply.download_and_validate_image = fake_download
         auto_reply.get_existing_md5s = lambda _d: set()
-        auto_reply.build_candidate_urls = lambda: ["u"] * 200
+        auto_reply.build_candidates = lambda sources=None: [("u", None)] * 200
         auto_reply.image_category = fake_category
         try:
             counts = auto_reply.fill_image_pool(d, total=30, max_attempts=200)
         finally:
             (auto_reply.download_and_validate_image, auto_reply.get_existing_md5s,
-             auto_reply.build_candidate_urls, auto_reply.image_category) = orig
+             auto_reply.build_candidates, auto_reply.image_category) = orig
         # 無既有 neutral 圖：30 張平均分配給早安、午安、晚安，neutral 不自動新增
         self.assertEqual(counts, {"morning": 10, "noon": 10, "evening": 10, "neutral": 0})
         self.assertEqual(len(os.listdir(d)), 30)
@@ -3151,16 +3151,16 @@ class TestLineGrandmaBotCore(unittest.TestCase):
             return path
 
         orig = (auto_reply.download_and_validate_image, auto_reply.get_existing_md5s,
-                auto_reply.build_candidate_urls, auto_reply.image_category)
+                auto_reply.build_candidates, auto_reply.image_category)
         auto_reply.download_and_validate_image = fake_download
         auto_reply.get_existing_md5s = lambda _d: set()
-        auto_reply.build_candidate_urls = lambda: ["u"] * 200
+        auto_reply.build_candidates = lambda sources=None: [("u", None)] * 200
         auto_reply.image_category = lambda p: "neutral"   # 來源只有已標記的 neutral 圖
         try:
             counts = auto_reply.fill_image_pool(d, total=30, max_attempts=200)
         finally:
             (auto_reply.download_and_validate_image, auto_reply.get_existing_md5s,
-             auto_reply.build_candidate_urls, auto_reply.image_category) = orig
+             auto_reply.build_candidates, auto_reply.image_category) = orig
         # 來源只有 neutral 圖：neutral 不計入自動配額，全部丟棄；不會用無法確認的圖補足總數
         self.assertEqual(counts["neutral"], 0)
         self.assertEqual(len(os.listdir(d)), 0)
@@ -3221,7 +3221,309 @@ class TestLineGrandmaBotCore(unittest.TestCase):
         self.assertIs(judge([((80, 300, 200, 440), (250, 200, 0)), ((80, 452, 200, 460), (250, 120, 120))]), True)
         self.assertIsNone(judge([]))                    # 左側無內容：無法判斷 (None，呼叫端走重試)
 
-    def test_skipped_text_does_not_start_cooldown_and_marks_processed(self):
+    # ---------- 識別長輩圖才回覆 ----------
+    def _make_image(self, name, size=(400, 400), color=(200, 30, 30)):
+        from PIL import Image
+        path = os.path.join(self.temp_dir.name, name)
+        Image.new("RGB", size, color).save(path)
+        return path
+
+    def _variant_sizes(self, size):
+        """跑一次多種前處理 OCR，回傳 (各次 OCR 看到的圖片尺寸, 文字清單, 暫存檔路徑清單)"""
+        from PIL import Image
+        path = self._make_image("variant_src.png", size)
+        seen = []
+
+        def fake_ocr(p):
+            with Image.open(p) as im:
+                seen.append((p, im.size))
+            return f"t{len(seen)}"
+
+        with mock.patch.object(auto_reply, "ocr_image_text", side_effect=fake_ocr):
+            texts = list(auto_reply.ocr_image_text_variants(path))
+        return seen, texts, path
+
+    def test_ocr_variants_yield_original_then_three_preprocessed_and_clean_up(self):
+        seen, texts, path = self._variant_sizes((3000, 2000))
+        self.assertEqual(texts, ["t1", "t2", "t3", "t4"])
+        self.assertEqual(seen[0][0], path)                                      # 第一個是原圖
+        self.assertEqual([s[1] for s in seen[1:]], [(1600, 1066)] * 3)          # 太大的圖縮到最長邊 1600
+        self.assertTrue(all(not os.path.exists(s[0]) for s in seen[1:]))        # 暫存檔都已刪除
+
+    def test_ocr_variants_upscale_small_images_and_keep_medium_ones(self):
+        seen, _, _ = self._variant_sizes((300, 200))
+        self.assertEqual([s[1] for s in seen[1:]], [(600, 400)] * 3)            # 最長邊 < 700 放大 2 倍
+        seen, _, _ = self._variant_sizes((800, 600))
+        self.assertEqual([s[1] for s in seen[1:]], [(800, 600)] * 3)            # 中等大小不縮放
+
+    def test_ocr_variants_ocr_errors_become_empty_text_and_early_stop_cleans_up(self):
+        path = self._make_image("variant_err.png", (800, 600))
+        seen = []
+
+        def fake_ocr(p):
+            seen.append(p)
+            if len(seen) == 2:
+                raise RuntimeError("boom")
+            return "x"
+
+        with mock.patch.object(auto_reply, "ocr_image_text", side_effect=fake_ocr):
+            gen = auto_reply.ocr_image_text_variants(path)
+            self.assertEqual(next(gen), "x")
+            self.assertEqual(next(gen), "")                                      # 辨識失敗變空字串，不擲出
+            gen.close()                                                          # 呼叫端提早停止
+        self.assertEqual(len(seen), 2)                                           # 沒有繼續跑後面的前處理
+        self.assertFalse(os.path.exists(seen[1]))                                # 提早停止也清掉暫存檔
+
+    def test_ocr_variants_unreadable_image_only_yields_original_ocr(self):
+        path = os.path.join(self.temp_dir.name, "not_an_image.bin")
+        with open(path, "wb") as f:
+            f.write(b"definitely not an image")
+        with mock.patch.object(auto_reply, "ocr_image_text", return_value="原圖") as ocr:
+            self.assertEqual(list(auto_reply.ocr_image_text_variants(path)), ["原圖"])
+            self.assertEqual(ocr.call_count, 1)
+
+    def test_is_authentic_grandma_image_keyword_in_any_variant_and_cache(self):
+        auto_reply._GRANDMA_ID_CACHE.clear()
+        img = self._make_image("g_big.png", (400, 400), (10, 20, 30))
+        with mock.patch.object(auto_reply, "ocr_image_text", side_effect=["", "", "平安喜樂", "不該被呼叫"]) as ocr:
+            self.assertTrue(auto_reply.is_authentic_grandma_image(img))          # 第三種前處理才讀到關鍵字
+            self.assertEqual(ocr.call_count, 3)                                  # 找到就不再跑第四種
+        with mock.patch.object(auto_reply, "ocr_image_text") as ocr:
+            self.assertTrue(auto_reply.is_authentic_grandma_image(img))          # 同一張圖用快取，不再 OCR
+            ocr.assert_not_called()
+
+    def test_is_authentic_grandma_image_rejects_without_keyword_or_when_unreadable(self):
+        auto_reply._GRANDMA_ID_CACHE.clear()
+        photo = self._make_image("g_photo.png", (400, 400), (90, 90, 90))
+        with mock.patch.object(auto_reply, "ocr_image_text", return_value="今天去爬山拍照") as ocr:
+            self.assertFalse(auto_reply.is_authentic_grandma_image(photo))       # 讀得到字但不是長輩圖用語
+            self.assertEqual(ocr.call_count, 4)                                  # 四種前處理都試過
+        blank = self._make_image("g_blank.png", (400, 400), (120, 10, 10))
+        with mock.patch.object(auto_reply, "ocr_image_text", side_effect=RuntimeError("ocr down")) as ocr:
+            self.assertFalse(auto_reply.is_authentic_grandma_image(blank))       # OCR 全失敗：Fail-Closed
+            self.assertEqual(ocr.call_count, 4)
+        with mock.patch.object(auto_reply, "ocr_image_text") as ocr:
+            self.assertFalse(auto_reply.is_authentic_grandma_image(photo))       # 否定結果同樣快取
+            ocr.assert_not_called()
+
+    def test_is_authentic_grandma_image_rejects_small_images_and_non_images(self):
+        auto_reply._GRANDMA_ID_CACHE.clear()
+        sticker = self._make_image("g_sticker.png", (200, 300), (1, 1, 1))       # 短邊 < 250：LINE 貼圖或縮圖
+        edge = self._make_image("g_edge.png", (250, 400), (2, 2, 2))             # 剛好 250：算數
+        junk = os.path.join(self.temp_dir.name, "g_junk.bin")
+        with open(junk, "wb") as f:
+            f.write(b"junk")
+        with mock.patch.object(auto_reply, "ocr_image_text", return_value="早安") as ocr:
+            self.assertFalse(auto_reply.is_authentic_grandma_image(sticker))
+            ocr.assert_not_called()                                              # 太小不浪費 OCR
+            self.assertTrue(auto_reply.is_authentic_grandma_image(edge))
+            self.assertFalse(auto_reply.is_authentic_grandma_image(junk))
+            self.assertFalse(auto_reply.is_authentic_grandma_image(os.path.join(self.temp_dir.name, "missing.png")))
+
+    def _run_send_gate(self, cfg_extra=None, *, triggered=True, authentic=False):
+        img = self._make_image("trigger.png", (400, 400), (1, 2, 3)) if triggered else None
+        cfg = {"images_dir": "images", "collect_incoming_images": True}
+        cfg.update(cfg_extra or {})
+        with mock.patch.object(auto_reply, "is_authentic_grandma_image", return_value=authentic) as auth, \
+             mock.patch.object(auto_reply, "harvest_line_incoming_images") as harvest, \
+             mock.patch.object(auto_reply, "get_images", return_value=[]) as get_imgs, \
+             mock.patch.object(auto_reply, "record_contact_received") as rec, \
+             mock.patch.object(auto_reply, "log_v"):
+            result = auto_reply.send_grandma_image("小明", cfg, triggered_file=img)
+        return result, auth, harvest, get_imgs, rec, img
+
+    def test_send_gate_skips_incoming_that_is_not_grandma_image(self):
+        result, auth, harvest, get_imgs, rec, img = self._run_send_gate({"history_rounds": 50})   # 預設就要求識別
+        self.assertEqual(result, "SKIPPED_NOT_GRANDMA")
+        auth.assert_called_once_with(img)
+        harvest.assert_not_called()                                              # 不收納
+        get_imgs.assert_not_called()                                             # 不挑圖、不回覆
+        rec.assert_called_once_with("小明", auto_reply.get_file_md5(img), max_rounds=50)   # 但記下對方傳過這張
+
+    def test_send_gate_skips_when_there_is_no_image_to_verify(self):
+        result, auth, harvest, get_imgs, rec, _ = self._run_send_gate(triggered=False)   # 例如只傳文字
+        self.assertEqual(result, "SKIPPED_NOT_GRANDMA")
+        auth.assert_not_called()
+        get_imgs.assert_not_called()
+        rec.assert_not_called()
+
+    def test_send_gate_lets_authentic_image_through_and_can_be_turned_off(self):
+        result, auth, harvest, get_imgs, rec, img = self._run_send_gate(authentic=True)
+        self.assertEqual(result, "NOT_SENT")                                     # 通過關卡，之後因為圖庫是空的才沒送
+        auth.assert_called_once_with(img)
+        harvest.assert_called_once()
+        get_imgs.assert_called_once()
+        result, auth, harvest, get_imgs, rec, _ = self._run_send_gate({"require_grandma_image": False})
+        self.assertEqual(result, "NOT_SENT")                                     # 關閉識別：不辨識也往下走 (舊行為)
+        auth.assert_not_called()
+        get_imgs.assert_called_once()
+        result, *_ = self._run_send_gate({"require_grandma_image": False}, triggered=False)
+        self.assertEqual(result, "NOT_SENT")
+
+    # ---------- 加密快取 (.eimg) 改用聊天視窗截圖識別 ----------
+    def test_can_decode_image(self):
+        self.assertTrue(auto_reply._can_decode_image(self._make_image("dec_ok.png")))
+        junk = os.path.join(self.temp_dir.name, "dec_junk.eimg")
+        with open(junk, "wb") as f:
+            f.write(b"\x00\x01encrypted")
+        self.assertFalse(auto_reply._can_decode_image(junk))                    # LINE 的 .eimg 是加密的
+        self.assertFalse(auto_reply._can_decode_image(os.path.join(self.temp_dir.name, "dec_missing.png")))
+
+    def _chat_shot(self, bubble=(84, 50, 450, 300)):
+        """合成一張聊天室截圖：白底，左側有一張圖 (藍色方塊)。回傳 (截圖, is_content)"""
+        from PIL import Image, ImageDraw
+        shot = Image.new("RGB", (600, 400), (255, 255, 255))
+        ImageDraw.Draw(shot).rectangle(list(bubble), fill=(20, 60, 160))
+        is_content = lambda px: sum(abs(px[i] - 255) for i in range(3)) > 30
+        return shot, is_content
+
+    def test_incoming_media_crop_crops_the_image_and_measures_its_width(self):
+        shot, is_content = self._chat_shot()
+        with mock.patch.object(auto_reply, "_left_message_blocks", return_value=(shot, 1.5, 84, 324, is_content, [(300, 50)])):
+            crop, width = auto_reply._incoming_media_crop(1)
+        self.assertEqual(crop.size, (379, 263))                                  # 圖片四周各加 6px
+        self.assertEqual(width, 244)                                             # (450 - 84 + 1) / 1.5 邏輯像素
+
+    def test_incoming_media_crop_skips_the_thin_action_bar_below_the_image(self):
+        shot, is_content = self._chat_shot()
+        # 最底部是矮的「儲存｜另存新檔｜分享」連結列 (高 8px)，圖片在它上方
+        with mock.patch.object(auto_reply, "_left_message_blocks", return_value=(shot, 1.5, 84, 324, is_content, [(330, 322), (300, 50)])):
+            crop, width = auto_reply._incoming_media_crop(1)
+        self.assertEqual(crop.size, (379, 263))                                  # 仍然是圖片那一塊，不是連結列
+
+    def test_incoming_media_crop_none_cases(self):
+        shot, is_content = self._chat_shot()
+        with mock.patch.object(auto_reply, "_left_message_blocks", return_value=None):
+            self.assertIsNone(auto_reply._incoming_media_crop(1))                # 視窗縮小、被遮住
+        with mock.patch.object(auto_reply, "_left_message_blocks", return_value=(shot, 1.5, 84, 324, is_content, [(330, 322)])):
+            self.assertIsNone(auto_reply._incoming_media_crop(1))                # 沒有夠高的區塊 (只有連結列)
+        blank, is_content = self._chat_shot(bubble=(0, 0, 1, 1))                 # 該區塊內其實沒有內容
+        with mock.patch.object(auto_reply, "_left_message_blocks", return_value=(blank, 1.5, 84, 324, is_content, [(300, 50)])):
+            self.assertIsNone(auto_reply._incoming_media_crop(1))
+
+    def test_grandma_in_chat_screenshot_cases(self):
+        from PIL import Image
+        crop = Image.new("RGB", (300, 200), (255, 255, 255))
+        seen = []
+
+        def fake_ocr(path):
+            seen.append(path)
+            self.assertTrue(os.path.exists(path))
+            return "今天去爬山拍照"
+
+        with mock.patch.object(auto_reply, "_incoming_media_crop", return_value=(crop, 300)), \
+             mock.patch.object(auto_reply, "ocr_image_text", side_effect=["", "", "早安", "x"]) as ocr:
+            self.assertIs(auto_reply._grandma_in_chat_screenshot(1), True)       # 任一種前處理讀到關鍵字
+            self.assertEqual(ocr.call_count, 3)
+        with mock.patch.object(auto_reply, "_incoming_media_crop", return_value=(crop, 300)), \
+             mock.patch.object(auto_reply, "ocr_image_text", side_effect=fake_ocr):
+            self.assertIs(auto_reply._grandma_in_chat_screenshot(1), False)      # 讀得到字但不是長輩圖
+        self.assertFalse(any(os.path.exists(p) for p in seen))                   # 暫存截圖已刪
+        with mock.patch.object(auto_reply, "_incoming_media_crop", return_value=(crop, 150)), \
+             mock.patch.object(auto_reply, "ocr_image_text", return_value="早安") as ocr:
+            self.assertIs(auto_reply._grandma_in_chat_screenshot(1), False)      # 內容太窄：LINE 貼圖，連 OCR 都不做
+            ocr.assert_not_called()
+        with mock.patch.object(auto_reply, "_incoming_media_crop", return_value=None):
+            self.assertIsNone(auto_reply._grandma_in_chat_screenshot(1))         # 暫時截不到
+
+    def _identify(self, *, path, hwnd=77, iconic=False, visible=True, fg=77, shot_result=True, win_error=False):
+        with mock.patch.object(auto_reply.win32gui, "IsWindow", side_effect=RuntimeError("bad") if win_error else None, return_value=True), \
+             mock.patch.object(auto_reply.win32gui, "IsIconic", return_value=iconic), \
+             mock.patch.object(auto_reply.win32gui, "IsWindowVisible", return_value=visible), \
+             mock.patch.object(auto_reply.win32gui, "GetForegroundWindow", return_value=fg), \
+             mock.patch.object(auto_reply, "is_authentic_grandma_image", return_value="FILE") as by_file, \
+             mock.patch.object(auto_reply, "_grandma_in_chat_screenshot", return_value=shot_result) as by_shot:
+            result = auto_reply.identify_incoming_image(path, hwnd)
+        return result, by_file.call_count, by_shot.call_count
+
+    def test_identify_incoming_image_routes_by_file_type_and_window_state(self):
+        plain = self._make_image("id_plain.png")
+        encrypted = os.path.join(self.temp_dir.name, "id_enc.eimg")
+        with open(encrypted, "wb") as f:
+            f.write(b"\x00encrypted")
+        self.assertEqual(self._identify(path=None), (False, 0, 0))               # 沒有觸發檔 (只傳文字)
+        self.assertEqual(self._identify(path=plain), ("FILE", 1, 0))              # 一般圖檔：直接 OCR 檔案
+        self.assertEqual(self._identify(path=encrypted), (True, 0, 1))            # 加密快取且視窗在前景：截圖識別
+        self.assertEqual(self._identify(path=encrypted, shot_result=False), (False, 0, 1))
+        self.assertEqual(self._identify(path=encrypted, shot_result=None), (None, 0, 1))
+        # 視窗不在前景、縮小、不可見、沒有視窗、讀視窗狀態出錯：截圖不可靠，延後判斷 (None)，且不截圖
+        self.assertEqual(self._identify(path=encrypted, fg=5), (None, 0, 0))
+        self.assertEqual(self._identify(path=encrypted, iconic=True), (None, 0, 0))
+        self.assertEqual(self._identify(path=encrypted, visible=False), (None, 0, 0))
+        self.assertEqual(self._identify(path=encrypted, hwnd=None), (None, 0, 0))
+        self.assertEqual(self._identify(path=encrypted, win_error=True), (None, 0, 0))
+
+    def test_skip_not_grandma_records_received_image(self):
+        img = self._make_image("skip_rec.png", color=(7, 8, 9))
+        with mock.patch.object(auto_reply, "record_contact_received") as rec, mock.patch.object(auto_reply, "log_v"):
+            self.assertEqual(auto_reply._skip_not_grandma("小明", img, {"history_rounds": 30}), "SKIPPED_NOT_GRANDMA")
+            rec.assert_called_once_with("小明", auto_reply.get_file_md5(img), max_rounds=30)
+            rec.reset_mock()
+            self.assertEqual(auto_reply._skip_not_grandma("小明", None, {}), "SKIPPED_NOT_GRANDMA")
+            rec.assert_not_called()
+
+    def test_media_type_with_retry(self):
+        with mock.patch.object(auto_reply.time, "sleep") as sleep:
+            with mock.patch.object(auto_reply, "last_left_message_is_media", side_effect=[None, None, True]) as m:
+                self.assertIs(auto_reply._media_type_with_retry(1), True)         # 剛還原視窗還沒重繪完：稍等再試就判斷得出來
+                self.assertEqual((m.call_count, sleep.call_count), (3, 2))
+            sleep.reset_mock()
+            with mock.patch.object(auto_reply, "last_left_message_is_media", return_value=None) as m:
+                self.assertIsNone(auto_reply._media_type_with_retry(1))           # 試完仍判斷不出來
+                self.assertEqual((m.call_count, sleep.call_count), (auto_reply.MEDIA_CHECK_ATTEMPTS, auto_reply.MEDIA_CHECK_ATTEMPTS - 1))
+            sleep.reset_mock()
+            with mock.patch.object(auto_reply, "last_left_message_is_media", return_value=False) as m:
+                self.assertIs(auto_reply._media_type_with_retry(1), False)        # 一次就有答案：不等待
+                self.assertEqual((m.call_count, sleep.call_count), (1, 0))
+
+    def _run_send_to_deferred_gate(self, early_verdict, late_verdict):
+        """把 send_grandma_image 一路跑到「延後的長輩圖識別」，其餘安全檢查都當作通過"""
+        img = os.path.join(self.temp_dir.name, "defer.eimg")
+        with open(img, "wb") as f:
+            f.write(b"\x00enc-defer")
+        minimized = []
+        patches = [
+            mock.patch.object(auto_reply, "identify_incoming_image", side_effect=[early_verdict, late_verdict]),
+            mock.patch.object(auto_reply, "find_target_chat_window", return_value=[(77, "小明", "Qt", True)]),
+            mock.patch.object(auto_reply, "harvest_line_incoming_images"),
+            mock.patch.object(auto_reply, "get_images", return_value=["a.jpg"]),
+            mock.patch.object(auto_reply, "pick_unique_image", return_value="a.jpg"),
+            mock.patch.object(auto_reply, "countdown_sleep"),
+            mock.patch.object(auto_reply.win32gui, "IsIconic", return_value=False),
+            mock.patch.object(auto_reply.win32gui, "GetForegroundWindow", return_value=77),
+            mock.patch.object(auto_reply.win32gui, "GetWindowText", return_value="小明"),
+            mock.patch.object(auto_reply, "activate_window"),
+            mock.patch.object(auto_reply, "focus_chat_input", return_value=True),
+            mock.patch.object(auto_reply, "is_last_message_from_self_in_chat", return_value=False),
+            mock.patch.object(auto_reply, "_media_type_with_retry", return_value=True),
+            mock.patch.object(auto_reply, "_minimize_if_configured", side_effect=lambda h, c: minimized.append(h)),
+            mock.patch.object(auto_reply, "record_contact_received"),
+            mock.patch.object(auto_reply, "get_active_line_cache_dir", side_effect=RuntimeError("reached the paste stage")),
+            mock.patch.object(auto_reply.time, "sleep"),
+            mock.patch.object(auto_reply, "log_v"),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            result = auto_reply.send_grandma_image("小明", {"time_aware_images": False, "min_delay_seconds": 1, "max_delay_seconds": 1}, triggered_file=img)
+        except RuntimeError as e:
+            result = str(e)                                                      # 通過所有關卡才會走到貼圖階段
+        finally:
+            for p in reversed(patches):
+                p.stop()
+        return result, minimized
+
+    def test_deferred_identification_gate_in_send_flow(self):
+        # 提前沒辦法判斷 (None)，實際回覆時視窗在前景再判斷：不是長輩圖就略過並縮回視窗
+        self.assertEqual(self._run_send_to_deferred_gate(None, False), ("SKIPPED_NOT_GRANDMA", [77]))
+        # 還是判斷不出來：不回、走重試流程
+        self.assertEqual(self._run_send_to_deferred_gate(None, None), ("NOT_SENT", [77]))
+        # 判斷是長輩圖：繼續往貼圖階段走
+        self.assertEqual(self._run_send_to_deferred_gate(None, True), ("reached the paste stage", []))
+        # 提前就判斷是長輩圖 (視窗當時在前景)：不再問第二次
+        self.assertEqual(self._run_send_to_deferred_gate(True, "不該被用到"), ("reached the paste stage", []))
+
+    def _assert_skip_status_marks_processed(self, status):
         test_cache = os.path.join(self.temp_dir.name, "skip_cache")
         fake_hash = "777703ef1234567890abcdef1234567890abcdef"
         chat_m = os.path.join(test_cache, fake_hash, "m")
@@ -3239,7 +3541,7 @@ class TestLineGrandmaBotCore(unittest.TestCase):
         auto_reply.find_target_chat_window = lambda t: [(9970, t, "ChatWnd", True)] if t == "TargetSkip" else []
         auto_reply.is_valid_image_or_eimg = lambda p: True
         calls = []
-        auto_reply.send_grandma_image = lambda t, c, **kw: calls.append(t) or "SKIPPED_TEXT"
+        auto_reply.send_grandma_image = lambda t, c, **kw: calls.append(t) or status
         try:
             cfg = {"targets": ["TargetSkip"], "trigger_mode": "photo_and_sticker", "cooldown_seconds": 0,
                    "min_delay_seconds": 0, "max_delay_seconds": 0}
@@ -3247,15 +3549,126 @@ class TestLineGrandmaBotCore(unittest.TestCase):
             auto_reply.last_reply_times.pop("TargetSkip", None)
             auto_reply.PROCESSED_CACHE_FILES.clear()
             auto_reply.last_seen_cache_mtime = now - 1.0
+            auto_reply.SEND_FAIL_COUNTS["TargetSkip"] = 2                          # 先前失敗過兩次：跳過是「已處理」，要清掉失敗計數
             auto_reply.check_for_incoming_messages(cfg)
             self.assertEqual(calls, ["TargetSkip"])
             self.assertEqual(auto_reply.last_reply_times.get("TargetSkip", 0), 0)   # 沒有啟動冷卻
+            self.assertEqual(auto_reply.SEND_FAIL_COUNTS["TargetSkip"], 0)          # 不是失敗，不累積重試次數
+            self.assertNotIn("TargetSkip", auto_reply.PENDING_RETRY_MEDIA)          # 也不排重試
             self.assertIn((img_path, os.path.getmtime(img_path)), auto_reply.PROCESSED_CACHE_FILES)
             auto_reply.check_for_incoming_messages(cfg)
             self.assertEqual(calls, ["TargetSkip"])                                  # 同一檔案不重複觸發
         finally:
             (auto_reply.get_active_line_cache_dir, auto_reply.find_target_chat_window,
              auto_reply.send_grandma_image, auto_reply.is_valid_image_or_eimg) = orig
+
+    def test_skipped_text_does_not_start_cooldown_and_marks_processed(self):
+        self._assert_skip_status_marks_processed("SKIPPED_TEXT")
+
+    def test_skipped_not_grandma_does_not_start_cooldown_and_marks_processed(self):
+        self._assert_skip_status_marks_processed("SKIPPED_NOT_GRANDMA")          # 不是長輩圖：不冷卻、不重試
+
+    def test_load_config_sanitizes_image_sources_and_gate_settings(self):
+        path = os.path.join(self.temp_dir.name, "img_cfg.json")
+        auto_reply._WARNED_ONCE.difference_update({m for m in auto_reply._WARNED_ONCE if m.startswith("來源")})
+
+        def load(data):
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            with mock.patch.object(auto_reply, "CONFIG_PATH", path), mock.patch.object(auto_reply.logging, "warning") as warn:
+                return auto_reply.load_config(), warn
+
+        cfg, warn = load({"targets": ["a"]})
+        self.assertEqual((cfg["require_grandma_image"], cfg["auto_neutral_images"], cfg["image_sources"]), (True, False, []))   # 預設
+        cfg, warn = load({"targets": ["a"], "require_grandma_image": False, "auto_neutral_images": True, "image_sources": [
+            {"name": "ok", "url": "https://x/{n}.jpg", "start": 1, "end": 3, "category": "neutral"},
+            {"name": "bad", "url": "https://x/no-placeholder.jpg", "start": 1, "end": 3}]})
+        self.assertEqual((cfg["require_grandma_image"], cfg["auto_neutral_images"]), (False, True))
+        self.assertEqual([s["name"] for s in cfg["image_sources"]], ["ok"])                       # 不合格的來源略過
+        self.assertTrue(any("bad" in str(c.args[0]) for c in warn.call_args_list))
+        cfg, _ = load({"targets": ["a"], "require_grandma_image": "no", "auto_neutral_images": 1, "image_sources": "x"})
+        self.assertEqual((cfg["require_grandma_image"], cfg["auto_neutral_images"], cfg["image_sources"]), (True, False, []))   # 型別錯誤沿用預設
+        cfg, _ = load({"targets": ["a"], "image_sources": [{"url": "ftp://x/{n}", "start": 1, "end": 2}]})
+        self.assertEqual([s["name"] for s in cfg["image_sources"]], ["fpg-daily-photo", "fpg-daily-illustration"])   # 全部不合格：用預設來源
+
+    def test_configure_image_options_sets_sources_and_auto_neutral(self):
+        with mock.patch.object(auto_reply, "_IMAGE_SOURCES", None), mock.patch.object(auto_reply, "_AUTO_NEUTRAL", False):
+            src = [{"name": "s", "url": "https://x/{n}", "start": 1, "end": 2}]
+            auto_reply.configure_image_options({"image_sources": src, "auto_neutral_images": True})
+            self.assertEqual((auto_reply._IMAGE_SOURCES, auto_reply._AUTO_NEUTRAL), (src, True))
+            auto_reply.configure_image_options({})                                  # 沒設定：預設來源、不自動判無時段
+            self.assertEqual((auto_reply._IMAGE_SOURCES, auto_reply._AUTO_NEUTRAL), (None, False))
+
+    # ---------- 自動判定無時段圖 (auto_neutral_images) ----------
+    def _classify_with_texts(self, texts, *, auto=True, name="c.png", color=(5, 6, 7)):
+        img = self._make_image(name, (800, 600), color)
+        tags_path = os.path.join(self.temp_dir.name, "image_tags.json")
+        with mock.patch.object(auto_reply, "IMAGE_TAGS_PATH", tags_path), mock.patch.object(auto_reply, "_AUTO_NEUTRAL", auto), \
+             mock.patch.object(auto_reply, "ocr_image_text", side_effect=texts) as ocr:
+            result = auto_reply.classify_image_slots(img)
+        tags = {}
+        if os.path.exists(tags_path):
+            with open(tags_path, encoding="utf-8") as f:
+                tags = json.load(f)
+        return result, ocr.call_count, tags, auto_reply.get_file_md5(img), img, tags_path
+
+    def test_auto_neutral_greeting_in_later_variant_wins_and_stops_early(self):
+        result, calls, tags, md5, _, _ = self._classify_with_texts(["", "晚安 好夢", "不該被呼叫", "不該被呼叫"])
+        self.assertEqual(result, ["evening"])
+        self.assertEqual(calls, 2)                                                # 第二種前處理讀到問候語就停
+        self.assertEqual(tags[md5], ["evening"])
+
+    def test_auto_neutral_labels_readable_greetingless_image_and_caches(self):
+        result, calls, tags, md5, img, tags_path = self._classify_with_texts(["平安喜樂身體健康", "", "", ""])
+        self.assertEqual(result, ["neutral"])
+        self.assertEqual(calls, 4)                                                # 全部前處理都沒有問候語才下結論
+        self.assertEqual(tags[md5], ["neutral"])
+        self.assertEqual(tags["_auto_neutral"], [md5])                            # 記在自動判定清單，方便檢查
+        with mock.patch.object(auto_reply, "IMAGE_TAGS_PATH", tags_path), mock.patch.object(auto_reply, "_AUTO_NEUTRAL", True), \
+             mock.patch.object(auto_reply, "ocr_image_text") as ocr:
+            self.assertEqual(auto_reply.classify_image_slots(img), ["neutral"])   # 第二次直接用快取
+            ocr.assert_not_called()
+
+    def test_auto_neutral_refuses_without_enough_evidence(self):
+        for texts in (["平安", "", "", ""],                                       # 只讀到 2 個字：OCR 對這張圖不可靠
+                      ["", "", "", ""],                                           # 什麼都讀不到
+                      ["中秋節快樂闔家團圓", "", "", ""],                         # 節慶圖不是通用圖
+                      ["父親節快樂永遠健康", "", "", ""]):
+            result, calls, tags, md5, _, _ = self._classify_with_texts(texts)
+            self.assertIsNone(result, texts)
+            self.assertNotIn(md5, tags)                                           # 沒有證據就不快取
+        result, calls, tags, md5, _, _ = self._classify_with_texts([RuntimeError("ocr down")] * 4)
+        self.assertIsNone(result)                                                 # OCR 全失敗
+
+    def test_auto_neutral_off_keeps_unknown_images_unknown(self):
+        result, calls, tags, md5, _, _ = self._classify_with_texts(["平安喜樂身體健康"], auto=False)
+        self.assertIsNone(result)                                                 # 預設行為：沒讀到問候語就是未知
+        self.assertEqual(calls, 1)                                                # 只跑一次 OCR
+        self.assertNotIn(md5, tags)
+
+    def test_fill_image_pool_uses_source_category_and_reserves_neutral_quota(self):
+        tags_path = os.path.join(self.temp_dir.name, "pool_tags.json")
+        for auto, expected_files in ((True, 2), (False, 0)):
+            d = os.path.join(self.temp_dir.name, f"pool_src_{auto}")
+            os.makedirs(d)
+            state = {"n": 0}
+
+            def fake_download(url, save_dir, md5s, state=state):
+                state["n"] += 1
+                path = os.path.join(save_dir, f"grandma_{state['n']}.jpg")
+                with open(path, "wb") as f:
+                    f.write(f"img{state['n']}-{auto}".encode())
+                return path
+
+            with mock.patch.object(auto_reply, "IMAGE_TAGS_PATH", tags_path), mock.patch.object(auto_reply, "_AUTO_NEUTRAL", auto), \
+                 mock.patch.object(auto_reply, "download_and_validate_image", fake_download), \
+                 mock.patch.object(auto_reply, "get_existing_md5s", return_value=set()), \
+                 mock.patch.object(auto_reply, "build_candidates", return_value=[("u", "neutral")] * 40), \
+                 mock.patch.object(auto_reply, "log_v"):
+                counts = auto_reply.fill_image_pool(d, total=10, max_attempts=40)
+            # 來源標明 neutral：不必 OCR 直接歸類。開啟自動無時段時保留 10 // 5 = 2 張，其餘超額的丟棄；關閉時 neutral 沒有名額
+            self.assertEqual(counts["neutral"], expected_files)
+            self.assertEqual(len(os.listdir(d)), expected_files)
 
     def test_filter_returns_tagged_neutral_after_ocr_quota_exhausted(self):
         fail_path = os.path.join(self.temp_dir.name, "q_fail.jpg")
