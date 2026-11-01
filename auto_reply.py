@@ -47,7 +47,7 @@ from crawl_images import (crawl_grandma_images, clean_expired_images, retire_ima
                           download_and_validate_image, get_existing_md5s, build_candidate_urls,
                           build_candidates, normalize_sources)
 
-VERSION = "2.9.0"
+VERSION = "2.9.1"
 
 # 0. 全系統單一執行個體鎖 (Windows Named Mutex)，防止重複啟動繞過斷路器
 _app_mutex_handle = None
@@ -455,6 +455,9 @@ def _scan_images(abs_dir):
         files.extend(glob.glob(os.path.join(abs_dir, ext.upper())))
     return list(set(files))
 
+_REPLENISH_LOCK = threading.Lock()      # 啟動時的背景補庫存與送圖時的補庫存不要同時連網下載
+
+
 def get_images(images_dir, auto_replenish=True, min_pool=10):
     if not os.path.isabs(images_dir):
         abs_dir = os.path.join(SCRIPT_DIR, images_dir)
@@ -466,13 +469,16 @@ def get_images(images_dir, auto_replenish=True, min_pool=10):
 
     # 自動從網路補充庫存
     if auto_replenish and len(images) < min_pool:
-        needed = min_pool - len(images)
-        log_v(f"[庫存提示] 目前長輩圖庫存僅 {len(images)} 張 (低於設定值 {min_pool})，自動連網下載補充 {needed} 張備用...")
-        try:
-            crawl_images_now(needed, abs_dir)
-            images = _scan_images(abs_dir)
-        except Exception as e:
-            log_v(f"[警告] 自動補充長輩圖失敗: {e}")
+        with _REPLENISH_LOCK:
+            images = _scan_images(abs_dir)                  # 等鎖的時候別人可能已經補好了
+            if len(images) < min_pool:
+                needed = min_pool - len(images)
+                log_v(f"[庫存提示] 目前長輩圖庫存僅 {len(images)} 張 (低於設定值 {min_pool})，自動連網下載補充 {needed} 張備用...")
+                try:
+                    crawl_images_now(needed, abs_dir)
+                    images = _scan_images(abs_dir)
+                except Exception as e:
+                    log_v(f"[警告] 自動補充長輩圖失敗: {e}")
 
     return images
 
@@ -3082,9 +3088,12 @@ def warm_up_image_library(config):
     """在背景預先辨識整個圖庫 (結果快取在 image_kinds.json，之後挑圖不必等)，完成後回報各性質的張數"""
     images_dir = config.get("images_dir", "images")
     abs_dir = images_dir if os.path.isabs(images_dir) else os.path.join(SCRIPT_DIR, images_dir)
+    os.makedirs(abs_dir, exist_ok=True)
 
     def work():
         try:
+            # 圖庫不進版控，剛下載的專案是空的：啟動時先上網補到 min_image_pool 張 (已經夠就不連網)，再辨識
+            get_images(images_dir, auto_replenish=config.get("auto_crawl_images", True), min_pool=config.get("min_image_pool", 10))
             library = image_library.scan_library(abs_dir, KIND_INDEX, log=log_v)
             counts = {}
             for img in library:

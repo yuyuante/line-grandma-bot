@@ -603,8 +603,92 @@ class TestStartup(_Base):
                 self.target()
 
         with mock.patch.object(auto_reply, "log_v", side_effect=logs.append),              mock.patch.object(auto_reply.threading, "Thread", Inline):
-            auto_reply.warm_up_image_library({"images_dir": self.dir})
+            auto_reply.warm_up_image_library({"images_dir": self.dir, "auto_crawl_images": False})
         self.assertTrue(any("可用 2 張" in l and "節日 1" in l and "時段問候 1" in l for l in logs), logs)   # 辨識不出的那張不算
+
+    def test_warm_up_tops_up_the_library_from_the_web_before_scanning(self):
+        # 圖庫不進版控：剛下載的專案是空的，啟動時要先上網補到 min_image_pool 張，再辨識
+        logs = []
+        calls = []
+
+        class Inline:
+            def __init__(self, target, name=None, daemon=None):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        def fake_get_images(images_dir, auto_replenish=True, min_pool=10):
+            calls.append((images_dir, auto_replenish, min_pool))
+            self.text_image("downloaded.jpg", "早安平安")                                     # 模擬剛抓下來的圖
+            return []
+
+        with mock.patch.object(auto_reply, "log_v", side_effect=logs.append), mock.patch.object(auto_reply.threading, "Thread", Inline), \
+             mock.patch.object(auto_reply, "get_images", side_effect=fake_get_images):
+            auto_reply.warm_up_image_library({"images_dir": self.dir, "min_image_pool": 7})
+        self.assertEqual(calls, [(self.dir, True, 7)])
+        self.assertTrue(any("可用 1 張" in l for l in logs), logs)                           # 補完之後才辨識，剛抓的圖算進去
+
+    def test_warm_up_does_not_go_online_when_auto_crawl_is_off(self):
+        calls = []
+
+        class Inline:
+            def __init__(self, target, name=None, daemon=None):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        with mock.patch.object(auto_reply, "log_v"), mock.patch.object(auto_reply.threading, "Thread", Inline), \
+             mock.patch.object(auto_reply, "get_images", side_effect=lambda d, auto_replenish=True, min_pool=10: calls.append(auto_replenish) or []):
+            auto_reply.warm_up_image_library({"images_dir": self.dir, "auto_crawl_images": False})
+        self.assertEqual(calls, [False])
+
+    def test_two_replenish_attempts_do_not_download_twice(self):
+        downloads = []
+
+        def fake_crawl(needed, abs_dir):
+            downloads.append(needed)
+            for i in range(needed):
+                self.text_image(f"dl{i}.jpg", "早安平安")
+
+        with mock.patch.object(auto_reply, "log_v"), mock.patch.object(auto_reply, "crawl_images_now", side_effect=fake_crawl):
+            first = auto_reply.get_images(self.dir, auto_replenish=True, min_pool=3)
+            second = auto_reply.get_images(self.dir, auto_replenish=True, min_pool=3)         # 啟動補庫存之後送圖又檢查一次
+        self.assertEqual(downloads, [3])
+        self.assertEqual((len(first), len(second)), (3, 3))
+
+    def test_two_threads_replenishing_at_the_same_time_download_only_once(self):
+        # 啟動時的背景補庫存還在下載，第一張圖就來了：送圖前的補庫存要等它做完，不能再抓一次
+        import threading as real_threading
+        downloads = []
+        started = real_threading.Event()
+        release = real_threading.Event()
+
+        def slow_crawl(needed, abs_dir):
+            downloads.append(needed)
+            started.set()
+            release.wait(5)
+            for i in range(needed):
+                self.text_image(f"dl{i}.jpg", "早安平安")
+
+        results = {}
+
+        def call(name):
+            results[name] = len(auto_reply.get_images(self.dir, auto_replenish=True, min_pool=3))
+
+        with mock.patch.object(auto_reply, "log_v"), mock.patch.object(auto_reply, "crawl_images_now", side_effect=slow_crawl):
+            a = real_threading.Thread(target=call, args=("a",))
+            a.start()
+            self.assertTrue(started.wait(5))
+            b = real_threading.Thread(target=call, args=("b",))
+            b.start()                                                                        # b 已經掃過圖庫 (還是空的)，卡在鎖上
+            time.sleep(0.3)
+            release.set()
+            a.join(10)
+            b.join(10)
+        self.assertEqual(downloads, [3])                                                      # b 等到鎖之後重新檢查，發現夠了
+        self.assertEqual(results, {"a": 3, "b": 3})
 
     def test_warm_up_failure_is_reported_not_raised(self):
         logs = []
@@ -617,7 +701,7 @@ class TestStartup(_Base):
                 self.target()
 
         with mock.patch.object(auto_reply, "log_v", side_effect=logs.append),              mock.patch.object(auto_reply.threading, "Thread", Inline),              mock.patch.object(auto_reply.image_library, "scan_library", side_effect=RuntimeError("disk")):
-            auto_reply.warm_up_image_library({"images_dir": self.dir})
+            auto_reply.warm_up_image_library({"images_dir": self.dir, "auto_crawl_images": False})
         self.assertTrue(any("預先辨識圖庫失敗" in l for l in logs))
 
 

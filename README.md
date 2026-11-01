@@ -1,6 +1,6 @@
 # LINE 長輩圖智慧自動回覆機器人 (line-grandma-bot)
 
-[![Version](https://img.shields.io/badge/version-2.9.0-blue.svg)](auto_reply.py)
+[![Version](https://img.shields.io/badge/version-2.9.1-blue.svg)](auto_reply.py)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D6.svg)](https://microsoft.com)
 [![Python](https://img.shields.io/badge/python-3.10%2B-green.svg)](https://python.org)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey.svg)](LICENSE)
@@ -49,7 +49,7 @@ line-grandma-bot/
 ├── image_kind.py        # 由圖上文字判斷性質：節日、時段問候、平安叮嚀、祝福鼓勵、心靈雞湯；競選圖一律不回
 ├── image_library.py     # 圖庫性質索引、挑圖規則、沒庫存時立即上網抓圖
 ├── reply_budget.py      # 每個聊天室每天的回覆次數上限
-├── auto_reply.py        # 核心自動回覆常駐程式 (v2.9.0)
+├── auto_reply.py        # 核心自動回覆常駐程式 (v2.9.1)
 ├── crawl_images.py      # 台塑貼圖酷長輩圖抓取與過期清理模組
 ├── config.example.json  # 設定檔範本
 ├── config.json          # 個人實際設定檔 (已列入 .gitignore 保護隱私)
@@ -224,6 +224,11 @@ python auto_reply.py --unbind "媽媽"
 ---
 
 ## 📝 版本異動紀錄 (Changelog)
+
+### [v2.9.1] - 2026-11-01
+- **圖庫 `images/` 不再進版控**：圖庫是執行時的資料（送出後淘汰、定期換新、啟動時自動抓），每次回覆都會讓工作目錄出現刪除與新增，而且 repo 帶著一包圖也沒有意義。`.gitignore` 改為忽略 `images/*`（只保留 `images/.gitkeep`），既有的圖檔仍留在你的磁碟上，只是不再被追蹤。
+- **不附起始圖，啟動時上網抓**：剛下載的專案圖庫是空的，程式啟動時會在背景自動上網補到 `min_image_pool`（預設 10）張再辨識性質，圖庫已經夠就不連網；`auto_crawl_images` 設為 `false` 則不連網。第一次啟動請等圖庫補好（紀錄會印「[圖庫] 辨識完成」）再開始收圖。
+- 啟動時的補庫存與送圖前的補庫存加了鎖，不會同時連網下載兩次。
 
 ### [v2.9.0] - 2026-11-01
 #### 支援群組

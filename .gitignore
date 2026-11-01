@@ -19,3 +19,7 @@ review_diff.patch
 *.emergency_copy
 *.emergency_lock
 image_tags.json
+
+# 圖庫是執行時的資料 (送出後淘汰、定期換新)，不進版控；剛下載的專案圖庫是空的，啟動時會自動上網補到 min_image_pool 張
+images/*
+!images/.gitkeep
