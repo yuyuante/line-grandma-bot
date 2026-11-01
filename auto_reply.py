@@ -48,7 +48,7 @@ from crawl_images import (crawl_grandma_images, clean_expired_images, retire_ima
                           download_and_validate_image, get_existing_md5s, build_candidate_urls,
                           build_candidates, normalize_sources)
 
-VERSION = "2.13.0"
+VERSION = "2.13.1"
 
 # 0. 全系統單一執行個體鎖 (Windows Named Mutex)，防止重複啟動繞過斷路器
 _app_mutex_handle = None
@@ -3289,6 +3289,9 @@ STOP_FUZZY_RATIO = 0.85         # OCR 偶爾認錯一字，整句相似度達此
 STOP_OCR_UPSCALES = (2, 4)      # OCR 截圖放大倍數 (小字放大後辨識較準，各倍數結果不同，都試)
 STOP_SIG_MIN_INTERVAL = 5.0       # 視窗簽章觸發的檢查最短間隔 (秒)，避免使用者捲動歷史訊息時每秒都做 OCR
 STOP_READ_ATTEMPTS = 3          # 視窗在前景時，讀不到你發的訊息最多再試幾次
+STOP_RECHECKS = 5               # 簽章變了但沒讀到停止指令時，保留舊簽章、之後最多再讀幾次 (新氣泡可能還沒畫好；每次至少隔 STOP_SIG_MIN_INTERVAL 秒，約 25 秒)
+STOP_RECHECK_WINDOW = 60.0      # 重讀計數的有效秒數 (從第一次沒讀到算起)；超過就當成新的一次簽章變化，重新完整讀
+_STOP_RECHECKS = {}             # {聊天室: (簽章, 這個簽章已經讀過幾次但沒讀到指令, 第一次沒讀到的時間)}
 _STOP_SIG_LAST_CHECK = {}        # {聊天室: 上次因視窗簽章變化而檢查的時間}
 _STOP_SEEN_SIG = {}             # {聊天室: 視窗展開時最後一次記下的訊息列表簽章}
 
@@ -3392,30 +3395,38 @@ def last_own_message_has_text(chat_hwnd, phrase):
                 return True
     return False if read else None
 
-def _chat_has_stop_command(chat, phrase):
+def _chat_has_stop_command(chat, phrase, attempts=None):
     """
-    確認該聊天室你發的最底部文字含停止指令，而且它是整個聊天室的最後一則。回傳 True (是指令) 或 False (不是，
-    或試了 STOP_READ_ATTEMPTS 次仍無法確認，依 Fail-Closed 不停止)。
+    確認該聊天室你發的最底部文字含停止指令，而且它是整個聊天室的最後一則。回傳三種結果：
+    True：是指令，要停止。
+    False：確定不用再讀了 (沒有這個聊天室視窗，或讀到指令但它不是最後一則：下面已有官方帳號推來的新訊息)。
+    None：這次沒讀到指令，但可能只是新氣泡還沒畫好、剛好失焦、讀不出字，稍後值得再讀 (見 check_stop_command)；依 Fail-Closed 本次不停止。
+    attempts 是「讀不出字」時最多讀幾次 (預設 STOP_READ_ATTEMPTS)；稍後的重讀只讀一次，免得每次都睡上好幾秒卡住主迴圈。
     你在聊天室打字時視窗一定在前景，所以只在視窗已是前景時檢查，不會為了檢查搶焦點或縮小視窗；
     只有讀到指令時才可能暫時最大化視窗 (確認它是最後一則)，平常打字聊天不會動你的視窗。
     """
+    attempts = STOP_READ_ATTEMPTS if attempts is None else max(1, attempts)
     matched = find_target_chat_window(chat)
     if not matched:
         return False
     hwnd = matched[0][0]
-    for _ in range(STOP_READ_ATTEMPTS):
-        if win32gui.GetForegroundWindow() != hwnd or win32gui.GetWindowText(hwnd).strip().lower() != chat.lower():
-            return False
+    for _ in range(attempts):
+        if win32gui.GetForegroundWindow() != hwnd:
+            return None                       # 失焦 (可能剛好切走)：不讀，稍後再說
+        if win32gui.GetWindowText(hwnd).strip().lower() != chat.lower():
+            return False                      # 標題對不上 (例如帶了未讀數)：這是持續的狀況，重讀也不會變，不浪費次數
         found = last_own_message_has_text(hwnd, phrase)
         if found is None:
-            time.sleep(0.8)
+            if attempts > 1:
+                time.sleep(0.8)
             continue
         if not found:
-            return False                      # 沒有指令：視窗完全不動
+            return None                       # 沒有指令：視窗完全不動 (新氣泡可能還沒畫好，由 check_stop_command 保留基準線、稍後再讀)
         # 看到指令才確認它是最底部一則 (而不是上面留著的舊指令，下面已有官方帳號推來的新訊息)；視窗太窄時這一步會暫時最大化
         return verify_message_sent_to_chat(hwnd)
-    log_v(f"[停止指令待確認]「{chat}」最底部你發的訊息無法讀取，本次不停止。")
-    return False
+    if attempts > 1:
+        log_v(f"[停止指令待確認]「{chat}」最底部你發的訊息無法讀取，本次不停止。")
+    return None
 
 def _window_hwnd(windows, chat):
     """好友視窗的控制代碼 (標題可帶未讀數)；找不到回傳 None"""
@@ -3527,6 +3538,7 @@ def init_stop_baselines(config, chats=None):
     for chat in (config.get("stop_command_chats") or []) if chats is None else chats:
         hwnd = _window_hwnd(windows, chat)
         sig = _expanded_window_signature(hwnd) if hwnd else None
+        _STOP_RECHECKS.pop(chat, None)              # 重新建立基準：之前進行到一半的重讀作廢
         if sig is not None:
             _STOP_SEEN_SIG[chat] = sig
 
@@ -3543,27 +3555,57 @@ def check_stop_command(config):
         return
     windows = get_all_line_windows()
     for chat in chats:
+        sig = None
         try:
             hwnd = _window_hwnd(windows, chat)
             sig = _expanded_window_signature(hwnd) if hwnd else None
             if sig is None:
                 _STOP_SEEN_SIG.pop(chat, None)      # 視窗關閉或縮小：展開後重新建立簽章
+                _STOP_RECHECKS.pop(chat, None)
                 continue
             old_sig = _STOP_SEEN_SIG.get(chat)
             if old_sig is None or sig == old_sig:
                 _STOP_SEEN_SIG[chat] = sig
+                _STOP_RECHECKS.pop(chat, None)
                 continue
             if time.time() - _STOP_SIG_LAST_CHECK.get(chat, 0.0) < STOP_SIG_MIN_INTERVAL:
                 continue                            # 太密集 (例如捲動歷史訊息)：保留舊簽章，間隔過後再查
             if win32gui.GetForegroundWindow() != hwnd:
                 continue                            # 背景視窗 (例如官方帳號推來 log)：不搶焦點，保留舊簽章
-            _STOP_SEEN_SIG[chat] = sig
             _STOP_SIG_LAST_CHECK[chat] = time.time()
-            if _chat_has_stop_command(chat, phrase):
+            now = time.time()
+            state = _STOP_RECHECKS.get(chat)
+            # 重讀計數屬於「這一次簽章變化」：更新的簽章要重新算，不繼承舊的；而且只在 STOP_RECHECK_WINDOW 秒內有效
+            # (「氣泡還沒畫好」只可能發生在簽章剛變的那一小段時間，你切走很久才回來要重新完整讀一次)
+            fresh = bool(state) and state[0] == sig and now - state[2] <= STOP_RECHECK_WINDOW
+            tries = state[1] if fresh else 0
+            first_miss = state[2] if fresh else now
+            try:
+                result = _chat_has_stop_command(chat, phrase, attempts=STOP_READ_ATTEMPTS if tries == 0 else 1)
+            except Exception as e:
+                # 讀取當下的暫時性錯誤 (視窗正在重繪、截圖失敗...) 不能當成「沒有指令」而推進基準線：算一次「稍後再讀」
+                if tries == 0:
+                    log_v(f"[警告] 讀取「{chat}」的停止指令時發生例外: {e}，稍後再試。")
+                result = None
+            if result:
                 raise StopRequested(f"你在「{chat}」聊天室發了停止指令")
+            if result is None:
+                # 沒讀到指令：列表一有新項目簽章就變，但新氣泡的內容可能還沒畫好 (真機實測 2026-11-01：程式送出的停止指令
+                # 過了約 2 分鐘才被偵測到，因為讀不到那次基準線就已經前進，除非列表再變一次否則不會再讀)。
+                # 所以先不推進基準線，之後幾輪 (每次至少隔 STOP_SIG_MIN_INTERVAL 秒) 再讀 (只讀一次，不睡)，最多 STOP_RECHECKS 次才放棄
+                tries += 1
+                if tries <= STOP_RECHECKS:
+                    _STOP_RECHECKS[chat] = (sig, tries, first_miss)
+                    continue
+            # 確定不用再讀 (False)，或重讀用完：推進基準線，之後同樣的簽章不再讀
+            _STOP_RECHECKS.pop(chat, None)
+            _STOP_SEEN_SIG[chat] = sig
         except StopRequested:
             raise
         except Exception as e:
+            if sig is not None:
+                _STOP_SEEN_SIG[chat] = sig          # 出錯就推進基準線，免得每個間隔都重複出錯與重複警告
+            _STOP_RECHECKS.pop(chat, None)
             log_v(f"[警告] 檢查「{chat}」的停止指令時發生例外: {e}")
 
 

@@ -3549,8 +3549,25 @@ class TestLineGrandmaBotCore(unittest.TestCase):
         return {"stop_command": "結束長輩圖機器人", "stop_command_chats": ["Notify Bot"]}
 
     def _reset_stop_state(self):
+        self.stop_attempts = []
         auto_reply._STOP_SEEN_SIG.clear()
         auto_reply._STOP_SIG_LAST_CHECK.clear()
+        auto_reply._STOP_RECHECKS.clear()
+
+    class _TooManyReads(BaseException):
+        """繼承 BaseException：程式裡的 except Exception 吞不掉，讀得比預期多就一定讓測試失敗"""
+
+    def _stop_call(self, calls, args, kwargs, check):
+        calls.append(args)
+        self.stop_attempts.append(kwargs.get("attempts"))
+        if isinstance(check, list):
+            if not check:
+                raise self._TooManyReads("讀取次數超過測試預期")
+            item = check.pop(0)
+            if isinstance(item, BaseException):
+                raise item                                    # 清單裡的例外要真的丟出去，不是當成回傳值
+            return item
+        return check
 
     def _run_stop_rounds(self, sigs, *, fg=5, check=False, clock=None, windows=None, rounds=None):
         """依序餵入每輪的視窗簽章跑 check_stop_command，回傳 _chat_has_stop_command 被呼叫的次數"""
@@ -3561,7 +3578,7 @@ class TestLineGrandmaBotCore(unittest.TestCase):
             mock.patch.object(auto_reply, "get_all_line_windows", return_value=windows or [(5, "Notify Bot", "Qt", True)]),
             mock.patch.object(auto_reply, "_expanded_window_signature", side_effect=lambda h: next(it)),
             mock.patch.object(auto_reply.win32gui, "GetForegroundWindow", return_value=fg),
-            mock.patch.object(auto_reply, "_chat_has_stop_command", side_effect=lambda *a, **k: calls.append(a) or check),
+            mock.patch.object(auto_reply, "_chat_has_stop_command", side_effect=lambda *a, **k: self._stop_call(calls, a, k, check)),
             mock.patch.object(auto_reply, "log_v"),
         ]
         if clock is not None:
@@ -3586,12 +3603,222 @@ class TestLineGrandmaBotCore(unittest.TestCase):
         # 名單內的聊天室沒開視窗：不檢查
         self.assertEqual(self._run_stop_rounds([], windows=[(1, "別人", "Qt", True)], rounds=1), [])
 
-    def test_check_stop_command_builds_baseline_then_checks_each_change_once(self):
+    def test_check_stop_command_builds_baseline_then_checks_each_change_a_bounded_number_of_times(self):
         self._reset_stop_state()
         clock = {"t": 1000.0}
-        # 第一輪只建基準，第二輪沒變，第三輪變了檢查一次，第四輪沒變不再檢查
-        calls = self._run_stop_rounds([(10, "a", "b"), (10, "a", "b"), (11, "c", "a"), (11, "c", "a")], clock=clock)
-        self.assertEqual(calls, [("Notify Bot", "結束長輩圖機器人")])
+        # 第一輪只建基準，第二輪沒變；第三輪變了：沒讀到指令 (None) 時不推進基準線，之後最多再讀 STOP_RECHECKS 次就放棄，不會一直讀
+        sigs = [(10, "a", "b"), (10, "a", "b")] + [(11, "c", "a")] * 12
+        calls = self._run_stop_rounds(sigs, check=None, clock=clock)
+        self.assertEqual(len(calls), 1 + auto_reply.STOP_RECHECKS)
+        self.assertEqual(calls[0], ("Notify Bot", "結束長輩圖機器人"))
+
+    def test_a_definite_no_advances_the_baseline_at_once(self):
+        # False = 確定不用再讀 (例如有指令但不是最後一則)：不重讀，免得每次都讓視窗最大化再還原
+        self._reset_stop_state()
+        calls = self._run_stop_rounds([(10, "a", "b"), (11, "c", "a")] + [(11, "c", "a")] * 6, check=False, clock={"t": 1000.0})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(auto_reply._STOP_SEEN_SIG["Notify Bot"], (11, "c", "a"))
+        self.assertNotIn("Notify Bot", auto_reply._STOP_RECHECKS)
+
+    def test_a_command_whose_bubble_was_not_drawn_yet_is_found_on_a_later_round(self):
+        # 真機 (2026-11-01)：列表一有新項目簽章就變，但氣泡內容可能還沒畫好，第一次讀不到；基準線沒推進，下一輪就讀得到
+        self._reset_stop_state()
+        sigs = [(10, "a", "b"), (11, "c", "a"), (11, "c", "a"), (11, "c", "a")]
+        with self.assertRaises(auto_reply.StopRequested):
+            self._run_stop_rounds(sigs, check=[None, True], clock={"t": 1000.0})
+
+    def test_a_command_found_at_once_needs_no_recheck(self):
+        self._reset_stop_state()
+        with self.assertRaises(auto_reply.StopRequested):
+            self._run_stop_rounds([(10, "a", "b"), (11, "c", "a")], check=[True], clock={"t": 1000.0})
+        self.assertNotIn("Notify Bot", auto_reply._STOP_RECHECKS)
+
+    def test_the_first_read_may_retry_but_rechecks_read_only_once(self):
+        # 重讀只讀一次：不然每次重讀都可能睡上好幾秒，卡住倒數與其他好友
+        self._reset_stop_state()
+        self._run_stop_rounds([(10, "a", "b")] + [(11, "c", "a")] * 4, check=None, clock={"t": 1000.0})
+        self.assertEqual(self.stop_attempts[0], auto_reply.STOP_READ_ATTEMPTS)
+        self.assertTrue(all(a == 1 for a in self.stop_attempts[1:]))
+        self.assertGreater(len(self.stop_attempts), 1)
+
+    def test_a_newer_signature_during_the_rechecks_starts_its_own_count(self):
+        # 審查：重讀計數屬於「這一次簽章變化」。使用者先發了一則普通訊息又接著發停止指令，後者要有完整的重讀次數
+        self._reset_stop_state()
+        auto_reply._STOP_SEEN_SIG["Notify Bot"] = (10, "a", "b")
+        auto_reply._STOP_RECHECKS["Notify Bot"] = ((11, "c", "a"), auto_reply.STOP_RECHECKS)      # 舊簽章已經快用完次數
+        calls = self._run_stop_rounds([(12, "d", "c")], check=None, clock={"t": 1000.0})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(auto_reply._STOP_RECHECKS["Notify Bot"], ((12, "d", "c"), 1, 1000.0))             # 新簽章從 1 開始算
+        self.assertEqual(auto_reply._STOP_SEEN_SIG["Notify Bot"], (10, "a", "b"))                  # 基準線還沒前進
+        self.assertEqual(self.stop_attempts, [auto_reply.STOP_READ_ATTEMPTS])                      # 而且第一次讀是完整的 (可重試讀不出字)
+
+    def test_the_same_signature_keeps_counting_across_rounds(self):
+        self._reset_stop_state()
+        auto_reply._STOP_SEEN_SIG["Notify Bot"] = (10, "a", "b")
+        auto_reply._STOP_RECHECKS["Notify Bot"] = ((11, "c", "a"), 2, 1000.0)
+        self._run_stop_rounds([(11, "c", "a")], check=None, clock={"t": 1000.0})
+        self.assertEqual(auto_reply._STOP_RECHECKS["Notify Bot"], ((11, "c", "a"), 3, 1000.0))
+
+    def test_rechecks_are_spaced_by_the_minimum_interval(self):
+        self._reset_stop_state()
+        auto_reply._STOP_SEEN_SIG["Notify Bot"] = (10, "a", "b")
+        clock = {"t": 1000.0}
+        windows = [(5, "Notify Bot", "Qt", True)]
+        calls = []
+        with mock.patch.object(auto_reply, "get_all_line_windows", return_value=windows), \
+             mock.patch.object(auto_reply, "_expanded_window_signature", return_value=(11, "c", "a")), \
+             mock.patch.object(auto_reply.win32gui, "GetForegroundWindow", return_value=5), \
+             mock.patch.object(auto_reply, "_chat_has_stop_command", side_effect=lambda *a, **k: calls.append(1)), \
+             mock.patch.object(auto_reply.time, "time", lambda: clock["t"]), \
+             mock.patch.object(auto_reply, "log_v"):
+            for _ in range(3):
+                auto_reply.check_stop_command(self._stop_cfg())                  # 時間沒前進：只讀第一次
+            self.assertEqual(len(calls), 1)
+            clock["t"] += auto_reply.STOP_SIG_MIN_INTERVAL
+            auto_reply.check_stop_command(self._stop_cfg())
+            self.assertEqual(len(calls), 2)
+
+    def test_after_giving_up_the_same_signature_is_not_read_again(self):
+        self._reset_stop_state()
+        sigs = [(10, "a", "b"), (11, "c", "a")] + [(11, "c", "a")] * 14
+        calls = self._run_stop_rounds(sigs, check=None, clock={"t": 1000.0})
+        self.assertEqual(len(calls), 1 + auto_reply.STOP_RECHECKS)               # 放棄之後基準線已推進，之後同樣的簽章不再讀
+        self.assertEqual(auto_reply._STOP_SEEN_SIG["Notify Bot"], (11, "c", "a"))
+        self.assertNotIn("Notify Bot", auto_reply._STOP_RECHECKS)
+
+    def test_a_background_window_is_not_read_while_waiting_for_a_recheck(self):
+        self._reset_stop_state()
+        auto_reply._STOP_SEEN_SIG["Notify Bot"] = (10, "a", "b")
+        auto_reply._STOP_RECHECKS["Notify Bot"] = ((11, "c", "a"), 1, 1000.0)
+        calls = self._run_stop_rounds([(11, "c", "a")] * 3, fg=99, clock={"t": 1000.0})
+        self.assertEqual(calls, [])                                              # 視窗在背景：不搶焦點
+        self.assertEqual(auto_reply._STOP_SEEN_SIG["Notify Bot"], (10, "a", "b"))
+
+    def test_minimising_the_window_resets_the_recheck_state(self):
+        self._reset_stop_state()
+        auto_reply._STOP_SEEN_SIG["Notify Bot"] = (10, "a", "b")
+        auto_reply._STOP_RECHECKS["Notify Bot"] = ((11, "c", "a"), 2, 1000.0)
+        self._run_stop_rounds([None], rounds=1)
+        self.assertNotIn("Notify Bot", auto_reply._STOP_RECHECKS)
+        self.assertNotIn("Notify Bot", auto_reply._STOP_SEEN_SIG)
+
+    def test_an_unchanged_signature_clears_the_recheck_counter(self):
+        self._reset_stop_state()
+        auto_reply._STOP_SEEN_SIG["Notify Bot"] = (10, "a", "b")
+        auto_reply._STOP_RECHECKS["Notify Bot"] = ((11, "c", "a"), 1, 1000.0)
+        self._run_stop_rounds([(10, "a", "b")], rounds=1)
+        self.assertNotIn("Notify Bot", auto_reply._STOP_RECHECKS)
+
+    def test_init_stop_baselines_discards_an_unfinished_recheck(self):
+        # 審查：啟動或熱重載重新建立基準時，之前進行到一半的重讀要作廢，不然新的簽章變化會只拿到剩下的次數
+        self._reset_stop_state()
+        auto_reply._STOP_RECHECKS["Notify Bot"] = ((11, "c", "a"), 4, 1000.0)
+        with mock.patch.object(auto_reply, "get_all_line_windows", return_value=[(5, "Notify Bot", "Qt", True)]), \
+             mock.patch.object(auto_reply, "_expanded_window_signature", return_value=(20, "x", "y")):
+            auto_reply.init_stop_baselines({"stop_command_chats": ["Notify Bot"]})
+        self.assertNotIn("Notify Bot", auto_reply._STOP_RECHECKS)
+        self.assertEqual(auto_reply._STOP_SEEN_SIG["Notify Bot"], (20, "x", "y"))
+
+    def test_a_list_driven_check_that_reads_too_often_fails_loudly(self):
+        # 審查：清單用完時丟的是 IndexError，會被程式的 except Exception 吞掉，測試可能空過；現在丟 BaseException
+        self._reset_stop_state()
+        with self.assertRaises(self._TooManyReads):
+            self._run_stop_rounds([(10, "a", "b")] + [(11, "c", "a")] * 3, check=[None], clock={"t": 1000.0})
+
+    def _run_erroring_check(self, rounds, error_in="check"):
+        self._reset_stop_state()
+        auto_reply._STOP_SEEN_SIG["Notify Bot"] = (10, "a", "b")
+        clock = {"t": 1000.0}
+        calls = []
+
+        def boom(*a, **k):
+            calls.append(1)
+            raise RuntimeError("boom")
+
+        with mock.patch.object(auto_reply, "get_all_line_windows", return_value=[(5, "Notify Bot", "Qt", True)]), \
+             mock.patch.object(auto_reply, "_expanded_window_signature", return_value=(11, "c", "a")), \
+             mock.patch.object(auto_reply.win32gui, "GetForegroundWindow", return_value=5), \
+             mock.patch.object(auto_reply, "_chat_has_stop_command", side_effect=boom), \
+             mock.patch.object(auto_reply.time, "time", lambda: clock["t"]), \
+             mock.patch.object(auto_reply, "log_v") as log:
+            for _ in range(rounds):
+                auto_reply.check_stop_command(self._stop_cfg())
+                clock["t"] += auto_reply.STOP_SIG_MIN_INTERVAL
+        return calls, log
+
+    def test_a_transient_error_while_reading_counts_as_a_retry_not_as_no_command(self):
+        # 審查：讀取當下的暫時性錯誤 (視窗重繪、截圖失敗) 不能直接推進基準線，否則指令就被丟掉
+        calls, _ = self._run_erroring_check(1)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(auto_reply._STOP_SEEN_SIG["Notify Bot"], (10, "a", "b"))      # 基準線沒前進
+        self.assertEqual(auto_reply._STOP_RECHECKS["Notify Bot"], ((11, "c", "a"), 1, 1000.0))
+
+    def test_a_command_is_still_found_after_a_transient_error(self):
+        self._reset_stop_state()
+        with self.assertRaises(auto_reply.StopRequested):
+            self._run_stop_rounds([(10, "a", "b"), (11, "c", "a"), (11, "c", "a")],
+                                  check=[RuntimeError("boom"), True], clock={"t": 1000.0})
+        self.assertEqual(self.stop_attempts, [auto_reply.STOP_READ_ATTEMPTS, 1])                  # 第一次出錯、第二次 (重讀) 才讀到，不是第一次就停
+
+    def test_a_persistent_error_gives_up_after_the_rechecks_and_warns_only_once(self):
+        calls, log = self._run_erroring_check(auto_reply.STOP_RECHECKS + 6)
+        self.assertEqual(len(calls), 1 + auto_reply.STOP_RECHECKS)                       # 有上限，不會每個間隔都重來
+        self.assertEqual(auto_reply._STOP_SEEN_SIG["Notify Bot"], (11, "c", "a"))        # 放棄之後才推進基準線
+        self.assertEqual(sum("例外" in str(c.args[0]) for c in log.call_args_list), 1)   # 警告只印一次
+        self.assertNotIn("Notify Bot", auto_reply._STOP_RECHECKS)
+
+    def test_an_error_outside_the_read_still_advances_the_baseline(self):
+        # 讀取之外的錯誤 (例如簽章比對本身出錯) 沒有重讀的意義：照舊推進基準線並清掉計數，免得每個間隔重複出錯
+        self._reset_stop_state()
+        auto_reply._STOP_SEEN_SIG["Notify Bot"] = (10, "a", "b")
+        auto_reply._STOP_RECHECKS["Notify Bot"] = ((11, "c", "a"), 1, 1000.0)
+        with mock.patch.object(auto_reply, "get_all_line_windows", return_value=[(5, "Notify Bot", "Qt", True)]), \
+             mock.patch.object(auto_reply, "_expanded_window_signature", return_value=(11, "c", "a")), \
+             mock.patch.object(auto_reply.win32gui, "GetForegroundWindow", side_effect=RuntimeError("boom")), \
+             mock.patch.object(auto_reply.time, "time", lambda: 1000.0), \
+             mock.patch.object(auto_reply, "log_v") as log:
+            auto_reply.check_stop_command(self._stop_cfg())
+        self.assertNotIn("Notify Bot", auto_reply._STOP_RECHECKS)
+        self.assertEqual(auto_reply._STOP_SEEN_SIG["Notify Bot"], (11, "c", "a"))
+        self.assertEqual(sum("例外" in str(c.args[0]) for c in log.call_args_list), 1)
+
+    def test_a_stale_recheck_counter_is_ignored_after_the_window_expires(self):
+        # 審查：你切走很久才回來，不能拿很久以前的次數來算；超過有效時間就當成新的一次簽章變化，重新完整讀
+        self._reset_stop_state()
+        auto_reply._STOP_SEEN_SIG["Notify Bot"] = (10, "a", "b")
+        auto_reply._STOP_RECHECKS["Notify Bot"] = ((11, "c", "a"), auto_reply.STOP_RECHECKS, 1000.0 - auto_reply.STOP_RECHECK_WINDOW - 1)
+        calls = self._run_stop_rounds([(11, "c", "a")], check=None, clock={"t": 1000.0})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.stop_attempts, [auto_reply.STOP_READ_ATTEMPTS])                    # 完整讀 (可重試讀不出字)
+        self.assertEqual(auto_reply._STOP_RECHECKS["Notify Bot"], ((11, "c", "a"), 1, 1000.0))   # 次數從 1 重新算
+        self.assertEqual(auto_reply._STOP_SEEN_SIG["Notify Bot"], (10, "a", "b"))
+
+    def test_a_recent_recheck_counter_is_still_used(self):
+        self._reset_stop_state()
+        auto_reply._STOP_SEEN_SIG["Notify Bot"] = (10, "a", "b")
+        auto_reply._STOP_RECHECKS["Notify Bot"] = ((11, "c", "a"), 2, 1000.0 - auto_reply.STOP_RECHECK_WINDOW)
+        self._run_stop_rounds([(11, "c", "a")], check=None, clock={"t": 1000.0})
+        self.assertEqual(self.stop_attempts, [1])                                                # 還在有效時間內：只讀一次
+        self.assertEqual(auto_reply._STOP_RECHECKS["Notify Bot"][1], 3)
+
+    def test_the_time_of_the_first_miss_is_kept_across_rechecks(self):
+        self._reset_stop_state()
+        self._run_stop_rounds([(10, "a", "b")] + [(11, "c", "a")] * 3, check=None, clock={"t": 1000.0})
+        sig, tries, first = auto_reply._STOP_RECHECKS["Notify Bot"]
+        self.assertEqual(first, 1000.0 + auto_reply.STOP_SIG_MIN_INTERVAL)                        # 第一次沒讀到的時間，不是最後一次
+        self.assertGreater(tries, 1)
+
+    def test_the_stop_check_returns_none_not_false_when_the_bubble_may_not_be_drawn(self):
+        with mock.patch.object(auto_reply, "find_target_chat_window", return_value=[(77, "Notify Bot", "Qt", True)]), \
+             mock.patch.object(auto_reply.time, "sleep") as nap, \
+             mock.patch.object(auto_reply.win32gui, "GetForegroundWindow", return_value=77), \
+             mock.patch.object(auto_reply.win32gui, "GetWindowText", return_value="Notify Bot"), \
+             mock.patch.object(auto_reply, "last_own_message_has_text", return_value=None) as rd, \
+             mock.patch.object(auto_reply, "log_v") as log:
+            self.assertIsNone(auto_reply._chat_has_stop_command("Notify Bot", "結束長輩圖機器人", attempts=1))
+        self.assertEqual(rd.call_count, 1)                                        # 重讀只讀一次
+        nap.assert_not_called()                                                   # 而且不睡
+        log.assert_not_called()                                                   # 也不重複印「待確認」
 
     def test_check_stop_command_raises_when_own_command_found(self):
         self._reset_stop_state()
@@ -3660,11 +3887,11 @@ class TestLineGrandmaBotCore(unittest.TestCase):
         calls = self._run_stop_rounds([(1, "a", "b")], windows=wins[:1], check=True)
         self.assertEqual(calls, [])
 
-    def _run_chat_has_stop(self, *, fg_hwnd=77, own=True, found=True, window=True):
+    def _run_chat_has_stop(self, *, fg_hwnd=77, own=True, found=True, window=True, title="Notify Bot"):
         with mock.patch.object(auto_reply, "find_target_chat_window", return_value=[(77, "Notify Bot", "Qt", True)] if window else []), \
              mock.patch.object(auto_reply.time, "sleep"), \
              mock.patch.object(auto_reply.win32gui, "GetForegroundWindow", return_value=fg_hwnd), \
-             mock.patch.object(auto_reply.win32gui, "GetWindowText", return_value="Notify Bot"), \
+             mock.patch.object(auto_reply.win32gui, "GetWindowText", return_value=title), \
              mock.patch.object(auto_reply, "verify_message_sent_to_chat", return_value=own) as verify, \
              mock.patch.object(auto_reply, "last_own_message_has_text", return_value=found) as rd, \
              mock.patch.object(auto_reply, "log_v"):
@@ -3673,12 +3900,14 @@ class TestLineGrandmaBotCore(unittest.TestCase):
 
     def test_chat_has_stop_command_cases(self):
         self.assertEqual(self._run_chat_has_stop(), (True, 1, 1))
-        self.assertEqual(self._run_chat_has_stop(found=False), (False, 0, 1))        # 沒有指令：不確認位置，視窗完全不動
+        self.assertEqual(self._run_chat_has_stop(found=False), (None, 0, 1))         # 沒有指令：不確認位置，視窗完全不動；可能只是氣泡還沒畫好，所以是「稍後再讀」
         self.assertEqual(self._run_chat_has_stop(window=False), (False, 0, 0))       # 找不到聊天室視窗
-        self.assertEqual(self._run_chat_has_stop(fg_hwnd=5), (False, 0, 0))          # 視窗不在前景：不搶焦點、不檢查
+        self.assertEqual(self._run_chat_has_stop(fg_hwnd=5), (None, 0, 0))           # 視窗不在前景：不搶焦點、不檢查 (可能剛好切走，稍後再說)
         self.assertEqual(self._run_chat_has_stop(own=False), (False, 1, 1))          # 有指令但不是最後一則 (下面有官方帳號推來的新訊息)
+        self.assertEqual(self._run_chat_has_stop(title="Notify Bot (3)"), (False, 0, 0))   # 標題對不上 (帶了未讀數)：持續的狀況，重讀也不會變，不浪費次數
+        self.assertEqual(self._run_chat_has_stop(fg_hwnd=5, title="Notify Bot (3)"), (None, 0, 0))   # 又失焦又標題不符：先判斷失焦 (稍後再說)
         res, verify, reads = self._run_chat_has_stop(found=None)                      # 讀不出字：重試後不停止
-        self.assertEqual((res, verify, reads), (False, 0, auto_reply.STOP_READ_ATTEMPTS))
+        self.assertEqual((res, verify, reads), (None, 0, auto_reply.STOP_READ_ATTEMPTS))
 
     def _own_bubble_shot(self, bubble_color=(141, 224, 85)):
         from PIL import Image, ImageDraw
