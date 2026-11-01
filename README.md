@@ -1,6 +1,6 @@
 # LINE 長輩圖智慧自動回覆機器人 (line-grandma-bot)
 
-[![Version](https://img.shields.io/badge/version-2.8.0-blue.svg)](auto_reply.py)
+[![Version](https://img.shields.io/badge/version-2.8.1-blue.svg)](auto_reply.py)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D6.svg)](https://microsoft.com)
 [![Python](https://img.shields.io/badge/python-3.10%2B-green.svg)](https://python.org)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey.svg)](LICENSE)
@@ -49,7 +49,7 @@ line-grandma-bot/
 ├── image_kind.py        # 由圖上文字判斷性質：節日、時段問候、平安叮嚀、祝福鼓勵、心靈雞湯；競選圖一律不回
 ├── image_library.py     # 圖庫性質索引、挑圖規則、沒庫存時立即上網抓圖
 ├── reply_budget.py      # 每個聊天室每天的回覆次數上限
-├── auto_reply.py        # 核心自動回覆常駐程式 (v2.8.0)
+├── auto_reply.py        # 核心自動回覆常駐程式 (v2.8.1)
 ├── crawl_images.py      # 台塑貼圖酷長輩圖抓取與過期清理模組
 ├── config.example.json  # 設定檔範本
 ├── config.json          # 個人實際設定檔 (已列入 .gitignore 保護隱私)
@@ -221,6 +221,9 @@ python auto_reply.py --unbind "媽媽"
 ---
 
 ## 📝 版本異動紀錄 (Changelog)
+
+### [v2.8.1] - 2026-11-01
+- **[安全隔離] 紀錄節流**：多個未知快取頻道同時有動靜時，這則訊息每個輪詢週期都會重複（每秒數次），把畫面與 Notify Bot 的推播洗版。現在相同內容（數字視為相同，例如「102.8s」與「103.8s」）60 秒內只印一次、只推播一次，下次印出時註明「其間略過 N 次相同訊息」。其他訊息不受影響；安全判斷本身（拒絕自動綁定）完全沒有改動。
 
 ### [v2.8.0] - 2026-11-01
 #### 不必事先把聊天室開成獨立視窗

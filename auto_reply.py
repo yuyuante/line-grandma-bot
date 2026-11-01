@@ -47,7 +47,7 @@ from crawl_images import (crawl_grandma_images, clean_expired_images, retire_ima
                           download_and_validate_image, get_existing_md5s, build_candidate_urls,
                           build_candidates, normalize_sources)
 
-VERSION = "2.8.0"
+VERSION = "2.8.1"
 
 # 0. 全系統單一執行個體鎖 (Windows Named Mutex)，防止重複啟動繞過斷路器
 _app_mutex_handle = None
@@ -86,8 +86,32 @@ logging.basicConfig(
     datefmt="%H:%M:%S"
 )
 
+ISOLATION_LOG_INTERVAL = 60.0              # 相同的 [安全隔離] 訊息最短間隔 (秒)
+_isolation_last = {}                       # 訊息樣式 -> (上次印出的 monotonic 時間, 之後被略過的次數)
+
+
+def throttle_isolation(msg, now=None):
+    """
+    [安全隔離] 訊息每個輪詢週期都可能重複 (每秒數次)，相同內容 (數字視為相同) 在間隔內只印一次。
+    回傳要印出的文字，被節流就回傳 None；重新印出時註明中間略過幾次。其他訊息原樣回傳。
+    """
+    if not msg.lstrip("\n").startswith("[安全隔離]"):
+        return msg
+    now = time.monotonic() if now is None else now
+    key = re.sub(r"[\d.+\-:]+", "#", msg)
+    last, skipped = _isolation_last.get(key, (None, 0))
+    if last is not None and now - last < ISOLATION_LOG_INTERVAL:
+        _isolation_last[key] = (last, skipped + 1)
+        return None
+    _isolation_last[key] = (now, 0)
+    return f"{msg} (其間略過 {skipped} 次相同訊息)" if skipped else msg
+
+
 def log_v(msg):
     """印出帶有時間戳記與版本號碼的訊息"""
+    msg = throttle_isolation(msg)
+    if msg is None:
+        return
     now = time.strftime("%H:%M:%S")
     prefix = ""
     if msg.startswith("\n"):
