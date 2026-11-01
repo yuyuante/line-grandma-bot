@@ -3772,6 +3772,49 @@ class TestLineGrandmaBotCore(unittest.TestCase):
             self.assertEqual((x_start, x_end, blocks), (216, 376, [(70, 40)]))
             self.assertIsNone(auto_reply._left_message_blocks(1, side="left"))   # 左側沒有內容：自己發的不算對方訊息
 
+    def _blocks_for(self, shot, window=(0, 0, 400, 300)):
+        with mock.patch.object(auto_reply.win32gui, "IsWindow", return_value=True),              mock.patch.object(auto_reply.win32gui, "IsIconic", return_value=False),              mock.patch.object(auto_reply.win32gui, "IsWindowVisible", return_value=True),              mock.patch.object(auto_reply, "get_window_true_rect", return_value=window),              mock.patch.object(auto_reply.ctypes.windll.user32, "GetDpiForWindow", return_value=96),              mock.patch.object(auto_reply.ImageGrab, "grab", return_value=shot):
+            return auto_reply._left_message_blocks(1, side="left"), auto_reply.last_left_message_is_media(1)
+
+    def test_left_message_blocks_background_survives_a_crop_that_starts_inside_a_long_bubble(self):
+        # 真機：窄視窗，截圖頂端剛好落在機器人的長氣泡中間，取樣點全是氣泡的灰色
+        from PIL import Image, ImageDraw
+        shot = Image.new("RGB", (400, 101), (255, 255, 255))
+        draw = ImageDraw.Draw(shot)
+        draw.rectangle([60, 0, 330, 45], fill=(238, 238, 238))        # 蓋住 30%~70% 取樣點的長氣泡
+        draw.rectangle([90, 62, 160, 98], fill=(238, 238, 238))       # 最底部是一則短文字氣泡
+        draw.text((105, 72), "ab", fill=(20, 20, 20))
+        found, is_media = self._blocks_for(shot)
+        self.assertIsNotNone(found)
+        self.assertEqual(found[5][0], (98, 62))                                      # 最底部區塊就是那則短氣泡，不是整片白色背景
+        self.assertIs(is_media, False)                                               # 文字氣泡：不是照片或貼圖
+
+    def test_left_message_blocks_still_finds_a_photo_when_the_top_samples_are_background(self):
+        from PIL import Image
+        import random
+        rnd = random.Random(3)
+        shot = Image.new("RGB", (400, 101), (255, 255, 255))
+        for x in range(90, 300):
+            for y in range(20, 98):
+                shot.putpixel((x, y), (rnd.randrange(256), rnd.randrange(256), rnd.randrange(256)))
+        found, is_media = self._blocks_for(shot)
+        bottom, top = found[5][0]
+        self.assertEqual(top, 20)
+        self.assertGreaterEqual(bottom, 90)                                          # 隨機像素偶爾接近底色，最後幾列可能被算成空白
+        self.assertIs(is_media, True)
+
+    def test_left_message_blocks_ignores_an_inconsistent_right_edge(self):
+        # 右緣內側不是一致的底色 (例如被圖片蓋住) 就不採用，維持原本以上方取樣點估計的做法
+        from PIL import Image, ImageDraw
+        shot = Image.new("RGB", (400, 101), (255, 255, 255))
+        draw = ImageDraw.Draw(shot)
+        stripes = [(200, 40, 40), (0, 0, 0), (40, 200, 40), (40, 40, 200)]
+        for i, y in enumerate(range(0, 101, 8)):
+            draw.rectangle([370, y, 399, y + 7], fill=stripes[i % 4])
+        draw.rectangle([90, 62, 160, 98], fill=(238, 238, 238))
+        found, _ = self._blocks_for(shot)
+        self.assertEqual(found[5][0], (98, 62))
+
     # ---------- 視窗太窄時暫時最大化再判斷左右 ----------
     def _run_wide_judgment(self, *, placement=1, width=585, dpi=144, iconic=False, body_error=False, placement_error=False):
         shows = []

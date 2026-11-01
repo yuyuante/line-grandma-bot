@@ -47,7 +47,7 @@ from crawl_images import (crawl_grandma_images, clean_expired_images, retire_ima
                           download_and_validate_image, get_existing_md5s, build_candidate_urls,
                           build_candidates, normalize_sources)
 
-VERSION = "2.9.1"
+VERSION = "2.10.0"
 
 # 0. 全系統單一執行個體鎖 (Windows Named Mutex)，防止重複啟動繞過斷路器
 _app_mutex_handle = None
@@ -194,6 +194,8 @@ DEFAULT_CONFIG = {
     "instant_crawl_max_downloads": 40,  # 圖庫沒有合適的圖時，立即上網抓圖最多下載幾張 (節日圖加倍)
     "image_sources": [],                # 圖庫來源 (網址範本、編號範圍、選填時段類別，見 crawl_images.py)；空白 = 預設的 Formosa 貼圖酷每日問候攝影與插畫
     "require_grandma_image": True,      # 對方傳來的圖要先辨識為長輩圖才回覆；貼圖、生活照、無法辨識的一律不理會
+    "reply_to_text": True,              # 對方傳來的「短文字訊息」(例如早安、中秋節快樂) 屬於本專案處理的性質時，也回同性質但不同張的圖 (只限一對一；讀文字要把聊天視窗帶到前景)
+    "text_reply_max_chars": 30,         # 文字訊息超過這麼多字 (去掉空白與標點) 就當作一般聊天，不回圖
     "auto_neutral_images": False,       # 【開發中，預設關閉】沒有符合目前時段的圖時，用 OCR 讀得到字、但沒有問候語與節慶字樣的圖代替。實測 OCR 常讀不出藝術字的問候語，開啟會把早安圖誤判成無時段
     "group_targets": [],                # 要回覆的群組名單 (名稱同 targets 的寫法，不含人數)；群組另有更保守的規則，只能手動綁定快取頻道 (--bind-view)
     "group_max_replies_per_day": 1,     # 每個群組每天最多回覆幾次 (0 = 不限次數)
@@ -267,7 +269,7 @@ def load_config():
                 except Exception:
                     pass
         for k in ("replace_after_send", "collect_incoming_images", "auto_crawl_images", "close_window_after_send", "time_aware_images",
-                  "require_grandma_image", "auto_neutral_images", "auto_open_chat_window"):
+                  "require_grandma_image", "auto_neutral_images", "auto_open_chat_window", "reply_to_text"):
             if k in cfg and isinstance(cfg[k], bool):
                 sanitized[k] = cfg[k]
         if isinstance(cfg.get("stop_command"), str) and cfg["stop_command"].strip():
@@ -285,7 +287,7 @@ def load_config():
                     if msg not in _WARNED_ONCE:
                         _WARNED_ONCE.add(msg)            # 主迴圈每秒讀一次設定，同一則警告只印一次
                         logging.warning(f"image_sources {msg}")
-        for k, minimum in (("max_replies_per_day", 0), ("max_image_pool", 1), ("instant_crawl_max_downloads", 1)):
+        for k, minimum in (("max_replies_per_day", 0), ("max_image_pool", 1), ("instant_crawl_max_downloads", 1), ("text_reply_max_chars", 1)):
             if k in cfg:
                 try:
                     sanitized[k] = max(minimum, int(cfg[k]))
@@ -730,6 +732,47 @@ def recognize_incoming_image(triggered_file, chat_hwnd=None):
     except Exception:
         pass
     return None, None, ""
+
+TEXT_CROP_RIGHT_RATIO = 0.9     # 長文字氣泡可以很寬，右界取視窗寬度的這個比例 (氣泡右外側的時間 clean_text 會去掉)
+
+def _incoming_text_crop(chat_hwnd):
+    """截取聊天室最底部左側 (對方) 的文字氣泡；視窗縮小、被遮住、太窄、找不到內容回傳 None"""
+    found = _left_message_blocks(chat_hwnd, side="left")
+    if found is None:
+        return None
+    shot, scale, x_start, _x_end, _is_content, blocks = found
+    bottom, top = blocks[0]
+    pad = int(4 * scale)
+    left = x_start                              # 區塊取樣帶的起點 (56px)：已避開頭像 (到約 50px)，氣泡從約 64px 開始
+    right = int(shot.width * TEXT_CROP_RIGHT_RATIO)
+    if right - left < int(40 * scale):
+        return None
+    return shot.crop((left, max(0, top - pad), right, min(shot.height, bottom + pad + 1)))
+
+def recognize_incoming_text(chat_hwnd, max_chars=image_kind.TEXT_MESSAGE_MAX_CHARS):
+    """
+    讀對方傳來的最後一則文字訊息，回傳 (狀態, 性質, 文字)：True (短訊息且辨識得出性質)、
+    False (太長、不是問候或祝福、競選相關、讀不到字)、None (暫時無法判斷：視窗不在前景、截圖失敗、OCR 暫時不能用)。
+    只在視窗是前景時截圖 (視窗被別的視窗蓋住時截到的是別人的畫面)。
+    """
+    try:
+        if not (chat_hwnd is not None and win32gui.IsWindow(chat_hwnd) and not win32gui.IsIconic(chat_hwnd)
+                and win32gui.IsWindowVisible(chat_hwnd) and win32gui.GetForegroundWindow() == chat_hwnd):
+            return None, None, ""
+        crop = _incoming_text_crop(chat_hwnd)
+        if crop is None:
+            return None, None, ""
+        text = image_library.clean_text(ocr_text(crop))
+        kind = image_kind.classify_message(text, max_chars)
+        if kind is None and 0 < image_kind.message_length(text) <= max_chars:
+            # 小字：放大一倍再讀一次 (只有短訊息才值得再讀；已經太長或根本沒字就不必)
+            bigger = image_library.clean_text(ocr_text(crop.resize((crop.width * 2, crop.height * 2), Image.LANCZOS)))
+            retry_kind = image_kind.classify_message(bigger, max_chars)
+            if retry_kind is not None:
+                text, kind = bigger, retry_kind
+    except Exception:
+        return None, None, ""
+    return kind is not None, kind, text
 
 def _skip_not_grandma(target_name, triggered_file, config, incoming_text=""):
     """略過不是長輩圖 (或辨識不出來、或是競選圖) 的來訊：記下對方傳過這張 (百輪內不回送給本人)，回傳結果代碼"""
@@ -2620,6 +2663,15 @@ def _left_message_blocks(chat_hwnd, side="left"):
 
     pts = [shot.getpixel((int(w * fx), y)) for fx in (0.3, 0.4, 0.5, 0.6, 0.7) for y in (10, 30) if y < crop_h]
     bg = tuple(sorted(c[i] for c in pts)[len(pts) // 2] for i in range(3))
+    # 截圖頂端剛好落在某個長氣泡中間時 (窄視窗常見)，上面的取樣點會把氣泡的灰色當成背景，整片白色背景反而變成「內容」。
+    # 氣泡不會貼到視窗右緣 (自己的訊息右緣約留 15px)，右緣內側的窄帶 (避開最外側的捲動軸) 一定是聊天背景，取得出一致的顏色就優先用它
+    edge_pts = [shot.getpixel((x, y)) for x in (w - int(k * scale) for k in (9, 11, 13)) if 0 <= x < shot.width
+                for y in range(5, crop_h, 25)]
+    if len(edge_pts) >= 6:
+        edge_bg = tuple(sorted(c[i] for c in edge_pts)[len(edge_pts) // 2] for i in range(3))
+        agree = sum(1 for c in edge_pts if sum(abs(c[i] - edge_bg[i]) for i in range(3)) <= 12)
+        if agree / len(edge_pts) >= 0.75:
+            bg = edge_bg
 
     def is_content(px):
         return (abs(px[0] - bg[0]) + abs(px[1] - bg[1]) + abs(px[2] - bg[2])) > 30
@@ -3154,7 +3206,7 @@ def choose_reply_image(target_name, incoming_kind, incoming_text, config):
         library = image_library.scan_library(abs_dir, KIND_INDEX, log=log_v)     # 抓的過程中留下的庫存，下一個池子可能用得到
     return None
 
-def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_file=None):
+def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_file=None, text_trigger=False):
     """執行長輩圖發送"""
     global last_global_reply_time
     # 每日上限：每個聊天室一天最多回覆 max_replies_per_day 次 (本機午夜重置，只計實際送出的)
@@ -3168,8 +3220,11 @@ def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_f
 
     # 識別關卡 (Fail-Closed)：對方傳來的必須是辨識得出性質的長輩圖才回。貼圖、生活照、辨識不出來的、沒有圖可驗證的 (例如只傳文字) 一律不理會
     deferred_identify = False
+    deferred_text = False
     incoming_kind, incoming_text = None, ""
-    if config.get("require_grandma_image", True):
+    if text_trigger and config.get("reply_to_text", True) and config.get("require_grandma_image", True) and not is_group_target(target_name):
+        deferred_text = deferred_identify = True      # 文字訊息：讀字要視窗在前景，等視窗帶到前景再辨識 (群組不適用)
+    elif config.get("require_grandma_image", True):
         early = find_target_chat_window(target_name)
         state, incoming_kind, incoming_text = recognize_incoming_image(triggered_file, early[0][0] if early else None)
         if state is False:
@@ -3198,7 +3253,7 @@ def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_f
             return "SKIPPED_NO_IMAGE"
         log_v(f" -> 挑選回覆圖片: {os.path.basename(selected_image)}")
     else:
-        log_v(" -> 對方那張圖的性質等視窗在前景時再辨識。")
+        log_v(" -> 對方那則文字的性質等視窗在前景時再辨識。" if deferred_text else " -> 對方那張圖的性質等視窗在前景時再辨識。")
 
     # 隨機延遲時間 (避免固定規律被看穿是機器人)
     min_d = max(1, config.get("min_delay_seconds", 5))
@@ -3263,20 +3318,42 @@ def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_f
         return "NOT_SENT"
 
     # 訊息類型核驗 (Fail-Closed)：對方最後一則若只是文字氣泡，不需回應 (trigger_mode="all" 時文字也要回，不套用)
-    if config.get("trigger_mode", "photo_and_sticker") != "all":
+    if config.get("trigger_mode", "photo_and_sticker") != "all" or deferred_text:
         is_media = _media_type_with_retry(chat_hwnd, expect_media=triggered_file is not None)
         if is_media is None:
             # 重試後仍無法判斷 (截圖失敗、視窗被遮住等)：不丟棄，走既有重試流程
             log_v(f"[訊息類型待確認]「{target_name}」暫時無法判斷最後一則訊息類型，本次不發送，稍後重試。")
             _minimize_if_configured(chat_hwnd, config)
             return "NOT_SENT"
-        if not is_media:
+        if deferred_text and is_media:
+            # 被「文字」觸發，但最底部其實是圖片或貼圖：那是圖片快取路徑的事，這裡不當文字處理
+            log_v(f"[文字訊息略過]「{target_name}」最後一則訊息是圖片或貼圖，不是文字。")
+            _minimize_if_configured(chat_hwnd, config)
+            return "SKIPPED_TEXT"
+        if not is_media and not deferred_text:
             log_v(f"[文字訊息略過]「{target_name}」最後一則訊息為文字，不需回應。")
             _minimize_if_configured(chat_hwnd, config)
             return "SKIPPED_TEXT"
 
     # 延後的識別：視窗此時已在前景，用截圖辨識對方那張圖的性質 (Fail-Closed)，再挑回覆圖
-    if deferred_identify:
+    if deferred_text:
+        state, incoming_kind, incoming_text = recognize_incoming_text(chat_hwnd, config.get("text_reply_max_chars", image_kind.TEXT_MESSAGE_MAX_CHARS))
+        if state is None:
+            log_v(f"[文字識別待確認]「{target_name}」暫時無法讀取對方傳來的文字，本次不發送，稍後重試。")
+            _minimize_if_configured(chat_hwnd, config)
+            return "NOT_SENT"
+        if not state:
+            log_v(f"[文字訊息略過]「{target_name}」最後一則文字不是短問候或祝福 (太長、不是問候、競選相關或讀不到字)，不回覆。")
+            _minimize_if_configured(chat_hwnd, config)
+            return "SKIPPED_TEXT"
+        log_v(f" -> [文字識別]「{target_name}」傳來的文字通過識別，性質：{incoming_kind.label}。")
+        selected_image = choose_reply_image(target_name, incoming_kind, incoming_text, config)
+        if not selected_image:
+            log_v(f"[無合適圖片]「{target_name}」傳來 {incoming_kind.label} 的文字，圖庫與即時抓圖都找不到合適的回覆圖，本次不回覆。")
+            _minimize_if_configured(chat_hwnd, config)
+            return "SKIPPED_NO_IMAGE"
+        log_v(f" -> 挑選回覆圖片: {os.path.basename(selected_image)}")
+    elif deferred_identify:
         state, incoming_kind, incoming_text = recognize_incoming_image(triggered_file, chat_hwnd)
         if state is None:
             log_v(f"[長輩圖識別待確認]「{target_name}」暫時無法識別對方傳來的圖，本次不發送，稍後重試。")
@@ -3417,6 +3494,7 @@ def check_for_incoming_messages(config):
     # 0. 超前檢查：發送失敗之暫時重試佇列 (保證照片與貼圖失敗後在冷卻期過後能精確重試)
     target_to_reply = None
     new_image_found = None
+    text_trigger = False
     for target in targets:
         if target in PENDING_RETRY_MEDIA:
             last_time = last_reply_times.get(target, 0)
@@ -3493,6 +3571,13 @@ def check_for_incoming_messages(config):
                             if current_time - last_time >= cooldown and current_time - LAST_SENT_TIME_BY_TARGET.get(target, 0) >= cooldown:
                                 log_v(f" -> [文字訊息觸發]「{target}」未讀數增加 (all 模式)，準備自動回覆！")
                                 target_to_reply = target
+                                break
+                        elif config.get("reply_to_text", True) and config.get("require_grandma_image", True):
+                            # 文字訊息沒有快取檔，只能靠未讀數增加；內容要等視窗帶到前景才讀得到，是不是問候由送出流程判斷
+                            if current_time - last_time >= cooldown and current_time - LAST_SENT_TIME_BY_TARGET.get(target, 0) >= 5:
+                                log_v(f" -> [文字訊息觸發]「{target}」未讀數增加且沒有新的圖片或貼圖，準備讀取最後一則文字！")
+                                target_to_reply = target
+                                text_trigger = True
                                 break
                         else:
                             # 未讀遞增但無對應新媒體快取：若正處於失敗重試中，嚴格不推進已處理基準線！
@@ -3775,7 +3860,7 @@ def check_for_incoming_messages(config):
 
         log_v(f" -> 經安全驗證確認，觸發自動回覆長輩圖給:「{target_to_reply}」")
         prev_reply_time = last_reply_times.get(target_to_reply, 0)
-        send_result = send_grandma_image(target_to_reply, config, triggered_file=new_image_found)
+        send_result = send_grandma_image(target_to_reply, config, triggered_file=new_image_found, text_trigger=text_trigger)
         # 對方只傳文字而略過時沒有送出任何東西，不啟動冷卻 (避免擋住隨後真正的新圖)
         last_reply_times[target_to_reply] = prev_reply_time if send_result in SKIPPED_RESULTS else time.time()
 
@@ -4187,6 +4272,7 @@ def main():
     print(f"發送後自動汰換新圖       : {config.get('replace_after_send', True)}")
     print(f"舊圖保存期限 (TTL)       : {config.get('image_ttl_days', 7)} 天")
     print(f"防洗版冷卻 (cooldown)    : {config.get('cooldown_seconds', 30)} 秒")
+    print(f"文字訊息回圖 (reply_to_text): {'開 (一對一、' + str(config.get('text_reply_max_chars', 30)) + ' 字內)' if config.get('reply_to_text', True) else '關'}")
     print(f"回覆後安全最小化         : {config.get('close_window_after_send', True)}")
     stop_chats = config.get("stop_command_chats", [])
     print(f"停止指令                 : {'在 ' + '、'.join(stop_chats) + ' 聊天室自己發「' + config.get('stop_command', '') + '」' if stop_chats else '未啟用'}")

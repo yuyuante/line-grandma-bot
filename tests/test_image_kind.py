@@ -162,5 +162,40 @@ class TestImageKind(unittest.TestCase):
         self.assertEqual(ik.normalize_text(" 早 安\n快乐 "), "早安快樂")
 
 
+class TestClassifyMessage(unittest.TestCase):
+    def test_short_greetings_and_festivals_are_recognised(self):
+        self.assertEqual(ik.classify_message("早安！").category, "greeting")
+        self.assertEqual(ik.classify_message("早安").slots, ("morning",))
+        self.assertEqual(ik.classify_message("晚安 😴").slots, ("evening",))
+        kind = ik.classify_message("中秋節快樂")
+        self.assertEqual((kind.category, kind.festival), ("festival", ik.find_festival("中秋節快樂")))
+        self.assertEqual(ik.classify_message("平安喜樂").category, "blessing")        # 與圖片文字同一套規則
+
+    def test_ordinary_chat_is_not_recognised(self):
+        for text in ("今天吃什麼", "好的", "我到了", "", "   ", "。。。"):
+            self.assertIsNone(ik.classify_message(text), text)
+
+    def test_long_messages_are_chat_even_when_they_contain_a_greeting(self):
+        long_text = "早安，我今天早上要去市場買菜然後再去醫院看醫生順便繳水電費還要去郵局寄包裹"
+        self.assertGreater(ik.message_length(long_text), ik.TEXT_MESSAGE_MAX_CHARS)
+        self.assertIsNone(ik.classify_message(long_text))
+        self.assertIsNotNone(ik.classify_text(long_text))                               # 同樣的字當成圖上的字是認得的
+        self.assertIsNotNone(ik.classify_message(long_text, max_chars=60))               # 門檻可調
+
+    def test_length_ignores_spaces_and_punctuation_and_the_limit_is_inclusive(self):
+        self.assertEqual(ik.message_length("早 安 ！ ， 。 …"), 2)
+        text = "早安" + "祝你" * 14                                                                # 剛好 30 字
+        self.assertEqual(ik.message_length(text), 30)
+        self.assertIsNotNone(ik.classify_message(text))
+        self.assertIsNone(ik.classify_message(text + "安"))
+
+    def test_campaign_text_is_never_answered(self):
+        for text in ("支持李大偉競選連任", "請投票給候選人", "早安 請支持我們的議員"):
+            self.assertIsNone(ik.classify_message(text), text)
+
+    def test_simplified_characters_from_ocr_are_normalised(self):
+        self.assertEqual(ik.classify_message("中秋节快乐").category, "festival")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -133,6 +133,61 @@ class TestRecognizeScreenshot(_Base):
         self.assertEqual(self.run_shot(300, ocr_error=RuntimeError("down")), (None, None, ""))   # OCR 暫時不能用：等下次
 
 
+class TestRecognizeIncomingText(_Base):
+    def run_text(self, ocr, front=True, crop="ok", max_chars=30, iconic=False):
+        from PIL import Image
+        self.ocr_mock = mock.Mock(side_effect=ocr if isinstance(ocr, list) else [ocr] * 4)
+        image = Image.new("RGB", (300, 60), (230, 230, 230)) if crop == "ok" else None
+        patches = [
+            mock.patch.object(auto_reply, "_incoming_text_crop", return_value=image),
+            mock.patch.object(auto_reply.win32gui, "IsWindow", return_value=True),
+            mock.patch.object(auto_reply.win32gui, "IsIconic", return_value=iconic),
+            mock.patch.object(auto_reply.win32gui, "IsWindowVisible", return_value=True),
+            mock.patch.object(auto_reply.win32gui, "GetForegroundWindow", return_value=CHAT if front else CHAT + 1),
+            mock.patch.object(auto_reply, "ocr_text", self.ocr_mock),
+        ]
+        with contextlib.ExitStack() as stack:
+            for patcher in patches:
+                stack.enter_context(patcher)
+            return auto_reply.recognize_incoming_text(CHAT, max_chars)
+
+    def test_short_greeting_is_recognised_and_ui_text_is_cleaned(self):
+        state, kind, text = self.run_text("早安！ 上午 12:05")                              # 氣泡右外側的時間會一併被截到
+        self.assertEqual((state, kind), (True, ik.classify_message("早安")))
+        self.assertNotIn("12:05", text)
+        self.assertEqual(self.run_text("中秋節快樂")[:2], (True, MID_AUTUMN))
+
+    def test_ordinary_chat_long_text_and_campaign_text_are_not_answered(self):
+        self.assertEqual(self.run_text("今天吃什麼")[:2], (False, None))
+        self.assertEqual(self.run_text("早安，我今天早上要去市場買菜然後再去醫院看醫生順便繳水電費還要去郵局寄包裹")[:2], (False, None))
+        self.assertEqual(self.run_text("早安 請支持我們的議員")[:2], (False, None))
+        self.assertEqual(self.run_text("")[:2], (False, None))
+
+    def test_short_text_that_was_not_recognised_is_read_a_second_time_at_double_size(self):
+        self.assertEqual(self.run_text(["平", "平安喜樂"])[:2], (True, ik.classify_message("平安喜樂")))       # 小字第一次讀漏，放大後讀到
+        self.assertEqual(self.ocr_mock.call_count, 2)
+        self.assertEqual(self.ocr_mock.call_args.args[0].size, (600, 120))                                      # 第二次是放大一倍的截圖
+        self.assertEqual(self.run_text(["今天吃什麼", "還是不是問候"])[:2], (False, None))
+        self.assertEqual(self.ocr_mock.call_count, 2)
+
+    def test_text_that_is_empty_or_too_long_is_not_read_again(self):
+        self.run_text("")
+        self.assertEqual(self.ocr_mock.call_count, 1)
+        self.run_text("早安，我今天早上要去市場買菜然後再去醫院看醫生順便繳水電費還要去郵局寄包裹")
+        self.assertEqual(self.ocr_mock.call_count, 1)
+
+    def test_cannot_tell_when_the_window_is_not_in_front_or_the_screen_cannot_be_read(self):
+        self.assertEqual(self.run_text("早安", front=False), (None, None, ""))
+        self.assertEqual(self.ocr_mock.call_count, 0)                                          # 視窗不在前景時連 OCR 都不做
+        self.assertEqual(self.run_text("早安", iconic=True), (None, None, ""))
+        self.assertEqual(self.run_text("早安", crop=None), (None, None, ""))                    # 截不到
+        self.assertEqual(self.run_text([RuntimeError("ocr down")]), (None, None, ""))          # OCR 暫時不能用：等下次
+
+    def test_custom_length_limit(self):
+        self.assertEqual(self.run_text("早安祝你有美好的一天", max_chars=5)[:2], (False, None))
+        self.assertEqual(self.run_text("早安祝你有美好的一天", max_chars=20)[0], True)
+
+
 class TestRecognizeScreenshotWaitsForLoading(_Base):
     def shots(self, widths, text="中秋節快樂"):
         from PIL import Image
@@ -372,7 +427,8 @@ class TestSendFlow(_Base):
         self.slot = "morning"
 
     def run_flow(self, *, recognize=((True, MID_AUTUMN, "中秋節快樂"),), choose=None, attach=True, config=None,
-                 triggered=True, slots=None, find_results=None, opener=False, title="小明"):
+                 triggered=True, slots=None, find_results=None, opener=False, title="小明",
+                 text_trigger=False, text_result=(True, MORNING, "早安"), media_result=True, target="小明", self_last=False):
         mocks = {}
         minimized = []
         patches = {
@@ -393,8 +449,9 @@ class TestSendFlow(_Base):
             "title": mock.patch.object(auto_reply.win32gui, "GetWindowText", return_value=title),
             "activate": mock.patch.object(auto_reply, "activate_window"),
             "focus": mock.patch.object(auto_reply, "focus_chat_input", return_value=True),
-            "self": mock.patch.object(auto_reply, "is_last_message_from_self_in_chat", return_value=False),
-            "media": mock.patch.object(auto_reply, "_media_type_with_retry", return_value=True),
+            "self": mock.patch.object(auto_reply, "is_last_message_from_self_in_chat", return_value=self_last),
+            "media": mock.patch.object(auto_reply, "_media_type_with_retry", return_value=media_result),
+            "recognize_text": mock.patch.object(auto_reply, "recognize_incoming_text", return_value=text_result),
             "cache_dir": mock.patch.object(auto_reply, "get_active_line_cache_dir", return_value="cache"),
             "cache_files": mock.patch.object(auto_reply, "get_all_cache_files", return_value={}),
             "chat_map": mock.patch.object(auto_reply, "load_chat_dirs_map", return_value={}),
@@ -411,7 +468,7 @@ class TestSendFlow(_Base):
                 mocks[name] = stack.enter_context(patcher)
             cfg = {"min_delay_seconds": 1, "max_delay_seconds": 1}
             cfg.update(config or {})
-            result = auto_reply.send_grandma_image("小明", cfg, triggered_file=self.incoming if triggered else None)
+            result = auto_reply.send_grandma_image(target, cfg, triggered_file=self.incoming if triggered else None, text_trigger=text_trigger)
         return result, mocks, minimized
 
     def today(self):
@@ -442,6 +499,91 @@ class TestSendFlow(_Base):
         self.assertEqual(self.run_flow(config={"max_replies_per_day": 1})[0], "SKIPPED_DAILY_LIMIT")
         for _ in range(5):
             self.assertEqual(self.run_flow(config={"max_replies_per_day": 0})[0], "SENT_CONFIRMED")
+
+    def text_flow(self, **kw):
+        kw.setdefault("triggered", False)
+        kw.setdefault("media_result", False)               # 最底部是文字氣泡
+        return self.run_flow(text_trigger=True, **kw)
+
+    def test_short_greeting_text_gets_a_picture_of_the_same_kind(self):
+        result, m, _ = self.text_flow(text_result=(True, MID_AUTUMN, "中秋節快樂"))
+        self.assertEqual(result, "SENT_CONFIRMED")
+        args = m["choose"].call_args.args
+        self.assertEqual((args[1], args[2]), (MID_AUTUMN, "中秋節快樂"))                       # 把文字的性質交給挑圖，跟圖片同一套規則
+        m["attach"].assert_called_once_with(CHAT, self.image)
+        m["recognize"].assert_not_called()                                                     # 沒有圖可辨識
+        m["recognize_text"].assert_called_once()
+        m["media"].assert_called_once_with(CHAT, expect_media=False)
+        self.assertEqual(self.today(), 1)
+
+    def test_text_and_picture_replies_share_the_same_daily_limit(self):
+        self.assertEqual(self.text_flow()[0], "SENT_CONFIRMED")
+        self.assertEqual(self.run_flow()[0], "SENT_CONFIRMED")                                  # 圖片
+        self.assertEqual(self.text_flow()[0], "SENT_CONFIRMED")
+        self.assertEqual(self.today(), 3)
+        result, m, _ = self.text_flow()
+        self.assertEqual(result, "SKIPPED_DAILY_LIMIT")                                         # 第 4 次 (不論圖或文字) 都不回
+        m["recognize_text"].assert_not_called()
+        m["attach"].assert_not_called()
+        self.assertEqual(self.run_flow()[0], "SKIPPED_DAILY_LIMIT")
+
+    def test_text_that_is_not_a_short_greeting_is_skipped_and_not_counted(self):
+        result, m, minimized = self.text_flow(text_result=(False, None, "今天吃什麼"))
+        self.assertEqual(result, "SKIPPED_TEXT")
+        m["choose"].assert_not_called()
+        m["attach"].assert_not_called()
+        self.assertEqual(self.today(), 0)
+        self.assertEqual(minimized, [CHAT])                                                     # 看完就縮回去，不留在前景
+        self.assertIn("不是短問候或祝福", NL.join(str(c.args[0]) for c in self.log.call_args_list))
+
+    def test_text_that_cannot_be_read_yet_is_retried_later(self):
+        result, m, minimized = self.text_flow(text_result=(None, None, ""))
+        self.assertEqual(result, "NOT_SENT")
+        m["attach"].assert_not_called()
+        self.assertEqual(self.today(), 0)
+
+    def test_a_text_trigger_whose_last_message_is_really_a_picture_is_not_treated_as_text(self):
+        result, m, _ = self.text_flow(media_result=True)
+        self.assertEqual(result, "SKIPPED_TEXT")
+        m["recognize_text"].assert_not_called()
+        m["attach"].assert_not_called()
+
+    def test_text_trigger_still_verifies_the_message_type_in_trigger_mode_all(self):
+        result, m, _ = self.text_flow(config={"trigger_mode": "all"}, media_result=True)       # all 模式不套用「文字略過」，但文字流程自己要確認
+        self.assertEqual(result, "SKIPPED_TEXT")
+        m["recognize_text"].assert_not_called()
+        result, m, _ = self.text_flow(config={"trigger_mode": "all"})
+        self.assertEqual(result, "SENT_CONFIRMED")
+
+    def test_text_replies_never_send_when_the_last_message_is_our_own(self):
+        result, m, _ = self.text_flow(self_last=True)
+        self.assertEqual(result, "NOT_SENT")
+        m["attach"].assert_not_called()
+
+    def test_text_trigger_needs_no_bound_channel(self):
+        # 對方只傳文字、從沒傳過圖：chat_dirs.json 沒有他，文字照樣能回
+        result, m, _ = self.text_flow()
+        self.assertEqual(result, "SENT_CONFIRMED")
+        self.assertEqual(m["chat_map"].return_value, {})
+
+    def test_switch_off_and_requirements_keep_the_old_behaviour(self):
+        result, m, _ = self.text_flow(config={"reply_to_text": False}, recognize=[(False, None, "")])
+        self.assertEqual(result, "SKIPPED_NOT_GRANDMA")                                        # 關掉：沒有觸發檔 = 不是長輩圖
+        m["recognize_text"].assert_not_called()
+        result, m, _ = self.text_flow(config={"require_grandma_image": False})
+        m["recognize_text"].assert_not_called()                                                 # 沒有識別就沒有「性質」可言，不走文字流程
+
+    def test_groups_never_use_the_text_flow(self):
+        auto_reply.set_group_targets(["小明"])
+        self.addCleanup(auto_reply.set_group_targets, [])
+        result, m, _ = self.text_flow(recognize=[(False, None, "")])
+        self.assertEqual(result, "SKIPPED_NOT_GRANDMA")
+        m["recognize_text"].assert_not_called()
+        m["attach"].assert_not_called()
+
+    def test_text_length_limit_comes_from_the_config(self):
+        _, m, _ = self.text_flow(config={"text_reply_max_chars": 12})
+        self.assertEqual(m["recognize_text"].call_args.args[1], 12)
 
     def test_a_group_uses_its_own_daily_limit_which_defaults_to_one(self):
         auto_reply.set_group_targets(["小明"])
@@ -799,6 +941,98 @@ class TestDetectionReopensTheWindow(_Base):
         sent, opener = self.run_detection(window_open=True, opener_result=True)
         self.assertEqual(sent, ["小明"])
         opener.assert_not_called()
+
+
+class TestTextTrigger(_Base):
+    """偵測階段：1:1 視窗標題未讀數增加、沒有新的圖片快取 -> 文字觸發 (文字訊息沒有快取檔)"""
+
+    def run_detection(self, config_extra=None, title="小明 (2)", group=False, baseline=1, last_reply_ago=None):
+        sent = []
+        cfg = {"targets": ["小明"], "trigger_mode": "photo_and_sticker", "cooldown_seconds": 30, "min_delay_seconds": 0, "max_delay_seconds": 0}
+        cfg.update(config_extra or {})
+        windows = [(CHAT, title, "Qt", True)]
+        cache = os.path.join(self.tmp.name, "cache")
+        os.makedirs(cache, exist_ok=True)
+
+        def fake_send(target, config, **kw):
+            sent.append((target, kw))
+            return "SKIPPED_TEXT"
+
+        with mock.patch.object(auto_reply, "CHAT_MAP_PATH", os.path.join(self.tmp.name, "chat_dirs.json")), \
+             mock.patch.object(auto_reply, "get_active_line_cache_dir", return_value=cache), \
+             mock.patch.object(auto_reply, "get_all_line_windows", return_value=windows), \
+             mock.patch.object(auto_reply, "find_target_chat_window", return_value=windows), \
+             mock.patch.object(auto_reply, "update_target_window_fingerprints"), mock.patch.object(auto_reply, "check_stop_command"), \
+             mock.patch.object(auto_reply, "save_circuit_breaker_state"), mock.patch.object(auto_reply, "check_circuit_breaker", return_value=True), \
+             mock.patch.object(auto_reply, "send_grandma_image", side_effect=fake_send):
+            auto_reply.last_global_reply_time = 0.0
+            auto_reply.LAST_SENT_TIME_BY_TARGET.pop("小明", None)
+            auto_reply.PENDING_RETRY_MEDIA.pop("小明", None)
+            auto_reply.SEND_FAIL_COUNTS.pop("小明", None)
+            auto_reply.last_reply_times.pop("小明", None)
+            if last_reply_ago is not None:
+                auto_reply.last_reply_times["小明"] = self.clock[0] - last_reply_ago
+            auto_reply.LAST_PROCESSED_UNREAD["小明"] = baseline
+            auto_reply.PROCESSED_CACHE_FILES.clear()
+            auto_reply.last_seen_cache_mtime = self.clock[0] + 1000
+            auto_reply.set_group_targets(["小明"] if group else [])
+            try:
+                auto_reply.check_for_incoming_messages(cfg)
+            finally:
+                auto_reply.set_group_targets([])
+        self.addCleanup(auto_reply.LAST_PROCESSED_UNREAD.pop, "小明", None)
+        self.addCleanup(auto_reply.last_reply_times.pop, "小明", None)
+        return sent
+
+    def test_unread_increase_without_media_triggers_a_text_check(self):
+        sent = self.run_detection()
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0][0], "小明")
+        self.assertTrue(sent[0][1]["text_trigger"])
+        self.assertIsNone(sent[0][1]["triggered_file"])
+        self.assertIn("文字訊息觸發", NL.join(str(c.args[0]) for c in self.log.call_args_list))
+
+    def test_no_unread_increase_means_no_trigger(self):
+        self.assertEqual(self.run_detection(baseline=2), [])                                    # 未讀數沒變
+        self.assertEqual(self.run_detection(title="小明"), [])                                  # 沒有未讀數
+
+    def test_switch_off_keeps_the_old_silence_and_advances_the_baseline(self):
+        self.assertEqual(self.run_detection(config_extra={"reply_to_text": False}), [])
+        self.assertEqual(auto_reply.LAST_PROCESSED_UNREAD["小明"], 2)                           # 同一則文字不會一直被看
+
+    def test_without_grandma_recognition_there_is_no_kind_to_match_so_no_text_trigger(self):
+        self.assertEqual(self.run_detection(config_extra={"require_grandma_image": False}), [])
+
+    def test_cooldown_applies_to_text_triggers_too(self):
+        self.assertEqual(self.run_detection(last_reply_ago=10), [])
+        self.assertEqual(len(self.run_detection(last_reply_ago=31)), 1)
+
+    def test_groups_are_never_triggered_by_their_member_count(self):
+        self.assertEqual(self.run_detection(title="小明 (477)", group=True, baseline=476), [])
+
+    def test_trigger_mode_all_keeps_its_own_text_path(self):
+        sent = self.run_detection(config_extra={"trigger_mode": "all"})
+        self.assertEqual(len(sent), 1)
+        self.assertFalse(sent[0][1]["text_trigger"])                                            # all 模式：照舊，文字一律回 (不看內容)
+
+
+class TestConfigTextKeys(_Base):
+    def load(self, cfg):
+        path = os.path.join(self.tmp.name, "config.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False)
+        with mock.patch.object(auto_reply, "CONFIG_PATH", path):
+            return auto_reply.load_config()
+
+    def test_defaults_and_sanitising(self):
+        cfg = self.load({"targets": ["a"]})
+        self.assertEqual((cfg["reply_to_text"], cfg["text_reply_max_chars"]), (True, 30))
+        cfg = self.load({"targets": ["a"], "reply_to_text": False, "text_reply_max_chars": "12"})
+        self.assertEqual((cfg["reply_to_text"], cfg["text_reply_max_chars"]), (False, 12))
+        cfg = self.load({"targets": ["a"], "reply_to_text": "no", "text_reply_max_chars": 0})
+        self.assertEqual((cfg["reply_to_text"], cfg["text_reply_max_chars"]), (True, 1))        # 不是布林：沿用預設；字數最少 1
+        cfg = self.load({"targets": ["a"], "text_reply_max_chars": "many"})
+        self.assertEqual(cfg["text_reply_max_chars"], 30)
 
 
 class TestConfigKeys(_Base):

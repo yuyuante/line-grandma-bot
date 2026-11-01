@@ -23,6 +23,8 @@
   "instant_crawl_max_downloads": 40,
   "image_sources": [],
   "require_grandma_image": true,
+  "reply_to_text": true,
+  "text_reply_max_chars": 30,
   "notify_log": false,
   "notify_monthly_cap": 150,
   "group_targets": [],

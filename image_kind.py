@@ -175,6 +175,24 @@ def find_slots(text):
     return tuple(found)
 
 
+TEXT_MESSAGE_MAX_CHARS = 30      # 對方傳來的「文字訊息」超過這麼多字 (去掉空白與標點) 就當作一般聊天，不回圖
+
+
+def message_length(text):
+    """去掉空白與標點後的字數 (OCR 多讀到的標點、空白不影響門檻)"""
+    return len(re.sub(r"[\W_]+", "", normalize_text(text or "")))
+
+
+def classify_message(text, max_chars=TEXT_MESSAGE_MAX_CHARS):
+    """
+    對方傳來的文字訊息 (不是圖) 屬於哪一種性質：只有短訊息才算 (長篇聊天、順便提到「早安」的句子不回)，
+    其餘規則同 classify_text (含競選文字一律回 None)。認不出或太長回傳 None。
+    """
+    if message_length(text) > max_chars:
+        return None
+    return classify_text(text)
+
+
 def classify_text(text):
     """
     由 OCR 文字判斷圖的性質，回傳 ImageKind；文字空白或認不出任何性質回傳 None (呼叫端要捨棄)。
