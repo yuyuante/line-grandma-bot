@@ -1,7 +1,16 @@
+# 安裝：
+#   pip install -r requirements.txt
+#   pip install --ignore-requires-python rapidocr-onnxruntime
+# 第二行不能省：rapidocr-onnxruntime 宣告只支援 Python 3.12 以下，
+# Python 3.13 以上用 pip install -r 會因版本限制而失敗，整份安裝中斷。
+# 加 --ignore-requires-python 單獨安裝，已在 Python 3.14 實測可載入引擎。
 pywin32>=306
 pyautogui>=0.9.54
 psutil>=5.9.0
 pillow>=10.0.0
 
 uiautomation>=2.0.18
-rapidocr-onnxruntime>=1.3.0   # 離線中文 OCR (辨識圖片性質、時段、節日)；沒安裝時退回 Windows 內建 OCR，辨識率大幅下降
+
+# 離線中文 OCR (辨識圖片性質、時段、節日)；沒安裝時退回 Windows 內建 OCR，辨識率大幅下降。
+# Python 3.12 以下可直接取消下一行註解，一併由 pip install -r 安裝。
+# rapidocr-onnxruntime>=1.3.0

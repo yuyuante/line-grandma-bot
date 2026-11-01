@@ -85,7 +85,9 @@ line-grandma-bot/
 在專案根目錄開啟 PowerShell，執行：
 ```powershell
 pip install -r requirements.txt
+pip install --ignore-requires-python rapidocr-onnxruntime
 ```
+第二行安裝離線 OCR。它宣告只支援 Python 3.12 以下，Python 3.13 以上不加 `--ignore-requires-python` 會安裝失敗；沒裝時退回 Windows 內建 OCR，辨識率大幅下降。
 
 ### 4. 設定監控名單
 首次使用時，請複製 `config.example.json` 為 `config.json`：
