@@ -26,6 +26,8 @@
   "reply_to_text": true,
   "birthday_reply": "謝謝",
   "text_reply_max_chars": 30,
+  "log_to_file": true,
+  "log_keep_days": 7,
   "notify_log": false,
   "notify_monthly_cap": 150,
   "group_targets": [],

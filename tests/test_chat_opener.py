@@ -21,7 +21,7 @@ class FakeUi:
     """記錄每個動作的假 LINE 介面；螢幕內容 (截圖) 取決於目前選的分頁"""
 
     def __init__(self, *, main=MAIN, front=True, search_box=SEARCH_BOX, window_appears=True, windows_open=False,
-                 tab=1, can_select=True, narrow=False):
+                 tab=1, can_select=True, narrow=False, moves_even_when_failing=False):
         self.main = main
         self.front = front
         self.search_box = search_box
@@ -30,6 +30,7 @@ class FakeUi:
         self.tab = tab
         self.can_select = can_select
         self.narrow = narrow
+        self.moves_even_when_failing = moves_even_when_failing
         self.events = []
 
     def find_chat_window(self, name):
@@ -62,8 +63,8 @@ class FakeUi:
 
     def select_tab(self, hwnd, index):
         self.events.append(("select_tab", index))
-        if self.can_select:
-            self.tab = index
+        if self.can_select or self.moves_even_when_failing:
+            self.tab = index                                  # moves_even_when_failing：點擊其實切過去了，只是事後驗證 (底線標記) 失敗
         return self.can_select
 
     def ensure_wide(self, hwnd):
@@ -107,12 +108,12 @@ class TestFindResultRows(unittest.TestCase):
         boxes = [("理財幼幼班_Z (142)", (300, 250)), ("理財幼幼班_Z（9）", (300, 300)), ("理財幼幼班_Z(7)", (300, 350)),
                  ("理財幼幼班_Z (x)", (300, 400)), ("理財幼幼班_Z (142) 群", (300, 450)), ("理財幼幼班_Z ()", (300, 500)),
                  ("舊理財幼幼班_Z (142)", (300, 550))]
-        self.assertEqual(chat_opener.find_result_rows(boxes, "理財幼幼班_Z", min_y=200), [(300, 250), (300, 300), (300, 350)])
+        self.assertEqual(chat_opener.find_result_rows(boxes, "理財幼幼班_Z", min_y=200, allow_count=True), [(300, 250), (300, 300), (300, 350)])
 
     def test_ocr_reading_traditional_as_simplified_still_matches(self):
         # 真機：OCR 把「理財幼幼班_Z (142)」讀成「理财幼幼班_Z (142)」
         boxes = [("理财幼幼班_Z (142)", (300, 250)), ("理财幼幼班_Z", (300, 120))]
-        self.assertEqual(chat_opener.find_result_rows(boxes, "理財幼幼班_Z", min_y=200), [(300, 250)])
+        self.assertEqual(chat_opener.find_result_rows(boxes, "理財幼幼班_Z", min_y=200, allow_count=True), [(300, 250)])
 
     NAME = "東南里李武雄服務處-公用"
 
@@ -121,11 +122,11 @@ class TestFindResultRows(unittest.TestCase):
         boxes = [("东南里李武雄服務處-公用", (273, 124)),                  # 搜尋欄裡剛打的字 (在 min_y 以上)
                  ("東南里李武雄服..．（477）上午9:20", (371, 224)),
                  ("李武雄理事長傳送了圖", (320, 251))]
-        self.assertEqual(chat_opener.find_result_rows(boxes, self.NAME, min_y=151), [(371, 224)])
+        self.assertEqual(chat_opener.find_result_rows(boxes, self.NAME, min_y=151, allow_count=True), [(371, 224)])
 
     def test_full_name_may_be_followed_by_count_and_time(self):
         for text in ("東南里李武雄服務處-公用（477）上午9:20", "東南里李武雄服務處-公用 (477) 下午 3:05", "東南里李武雄服務處-公用 昨天", "東南里李武雄服務處-公用"):
-            self.assertEqual(chat_opener.find_result_rows([(text, (1, 300))], self.NAME, 0), [(1, 300)], text)
+            self.assertEqual(chat_opener.find_result_rows([(text, (1, 300))], self.NAME, 0, allow_count=True), [(1, 300)], text)
         self.assertEqual(chat_opener.find_result_rows([("Notify Bot 上午9:20", (1, 300))], "Notify Bot", 0), [(1, 300)])
 
     def test_truncated_rows_are_refused_when_they_are_not_clearly_this_chat(self):
@@ -136,19 +137,32 @@ class TestFindResultRows(unittest.TestCase):
                      "東南里李武雄服..（477）上午9:20 轉寄",             # 尾巴多了別的字
                      "東南里李武雄服..（x）上午9:20",                   # 括號裡不是數字
                      "東南里李武雄服.（477）上午9:20"):                 # 只有一個點，不是刪節號
-            self.assertEqual(chat_opener.find_result_rows([(text, (1, 300))], N, 0), [], text)
+            self.assertEqual(chat_opener.find_result_rows([(text, (1, 300))], N, 0, allow_count=True), [], text)
 
     def test_two_truncated_rows_are_ambiguous_so_nothing_is_clicked(self):
         boxes = [("東南里李武雄服..．（477）上午9:20", (1, 300)), ("東南里李武雄服..．（12）上午8:01", (1, 400))]
-        self.assertEqual(chat_opener.find_result_rows(boxes, self.NAME, 0), [])          # 另一個同前綴的聊天室也在結果裡：分不出來
-        self.assertEqual(chat_opener.find_result_rows(boxes[:1], self.NAME, 0), [(1, 300)])
+        self.assertEqual(chat_opener.find_result_rows(boxes, self.NAME, 0, allow_count=True), [])          # 另一個同前綴的聊天室也在結果裡：分不出來
+        self.assertEqual(chat_opener.find_result_rows(boxes[:1], self.NAME, 0, allow_count=True), [(1, 300)])
 
     def test_an_exact_row_wins_over_truncated_rows(self):
         boxes = [("東南里李武雄服..（5）上午9:20", (1, 300)), ("東南里李武雄服務處-公用（477）", (1, 400)), ("東南里李武雄服..（9）上午9:21", (1, 500))]
-        self.assertEqual(chat_opener.find_result_rows(boxes, self.NAME, 0), [(1, 400)])
+        self.assertEqual(chat_opener.find_result_rows(boxes, self.NAME, 0, allow_count=True), [(1, 400)])
 
     def test_rows_above_the_search_box_bottom_never_count_even_when_truncated(self):
-        self.assertEqual(chat_opener.find_result_rows([("東南里李武雄服..（477）上午9:20", (1, 100))], self.NAME, 151), [])
+        self.assertEqual(chat_opener.find_result_rows([("東南里李武雄服..（477）上午9:20", (1, 100))], self.NAME, 151, allow_count=True), [])
+
+    def test_a_one_to_one_target_never_matches_a_row_with_a_member_count(self):
+        # 「名稱 (12)」那一列是同名的群組，不是這位好友：一對一 (預設) 不接受，只有要開群組時才接受
+        boxes = [("羅毓斌 (12)", (1, 250)), ("羅毓斌（5）上午9:20", (1, 300))]
+        self.assertEqual(chat_opener.find_result_rows(boxes, "羅毓斌", 0), [])
+        self.assertEqual(chat_opener.find_result_rows(boxes, "羅毓斌", 0, allow_count=True), [(1, 250), (1, 300)])
+        both = boxes + [("羅毓斌 上午9:20", (1, 400))]
+        self.assertEqual(chat_opener.find_result_rows(both, "羅毓斌", 0), [(1, 400)])                 # 同名群組在上面也不會被點到
+
+    def test_a_truncated_one_to_one_name_may_carry_a_time_but_not_a_member_count(self):
+        name = "翁彦臻(公羽)凱基人壽/信託咨詢"
+        self.assertEqual(chat_opener.find_result_rows([("翁彦臻(公羽)凱基人..上午9:20", (1, 300))], name, 0), [(1, 300)])
+        self.assertEqual(chat_opener.find_result_rows([("翁彦臻(公羽)凱基人..（12）上午9:20", (1, 300))], name, 0), [])
 
     def test_sorted_top_down_and_empty(self):
         boxes = [("Mom", (1, 400)), ("Mom", (1, 250))]
@@ -213,8 +227,15 @@ class TestOpenChatWindow(unittest.TestCase):
         ok, logs = run(ui, {1: [ECHO], 0: [ECHO, RESULT_TOP]})
         self.assertFalse(ok)
         self.assertNotIn("double_click", ui.names())
-        self.assertEqual(ui.names().count("select_tab"), 1)                               # 沒切成功就沒有要還原的東西
+        self.assertEqual(ui.names().count("select_tab"), 2)                               # 切換 + 還原：點擊可能已經切過去、只是驗證失敗，所以一定要切回去
         self.assertTrue(any("全部" in l for l in logs))
+
+    def test_a_tab_switch_that_moved_the_tab_but_failed_verification_is_still_undone(self):
+        ui = FakeUi(tab=1, can_select=False, moves_even_when_failing=True)
+        ok, _ = run(ui, {1: [ECHO], 0: [ECHO, RESULT_TOP]})
+        self.assertFalse(ok)
+        self.assertEqual(ui.tab, 1)                                                       # 使用者原本的分頁被還原
+        self.assertEqual(ui.events[-1], ("select_tab", 1))
 
     def test_not_found_in_the_all_tab_either_still_restores_the_tab(self):
         ui = FakeUi(tab=1)

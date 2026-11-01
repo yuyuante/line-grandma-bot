@@ -481,9 +481,12 @@ class TestLineGrandmaBotCore(unittest.TestCase):
         win32gui.GetWindowText = dynamic_title
         orig_uia = auto_reply.verify_is_not_group_window_uia
         auto_reply.verify_is_not_group_window_uia = lambda hwnd: True
+        orig_root = auto_reply._root_window_at
+        auto_reply._root_window_at = lambda x, y: 5001
         try:
             self.assertTrue(auto_reply.focus_chat_input(5001, target_name="TargetUser"))
         finally:
+            auto_reply._root_window_at = orig_root
             auto_reply.verify_is_not_group_window_uia = orig_uia
             win32gui.IsWindow = orig_is_win
             win32gui.IsWindowVisible = orig_is_vis
@@ -3312,29 +3315,31 @@ class TestLineGrandmaBotCore(unittest.TestCase):
         is_content = lambda px: sum(abs(px[i] - 255) for i in range(3)) > 30
         return shot, is_content
 
-    def test_incoming_media_crop_crops_the_image_and_measures_its_width(self):
+    def test_incoming_media_info_crops_the_image_and_measures_its_width(self):
         shot, is_content = self._chat_shot()
         with mock.patch.object(auto_reply, "_left_message_blocks", return_value=(shot, 1.5, 84, 324, is_content, [(300, 50)])):
-            crop, width = auto_reply._incoming_media_crop(1)
+            crop, width, row = auto_reply._incoming_media_info(1)
         self.assertEqual(crop.size, (379, 263))                                  # 圖片四周各加 6px
+        self.assertFalse(row)                                                    # 圖片下面沒有連結列
         self.assertEqual(width, 244)                                             # (450 - 84 + 1) / 1.5 邏輯像素
 
-    def test_incoming_media_crop_skips_the_thin_action_bar_below_the_image(self):
+    def test_incoming_media_info_skips_the_thin_action_bar_below_the_image(self):
         shot, is_content = self._chat_shot()
         # 最底部是矮的「儲存｜另存新檔｜分享」連結列 (高 8px)，圖片在它上方
         with mock.patch.object(auto_reply, "_left_message_blocks", return_value=(shot, 1.5, 84, 324, is_content, [(330, 322), (300, 50)])):
-            crop, width = auto_reply._incoming_media_crop(1)
+            crop, width, row = auto_reply._incoming_media_info(1)
         self.assertEqual(crop.size, (379, 263))                                  # 仍然是圖片那一塊，不是連結列
+        self.assertTrue(row)                                                     # 而且認得出下面那一列就是連結列
 
-    def test_incoming_media_crop_none_cases(self):
+    def test_incoming_media_info_none_cases(self):
         shot, is_content = self._chat_shot()
         with mock.patch.object(auto_reply, "_left_message_blocks", return_value=None):
-            self.assertIsNone(auto_reply._incoming_media_crop(1))                # 視窗縮小、被遮住
+            self.assertIsNone(auto_reply._incoming_media_info(1))                # 視窗縮小、被遮住
         with mock.patch.object(auto_reply, "_left_message_blocks", return_value=(shot, 1.5, 84, 324, is_content, [(330, 322)])):
-            self.assertIsNone(auto_reply._incoming_media_crop(1))                # 沒有夠高的區塊 (只有連結列)
+            self.assertIsNone(auto_reply._incoming_media_info(1))                # 沒有夠高的區塊 (只有連結列)
         blank, is_content = self._chat_shot(bubble=(0, 0, 1, 1))                 # 該區塊內其實沒有內容
         with mock.patch.object(auto_reply, "_left_message_blocks", return_value=(blank, 1.5, 84, 324, is_content, [(300, 50)])):
-            self.assertIsNone(auto_reply._incoming_media_crop(1))
+            self.assertIsNone(auto_reply._incoming_media_info(1))
 
     def test_skip_not_grandma_records_received_image(self):
         img = self._make_image("skip_rec.png", color=(7, 8, 9))

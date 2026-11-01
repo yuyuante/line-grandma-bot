@@ -59,6 +59,92 @@ class TestNotifier(unittest.TestCase):
         with open(self.state_path, encoding="utf-8") as f:
             return json.load(f)
 
+    def reject(self, code):
+        self.push_error = urllib.error.HTTPError("https://api.line.me", code, "x", {}, None)
+
+    def test_a_rejected_push_switches_to_file_only_for_the_rest_of_the_run(self):
+        # 另一台電腦的帳號沒有加 Notify Bot 為好友：推播被 LINE 拒絕，之後不再嘗試，紀錄只留在畫面與檔案
+        for code in (400, 401, 403, 404):
+            notifier._rejected["code"] = None
+            notifier._warned.clear()
+            self.calls.clear()
+            self.reject(code)
+            self.assertTrue(notifier.notify("第一則"))
+            notifier.flush(3)
+            self.assertEqual(len(self.pushes()), 1, code)                                  # 試了一次，被拒絕
+            self.assertFalse(notifier.notify("第二則"))                                    # 之後連排隊都不排
+            notifier.on_log("[警告] 之後的警告")
+            notifier.flush(1)
+            self.assertEqual(len(self.pushes()), 1, code)
+            shown = "\n".join(str(c.args[0]) for c in self.printed.call_args_list)
+            self.assertIn(f"HTTP {code}", shown)
+            self.assertIn("logs/", shown)                                                   # 告訴使用者紀錄在檔案
+
+    def test_the_rejection_notice_is_printed_once_and_reaches_the_log_file_sink(self):
+        sink = []
+        notifier.log_sink = sink.append
+        self.addCleanup(setattr, notifier, "log_sink", None)
+        self.reject(403)
+        notifier.notify("a")
+        notifier.flush(3)
+        notifier.notify("b")
+        notifier.flush(1)
+        self.assertEqual(len([c for c in self.printed.call_args_list if "HTTP 403" in str(c.args[0])]), 1)
+        self.assertEqual(len([t for t in sink if "HTTP 403" in t]), 1)
+        self.assertTrue(all(t.startswith("[通知]") for t in sink))
+
+    def test_transient_errors_do_not_switch_notifications_off(self):
+        self.reject(500)
+        notifier.notify("a")
+        notifier.flush(3)
+        self.assertIsNone(notifier._rejected["code"])
+        self.push_error = None
+        self.assertTrue(notifier.notify("b"))                                              # 伺服器暫時出錯：下一則還是會推
+        notifier.flush(3)
+        self.assertEqual(len(self.pushes()), 2)
+
+    def test_quota_exhausted_is_still_its_own_case(self):
+        self.reject(429)
+        notifier.notify("a")
+        notifier.flush(3)
+        self.assertIsNone(notifier._rejected["code"])                                      # 429 是額度用完，維持原本的處理 (本月不再推)
+
+    def test_turning_notify_log_off_and_on_gives_a_rejected_run_another_try(self):
+        self.reject(403)
+        notifier.notify("a")
+        notifier.flush(3)
+        self.assertFalse(notifier.notify("b"))
+        notifier.configure(False)
+        notifier.configure(True, 150, self.state_path)                                    # 使用者關掉再打開 (可能剛換了權杖或加了好友)
+        self.push_error = None
+        self.assertTrue(notifier.notify("c"))
+        notifier.flush(3)
+        self.assertEqual(len(self.pushes()), 2)
+
+    def test_a_second_rejection_after_toggling_notify_log_prints_the_notice_again(self):
+        # 關掉再打開重試又被拒絕：提示要再印一次，否則看起來像還在正常運作
+        self.reject(403)
+        notifier.notify("a")
+        notifier.flush(3)
+        notifier.configure(False)
+        notifier.configure(True, 150, self.state_path)
+        notifier.notify("b")
+        notifier.flush(3)
+        notices = [c for c in self.printed.call_args_list if "HTTP 403" in str(c.args[0])]
+        self.assertEqual(len(notices), 2)
+
+    def test_missing_credentials_print_a_hint_that_reaches_the_log_file_sink(self):
+        sink = []
+        notifier.log_sink = sink.append
+        self.addCleanup(setattr, notifier, "log_sink", None)
+        os.environ["LINE_NOTIFY_ENV"] = os.path.join(self.temp_dir.name, "does-not-exist.env")
+        notifier._creds = None
+        notifier._creds_checked = False
+        notifier.notify("hi")
+        notifier.flush(3)
+        self.assertEqual(self.pushes(), [])                                                # 沒有憑證：完全不推
+        self.assertTrue(any("找不到 LINE_TOKEN" in t for t in sink))
+
     def test_disabled_does_nothing(self):
         notifier.configure(False)
         self.assertFalse(notifier.notify("hi"))

@@ -59,6 +59,11 @@ class _Base(unittest.TestCase):
                                                    il.KindIndex(os.path.join(self.tmp.name, "kinds.json"), fake_ocr)))
         self.log = self.stack.enter_context(mock.patch.object(auto_reply, "log_v"))
         auto_reply._FILE_KIND_CACHE.clear()
+        auto_reply._LAST_OPEN_ATTEMPT.clear()
+        auto_reply._DUPLICATE_WINDOW_SEEN.clear()
+        auto_reply._TEXT_SEEN_SIG.clear()
+        auto_reply._TEXT_LAST_TRIGGER.clear()
+        auto_reply._BACKGROUND_WINDOWS.clear()
 
     def tearDown(self):
         self.stack.close()
@@ -151,6 +156,7 @@ class TestRecognizeIncomingText(_Base):
         image = Image.new("RGB", (300, 60), (230, 230, 230)) if crop == "ok" else None
         patches = [
             mock.patch.object(auto_reply, "_incoming_text_crop", return_value=image),
+            mock.patch.object(auto_reply, "_wait_until_chat_settled", return_value=True),
             mock.patch.object(auto_reply.win32gui, "IsWindow", return_value=True),
             mock.patch.object(auto_reply.win32gui, "IsIconic", return_value=iconic),
             mock.patch.object(auto_reply.win32gui, "IsWindowVisible", return_value=True),
@@ -161,6 +167,25 @@ class TestRecognizeIncomingText(_Base):
             for patcher in patches:
                 stack.enter_context(patcher)
             return auto_reply.recognize_incoming_text(CHAT, max_chars)
+
+    def test_the_screen_is_awaited_before_it_is_read(self):
+        # 真機 (2026-11-01)：is_last_message_from_self_in_chat 暫時最大化再還原視窗，還原後立刻讀會讀不到，等 1.5 秒才讀得到
+        order = []
+        with mock.patch.object(auto_reply, "_wait_until_chat_settled", side_effect=lambda h: order.append("settle") or True), \
+             mock.patch.object(auto_reply, "_incoming_text_crop", side_effect=lambda h: order.append("crop")), \
+             mock.patch.object(auto_reply.win32gui, "IsWindow", return_value=True), mock.patch.object(auto_reply.win32gui, "IsIconic", return_value=False), \
+             mock.patch.object(auto_reply.win32gui, "IsWindowVisible", return_value=True), \
+             mock.patch.object(auto_reply.win32gui, "GetForegroundWindow", return_value=CHAT):
+            auto_reply.recognize_incoming_text(CHAT, 30)
+        self.assertEqual(order, ["settle", "crop"])
+
+    def test_nothing_is_awaited_when_the_window_is_not_in_front(self):
+        with mock.patch.object(auto_reply, "_wait_until_chat_settled") as settle, \
+             mock.patch.object(auto_reply.win32gui, "IsWindow", return_value=True), mock.patch.object(auto_reply.win32gui, "IsIconic", return_value=False), \
+             mock.patch.object(auto_reply.win32gui, "IsWindowVisible", return_value=True), \
+             mock.patch.object(auto_reply.win32gui, "GetForegroundWindow", return_value=CHAT + 1):
+            self.assertEqual(auto_reply.recognize_incoming_text(CHAT, 30), (None, None, ""))
+        settle.assert_not_called()
 
     def test_short_greeting_is_recognised_and_ui_text_is_cleaned(self):
         state, kind, text = self.run_text("早安！ 上午 12:05")                              # 氣泡右外側的時間會一併被截到
@@ -278,8 +303,16 @@ class TestRecognizeScreenshotWaitsForLoading(_Base):
 
 class TestMediaCheckWhileLoading(_Base):
     def run_check(self, results, expect_media):
-        with mock.patch.object(auto_reply, "last_left_message_is_media", side_effect=results) as m:
+        with mock.patch.object(auto_reply, "last_left_message_is_media", side_effect=results) as m, \
+             mock.patch.object(auto_reply, "_wait_until_chat_settled", return_value=True):
             return auto_reply._media_type_with_retry(CHAT, expect_media=expect_media), m.call_count
+
+    def test_the_screen_is_awaited_before_the_media_check(self):
+        order = []
+        with mock.patch.object(auto_reply, "_wait_until_chat_settled", side_effect=lambda h: order.append("settle") or True), \
+             mock.patch.object(auto_reply, "last_left_message_is_media", side_effect=lambda h: order.append("check") or False):
+            auto_reply._media_type_with_retry(CHAT)
+        self.assertEqual(order, ["settle", "check"])
 
     def test_image_triggered_waits_through_the_text_looking_placeholder(self):
         value, calls = self.run_check([False, False, False, True], expect_media=True)       # 灰色佔位方塊先被看成文字
@@ -477,7 +510,7 @@ class TestSendFlow(_Base):
     def run_flow(self, *, recognize=((True, MID_AUTUMN, "中秋節快樂"),), choose=None, attach=True, config=None,
                  triggered=True, slots=None, find_results=None, opener=False, title="小明",
                  text_trigger=False, text_result=(True, MORNING, "早安"), media_result=True, target="小明", self_last=False,
-                 send_text=True):
+                 send_text=True, peek=(True, MORNING, "早安")):
         mocks = {}
         minimized = []
         patches = {
@@ -502,6 +535,7 @@ class TestSendFlow(_Base):
             "self": mock.patch.object(auto_reply, "is_last_message_from_self_in_chat", return_value=self_last),
             "media": mock.patch.object(auto_reply, "_media_type_with_retry", return_value=media_result),
             "recognize_text": mock.patch.object(auto_reply, "recognize_incoming_text", return_value=text_result),
+            "peek": mock.patch.object(auto_reply, "_peek_incoming_text", return_value=peek),
             "cache_dir": mock.patch.object(auto_reply, "get_active_line_cache_dir", return_value="cache"),
             "cache_files": mock.patch.object(auto_reply, "get_all_cache_files", return_value={}),
             "chat_map": mock.patch.object(auto_reply, "load_chat_dirs_map", return_value={}),
@@ -573,6 +607,13 @@ class TestSendFlow(_Base):
     def test_birthday_text_gets_only_a_thank_you(self):
         result, m, _ = self.text_flow(text_result=(True, BIRTHDAY, "生日快樂"))
         self.assert_thanks_only(result, m)
+
+    def test_a_birthday_picture_without_a_wish_phrase_is_not_thanked(self):
+        # 圖上只有「生日」(沒有「生日快樂」之類)：照一般節日圖回覆，不回謝謝
+        result, m, _ = self.run_flow(recognize=[(True, BIRTHDAY, "生日蛋糕")])
+        self.assertEqual(result, "SENT_CONFIRMED")
+        m["attach"].assert_called_once()
+        m["send_text"].assert_not_called()
 
     def test_birthday_picture_recognised_late_from_the_window_screenshot_also_gets_a_thank_you(self):
         result, m, _ = self.run_flow(recognize=[(None, None, ""), (True, BIRTHDAY, "生日快樂")])      # 視窗不在前景：先延後，帶到前景再辨識
@@ -688,6 +729,33 @@ class TestSendFlow(_Base):
         result, m, _ = self.text_flow(self_last=True)
         self.assertEqual(result, "NOT_SENT")
         m["attach"].assert_not_called()
+
+    def test_a_non_greeting_text_is_dropped_before_the_random_wait_and_before_anything_else(self):
+        # 審查發現：以前每則聊天文字都先睡 5~900 秒 (單執行緒，擋住所有好友) 才發現不是問候
+        result, m, _ = self.text_flow(peek=(False, None, "今天吃什麼"))
+        self.assertEqual(result, "SKIPPED_TEXT")
+        m["peek"].assert_called_once()
+        m["countdown"].assert_not_called()                                                     # 沒有睡
+        m["get_images"].assert_not_called()                                                    # 也沒有為它去補圖庫、上網
+        m["choose"].assert_not_called()
+        m["attach"].assert_not_called()
+        self.assertEqual(self.today(), 0)
+
+    def test_text_that_cannot_be_peeked_yet_is_retried_without_waiting(self):
+        result, m, _ = self.text_flow(peek=(None, None, ""))
+        self.assertEqual(result, "NOT_SENT")
+        m["countdown"].assert_not_called()
+
+    def test_a_greeting_text_passes_the_peek_and_then_goes_through_the_whole_flow_with_the_wait(self):
+        result, m, _ = self.text_flow()
+        self.assertEqual(result, "SENT_CONFIRMED")
+        m["peek"].assert_called_once()
+        m["countdown"].assert_called_once()                                                    # 通過才做「像真人」的隨機等待
+        m["recognize_text"].assert_called_once()                                               # 等完、視窗在前景時再確認一次 (期間可能有新訊息)
+
+    def test_image_triggers_never_peek(self):
+        _, m, _ = self.run_flow()
+        m["peek"].assert_not_called()
 
     def test_text_trigger_needs_no_bound_channel(self):
         # 對方只傳文字、從沒傳過圖：chat_dirs.json 沒有他，文字照樣能回
@@ -987,10 +1055,107 @@ class TestStartup(_Base):
         self.assertTrue(any("預先辨識圖庫失敗" in l for l in logs))
 
 
+class TestWaitUntilChatSettled(_Base):
+    def settle(self, images, timeout=3.0):
+        from PIL import Image
+        seq = iter(images)
+        last = {"v": None}
+
+        def sig(hwnd):
+            try:
+                v = next(seq)
+            except StopIteration:
+                v = last["v"]
+            if isinstance(v, Exception):
+                raise v
+            last["v"] = v
+            return v
+
+        with mock.patch.object(auto_reply, "_chat_signature", side_effect=sig) as m:
+            return auto_reply._wait_until_chat_settled(CHAT, timeout=timeout, interval=0.3), m.call_count
+
+    def img(self, level, noise=0):
+        from PIL import Image
+        im = Image.new("L", (64, 64), level)
+        if noise:
+            im.putpixel((3, 3), min(255, level + noise))
+        return im
+
+    def test_two_identical_screens_in_a_row_are_settled(self):
+        self.assertEqual(self.settle([self.img(200), self.img(200)]), (True, 2))
+
+    def test_it_keeps_waiting_while_the_screen_is_still_changing(self):
+        ok, calls = self.settle([self.img(250), self.img(100), self.img(180), self.img(180)])
+        self.assertEqual((ok, calls), (True, 4))
+        self.assertAlmostEqual(sum(self.sleeps), 0.9)                                          # 等了三輪 (用假時鐘，沒有真的睡)
+
+    def test_a_blinking_caret_or_tiny_noise_does_not_count_as_changing(self):
+        self.assertEqual(self.settle([self.img(200), self.img(200, noise=200)]), (True, 2))     # 只有一個像素不同
+
+    def test_a_screen_that_never_stops_changing_gives_up_after_the_timeout(self):
+        ok, calls = self.settle([self.img(i * 20 % 250) for i in range(100)], timeout=1.0)
+        self.assertFalse(ok)
+        self.assertLess(calls, 10)
+
+    def test_a_failed_capture_means_not_settled_and_never_raises(self):
+        self.assertEqual(self.settle([RuntimeError("no screen")]), (False, 1))
+
+
+class TestPeekIncomingText(_Base):
+    def peek(self, *, found=True, iconic=False, front=True, own_last=False, recognized=(True, MORNING, "早安"), explode=False):
+        window = [(CHAT, "小明", "Qt", True)] if found else []
+        recognize = mock.Mock(side_effect=RuntimeError("boom")) if explode else mock.Mock(return_value=recognized)
+        with mock.patch.object(auto_reply, "find_target_chat_window", return_value=window), \
+             mock.patch.object(auto_reply.win32gui, "IsIconic", return_value=iconic), \
+             mock.patch.object(auto_reply.win32gui, "ShowWindow") as show, \
+             mock.patch.object(auto_reply.win32gui, "GetForegroundWindow", return_value=CHAT if front else CHAT + 1), \
+             mock.patch.object(auto_reply, "activate_window"), \
+             mock.patch.object(auto_reply, "is_last_message_from_self_in_chat", return_value=own_last), \
+             mock.patch.object(auto_reply, "recognize_incoming_text", recognize), \
+             mock.patch.object(auto_reply, "_minimize_if_configured") as minimize:
+            try:
+                result = auto_reply._peek_incoming_text("小明", {"text_reply_max_chars": 12})
+            except RuntimeError:
+                result = "raised"
+        return result, recognize, minimize, show
+
+    def test_a_greeting_is_recognised_and_the_window_is_put_back(self):
+        result, recognize, minimize, _ = self.peek()
+        self.assertEqual(result, (True, MORNING, "早安"))
+        recognize.assert_called_once_with(CHAT, 12)                                             # 字數上限來自設定
+        minimize.assert_called_once()
+
+    def test_other_text_is_a_no(self):
+        self.assertEqual(self.peek(recognized=(False, None, "今天吃什麼"))[0][0], False)
+
+    def test_a_minimised_window_is_restored_first(self):
+        _, _, _, show = self.peek(iconic=True)
+        show.assert_called_once()
+
+    def test_without_the_window_or_the_foreground_it_cannot_tell_and_never_reads_the_screen(self):
+        result, recognize, _, _ = self.peek(found=False)
+        self.assertEqual(result[0], None)
+        recognize.assert_not_called()
+        result, recognize, minimize, _ = self.peek(front=False)
+        self.assertEqual(result[0], None)
+        recognize.assert_not_called()                                                           # 視窗不在前景時截到的是別人的畫面
+        minimize.assert_called_once()                                                           # 但視窗一樣縮回去
+
+    def test_when_the_last_message_is_our_own_there_is_nothing_to_answer(self):
+        result, recognize, _, _ = self.peek(own_last=True)
+        self.assertEqual(result[0], False)
+        recognize.assert_not_called()
+
+    def test_the_window_is_always_put_back_even_when_reading_blows_up(self):
+        result, _, minimize, _ = self.peek(explode=True)
+        self.assertEqual(result, "raised")
+        minimize.assert_called_once()
+
+
 class TestDetectionReopensTheWindow(_Base):
     """偵測階段：頻道已綁定、但好友的獨立視窗不見了，不再直接丟掉事件，先試著把視窗開回來"""
 
-    def run_detection(self, window_open, opener_result, config_extra=None, group=False, photo=True, last_reply_ago=None, windows=(), size=300000):
+    def run_detection(self, window_open, opener_result, config_extra=None, group=False, photo=True, last_reply_ago=None, windows=(), size=300000, replies_today=0):
         cache = os.path.join(self.tmp.name, "cache")
         fake_hash = "888803ef1234567890abcdef1234567890abcdef"
         chat_m = os.path.join(cache, fake_hash, "m")
@@ -1025,6 +1190,8 @@ class TestDetectionReopensTheWindow(_Base):
                 auto_reply.last_reply_times.pop("小明", None)
                 if last_reply_ago is not None:
                     auto_reply.last_reply_times["小明"] = now - last_reply_ago
+                for _ in range(replies_today):
+                    reply_budget.record_reply(self.counts_path, "小明")
                 auto_reply.PROCESSED_CACHE_FILES.clear()
                 auto_reply.last_seen_cache_mtime = now - 1.0
                 auto_reply.set_group_targets(["小明"] if group else [])
@@ -1038,6 +1205,36 @@ class TestDetectionReopensTheWindow(_Base):
         sent, opener = self.run_detection(window_open=False, opener_result=True)
         self.assertEqual(sent, ["小明"])
         opener.assert_called_once_with("小明", mock.ANY)
+
+    def test_the_main_window_is_not_hijacked_for_a_message_that_would_never_be_answered(self):
+        # 審查發現：以前沒視窗就先開窗，才檢查上限與冷卻；對一張不會回的圖也會搶你的主視窗、在搜尋欄打字
+        sent, opener = self.run_detection(window_open=False, opener_result=True, replies_today=3)       # 今天已回 3 次 (上限)
+        self.assertEqual((sent, opener.call_count), ([], 0))
+        sent, opener = self.run_detection(window_open=False, opener_result=True, last_reply_ago=5, config_extra={"cooldown_seconds": 30})
+        self.assertEqual((sent, opener.call_count), ([], 0))                                           # 還在冷卻
+        if os.path.exists(self.counts_path):
+            os.remove(self.counts_path)                                                                # 清掉前面幾次記下的回覆次數
+        sent, opener = self.run_detection(window_open=False, opener_result=True, replies_today=2)
+        self.assertEqual((sent, opener.call_count), (["小明"], 1))                                      # 還有額度、不在冷卻：照常開窗
+
+    def test_groups_use_their_own_limit_and_cooldown_before_opening(self):
+        sent, opener = self.run_detection(window_open=False, opener_result=True, group=True, replies_today=1)      # 群組上限預設 1 次
+        self.assertEqual(opener.call_count, 0)
+        sent, opener = self.run_detection(window_open=False, opener_result=True, group=True, last_reply_ago=120)   # 群組冷卻 600 秒
+        self.assertEqual(opener.call_count, 0)
+        if os.path.exists(self.counts_path):
+            os.remove(self.counts_path)
+        sent, opener = self.run_detection(window_open=False, opener_result=True, group=False, replies_today=1, last_reply_ago=120)
+        self.assertEqual(opener.call_count, 1)                                                                     # 同樣狀況一對一 (上限 3、冷卻 0) 照開
+
+    def test_opening_the_window_is_attempted_at_most_once_a_minute_per_contact(self):
+        _, opener = self.run_detection(window_open=False, opener_result=False)                          # 開不出來 (例如視窗名稱對不上)
+        self.assertEqual(opener.call_count, 1)
+        _, opener = self.run_detection(window_open=False, opener_result=False)                          # 馬上又來一個事件：不再搶主視窗
+        self.assertEqual(opener.call_count, 0)
+        self.clock[0] += auto_reply.OPEN_ATTEMPT_MIN_INTERVAL + 1
+        _, opener = self.run_detection(window_open=False, opener_result=False)
+        self.assertEqual(opener.call_count, 1)                                                          # 一分鐘後可以再試
 
     def test_window_that_cannot_be_reopened_still_drops_the_event(self):
         sent, opener = self.run_detection(window_open=False, opener_result=False)
@@ -1082,6 +1279,391 @@ class TestDetectionReopensTheWindow(_Base):
         sent, opener = self.run_detection(window_open=True, opener_result=True)
         self.assertEqual(sent, ["小明"])
         opener.assert_not_called()
+
+
+class TestChannelLabel(_Base):
+    """紀錄裡的快取頻道代號 (LINE 自己產生的雜湊) 光看分不出是誰，每一行都要一起帶出聊天室名稱"""
+    BOUND = "b1acf4e0" + "0" * 32
+    OTHER = "3436b478" + "f" * 32
+
+    def label(self, chat_hash, mapping=None):
+        with mock.patch.object(auto_reply, "load_chat_dirs_map", return_value={self.BOUND: "林如婷"} if mapping is None else mapping):
+            return auto_reply.channel_label(chat_hash)
+
+    def test_a_bound_channel_shows_its_chat_name(self):
+        self.assertEqual(self.label(self.BOUND), "「b1acf4e0...」(林如婷)")
+
+    def test_an_unbound_channel_says_so(self):
+        self.assertEqual(self.label(self.OTHER), "「3436b478...」(未綁定)")
+
+    def test_the_hash_match_ignores_case(self):
+        self.assertEqual(self.label(self.BOUND.upper()), "「B1ACF4E0...」(林如婷)")
+
+    def test_missing_hash_or_a_broken_map_never_raises(self):
+        self.assertEqual(self.label(None), "「...」(未綁定)")
+        with mock.patch.object(auto_reply, "load_chat_dirs_map", side_effect=OSError("disk")):
+            self.assertEqual(auto_reply.channel_label(self.OTHER), "「3436b478...」(未綁定)")
+
+    def test_no_log_line_prints_a_bare_channel_hash(self):
+        # 防止日後又寫回「快取頻道「{ch[:8]}...」」這種看不出是誰的寫法
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "auto_reply.py")
+        with open(path, encoding="utf-8") as f:
+            source = f.read()
+        self.assertNotIn("快取頻道「", source)
+        self.assertGreaterEqual(source.count("channel_label("), 12)
+
+
+class TestClickTargetCheck(_Base):
+    """真機 (2026-11-01 19:34)：視窗被放到最底層，焦點對了卻被終端機蓋住，點輸入框點到了上面的終端機，焦點被搶走"""
+
+    def click_attempt(self, tops):
+        """tops: 依序回傳「輸入框座標最上面的視窗」"""
+        seq = iter(tops)
+        stack = contextlib.ExitStack()
+        with stack:
+            stack.enter_context(mock.patch.object(auto_reply.win32gui, "GetForegroundWindow", return_value=CHAT))
+            stack.enter_context(mock.patch.object(auto_reply.win32gui, "GetWindowText", return_value="小明"))
+            stack.enter_context(mock.patch.object(auto_reply.win32gui, "GetWindowRect", return_value=(0, 0, 400, 600)))
+            stack.enter_context(mock.patch.object(auto_reply, "get_system_dpi_scale", return_value=1.0))
+            stack.enter_context(mock.patch.object(auto_reply, "_root_window_at", side_effect=lambda x, y: next(seq)))
+            raised = stack.enter_context(mock.patch.object(auto_reply, "_raise_to_top"))
+            click = stack.enter_context(mock.patch.object(auto_reply.pyautogui, "click"))
+            ok = auto_reply.focus_chat_input(CHAT, target_name="小明")
+        return ok, click, raised
+
+    def test_it_clicks_when_the_target_is_on_top(self):
+        ok, click, raised = self.click_attempt([CHAT])
+        self.assertTrue(ok)
+        click.assert_called_once()
+        raised.assert_not_called()
+
+    def test_a_covered_window_is_raised_and_then_clicked(self):
+        ok, click, raised = self.click_attempt([CHAT + 1, CHAT])
+        self.assertTrue(ok)
+        raised.assert_called_once_with(CHAT)
+        click.assert_called_once()
+
+    def test_it_never_clicks_when_another_window_stays_on_top(self):
+        ok, click, raised = self.click_attempt([CHAT + 1, CHAT + 1])
+        self.assertFalse(ok)
+        click.assert_not_called()
+        self.assertIn("禁止點擊", NL.join(str(c.args[0]) for c in self.log.call_args_list))
+
+    def test_unreadable_top_window_is_treated_as_not_ours(self):
+        ok, click, _ = self.click_attempt([None, None])
+        self.assertFalse(ok)
+        click.assert_not_called()
+
+    def test_raise_to_top_uses_hwnd_top_without_activating(self):
+        with mock.patch.object(auto_reply.win32gui, "SetWindowPos") as pos:
+            auto_reply._raise_to_top(CHAT)
+        flags = auto_reply.win32con.SWP_NOMOVE | auto_reply.win32con.SWP_NOSIZE | auto_reply.win32con.SWP_NOACTIVATE
+        pos.assert_called_once_with(CHAT, auto_reply.win32con.HWND_TOP, 0, 0, 0, 0, flags)
+
+    def test_raise_to_top_never_raises(self):
+        with mock.patch.object(auto_reply.win32gui, "SetWindowPos", side_effect=RuntimeError("boom")):
+            auto_reply._raise_to_top(CHAT)
+
+    def test_activating_a_window_also_raises_it(self):
+        with mock.patch.object(auto_reply.win32gui, "IsIconic", return_value=False), \
+             mock.patch.object(auto_reply.win32gui, "ShowWindow"), \
+             mock.patch.object(auto_reply.win32gui, "SetForegroundWindow"), \
+             mock.patch.object(auto_reply.win32gui, "GetForegroundWindow", return_value=CHAT), \
+             mock.patch.object(auto_reply.pyautogui, "press"), \
+             mock.patch.object(auto_reply, "_raise_to_top") as raised:
+            self.assertTrue(auto_reply.activate_window(CHAT))
+        raised.assert_called_once_with(CHAT)
+
+    def test_root_window_lookup_never_raises(self):
+        with mock.patch.object(auto_reply.ctypes, "windll", mock.Mock(user32=mock.Mock(WindowFromPoint=mock.Mock(side_effect=OSError("x"))))):
+            self.assertIsNone(auto_reply._root_window_at(1, 1))
+
+
+class TestForceForeground(_Base):
+    """真機 (2026-11-01)：展開、放在最底層的視窗，使用者正在別的視窗打字時一般的 SetForegroundWindow 會被前景鎖擋下"""
+
+    def run_activate(self, fg_after_normal, fg_after_attach=None):
+        fg = {"v": CHAT + 1}
+        calls = []
+        sets = {"n": 0}
+
+        def set_fg(h):
+            sets["n"] += 1
+            calls.append("set")
+            fg["v"] = fg_after_normal if sets["n"] == 1 else (fg_after_attach if fg_after_attach is not None else fg["v"])
+
+        def show(h, cmd):
+            calls.append(cmd)
+            if cmd == auto_reply.win32con.SW_RESTORE and "min" in calls:
+                fg["v"] = CHAT
+
+        def show_wrapper(h, cmd):
+            if cmd == auto_reply.win32con.SW_MINIMIZE:
+                calls.append("min")
+                return
+            show(h, cmd)
+
+        user32 = mock.Mock()
+        user32.AttachThreadInput.return_value = 1
+        with mock.patch.object(auto_reply.win32gui, "IsIconic", return_value=False), \
+             mock.patch.object(auto_reply.win32gui, "ShowWindow", side_effect=show_wrapper), \
+             mock.patch.object(auto_reply.win32gui, "SetForegroundWindow", side_effect=set_fg), \
+             mock.patch.object(auto_reply.win32gui, "BringWindowToTop"), \
+             mock.patch.object(auto_reply.win32gui, "GetForegroundWindow", side_effect=lambda: fg["v"]), \
+             mock.patch.object(auto_reply.win32process, "GetWindowThreadProcessId", return_value=(111, 222)), \
+             mock.patch.object(auto_reply.ctypes, "windll", mock.Mock(user32=user32, kernel32=mock.Mock(GetCurrentThreadId=lambda: 999))), \
+             mock.patch.object(auto_reply.pyautogui, "press"):
+            result = auto_reply.activate_window(CHAT)
+        return result, calls, user32, fg["v"]
+
+    def test_normal_switch_needs_no_fallback(self):
+        _, calls, user32, fg = self.run_activate(fg_after_normal=CHAT)
+        self.assertEqual(fg, CHAT)
+        self.assertEqual(calls.count("set"), 1)
+        user32.AttachThreadInput.assert_not_called()
+
+    def test_input_thread_attach_is_the_first_fallback_and_is_always_detached(self):
+        _, calls, user32, fg = self.run_activate(fg_after_normal=CHAT + 1, fg_after_attach=CHAT)
+        self.assertEqual(fg, CHAT)
+        self.assertNotIn("min", calls)
+        self.assertEqual([c.args[2] for c in user32.AttachThreadInput.call_args_list], [True, False])
+
+    def test_minimise_and_restore_is_the_last_resort(self):
+        _, calls, user32, fg = self.run_activate(fg_after_normal=CHAT + 1, fg_after_attach=CHAT + 1)
+        self.assertIn("min", calls)
+        self.assertEqual(fg, CHAT)                                              # 還原一定會啟用視窗
+        self.assertEqual([c.args[2] for c in user32.AttachThreadInput.call_args_list], [True, False])
+
+    def test_it_never_raises(self):
+        with mock.patch.object(auto_reply.win32gui, "GetForegroundWindow", side_effect=RuntimeError("boom")):
+            self.assertFalse(auto_reply._force_foreground(CHAT))
+
+
+class TestExpandedWindowSignature(_Base):
+    """真機 (2026-11-01)：列表已滿時新訊息把舊的擠出去，項目數與最底部位置不變，簽章要靠 runtime ID 才看得出新訊息"""
+
+    class FakeItem:
+        def __init__(self, rect, rid):
+            self.BoundingRectangle = type("R", (), dict(left=rect[0], top=rect[1], right=rect[2], bottom=rect[3]))()
+            self._rid = rid
+
+        def GetRuntimeId(self):
+            if isinstance(self._rid, Exception):
+                raise self._rid
+            return self._rid
+
+    def signature(self, items):
+        import sys
+        import types
+        view = mock.Mock()
+        view.Exists.return_value = True
+        view.GetChildren.return_value = items
+        root = mock.Mock()
+        root.ListControl.return_value = view
+        fake = types.SimpleNamespace(ControlFromHandle=lambda h: root)
+        with mock.patch.dict(sys.modules, {"uiautomation": fake}), \
+             mock.patch.object(auto_reply.win32gui, "IsIconic", return_value=False), \
+             mock.patch.object(auto_reply.win32gui, "IsWindowVisible", return_value=True):
+            return auto_reply._expanded_window_signature(CHAT)
+
+    def items(self, ids):
+        return [self.FakeItem((0, 100 * i, 500, 100 * i + 90), rid) for i, rid in enumerate(ids)]
+
+    def test_a_new_message_in_a_full_list_changes_the_signature_even_if_count_and_positions_stay_the_same(self):
+        before = self.signature(self.items([(1,), (2,), (3,)]))
+        after = self.signature(self.items([(2,), (3,), (4,)]))                  # 舊的擠出去、新的進來：數量與位置都一樣
+        self.assertNotEqual(before, after)
+
+    def test_the_same_list_gives_the_same_signature(self):
+        self.assertEqual(self.signature(self.items([(1,), (2,)])), self.signature(self.items([(1,), (2,)])))
+
+    def test_a_missing_runtime_id_does_not_break_the_signature(self):
+        sig = self.signature(self.items([RuntimeError("no id"), RuntimeError("no id")]))
+        self.assertIsNotNone(sig)
+
+    def test_a_single_item_list_works(self):
+        self.assertIsNotNone(self.signature(self.items([(1,)])))
+
+    def test_empty_list_or_missing_view_is_none(self):
+        self.assertIsNone(self.signature([]))
+
+
+class TestTextWindowWatch(_Base):
+    """真機 (2026-11-01)：一對一獨立視窗不論縮小或展開標題都沒有未讀數，文字只能靠展開視窗的訊息列表變化偵測"""
+    WINDOWS = [(CHAT, "小明", "Qt", True)]
+
+    def watch(self, sig, foreground=0, target="小明", config=None, windows=None, covered=False):
+        with mock.patch.object(auto_reply, "_expanded_window_signature", return_value=sig), \
+             mock.patch.object(auto_reply.win32gui, "GetForegroundWindow", return_value=foreground), \
+             mock.patch.object(auto_reply.win32gui, "GetWindowRect", return_value=(0, 0, 400, 600)), \
+             mock.patch.object(auto_reply, "_root_window_at", return_value=CHAT + 1 if covered else CHAT):
+            return auto_reply.text_window_changed(self.WINDOWS if windows is None else windows, target, config or {})
+
+    def test_first_look_only_records_the_baseline(self):
+        self.assertFalse(self.watch((3, "a", "b")))
+        self.assertEqual(auto_reply._TEXT_SEEN_SIG["小明"], (3, "a", "b"))
+
+    def test_a_changed_list_in_the_background_triggers_but_keeps_the_old_baseline(self):
+        self.watch((3, "a", "b"))
+        self.assertTrue(self.watch((4, "c", "a")))
+        self.assertEqual(auto_reply._TEXT_SEEN_SIG["小明"], (3, "a", "b"))      # 沒處理完前不更新：失敗還能再試
+        self.assertIn(CHAT, auto_reply._BACKGROUND_WINDOWS)
+
+    def test_an_unchanged_list_never_triggers(self):
+        self.watch((3, "a", "b"))
+        self.assertFalse(self.watch((3, "a", "b")))
+
+    def test_a_window_in_front_updates_the_baseline_without_triggering(self):
+        self.watch((3, "a", "b"))
+        self.assertFalse(self.watch((4, "c", "a"), foreground=CHAT))            # 你正在看或在捲動
+        self.assertEqual(auto_reply._TEXT_SEEN_SIG["小明"], (4, "c", "a"))
+        self.assertFalse(self.watch((4, "c", "a")))
+
+    def test_a_foreground_window_that_is_covered_does_not_count_as_being_viewed(self):
+        # 回覆完視窗被放到最底層但仍是前景視窗：你看不到它，之後的新文字不能被當成「你正在看」而漏掉
+        self.watch((3, "a", "b"))
+        self.assertTrue(self.watch((4, "c", "a"), foreground=CHAT, covered=True))
+
+    def test_an_unreadable_window_position_counts_as_being_viewed(self):
+        self.watch((3, "a", "b"))
+        with mock.patch.object(auto_reply, "_expanded_window_signature", return_value=(4, "c", "a")), \
+             mock.patch.object(auto_reply.win32gui, "GetForegroundWindow", return_value=CHAT), \
+             mock.patch.object(auto_reply.win32gui, "GetWindowRect", side_effect=OSError("gone")):
+            self.assertFalse(auto_reply.text_window_changed(self.WINDOWS, "小明", {}))
+
+    def test_triggers_are_spaced_by_the_minimum_interval(self):
+        self.watch((3, "a", "b"))
+        self.assertTrue(self.watch((4, "c", "a")))
+        self.assertFalse(self.watch((5, "d", "c")))                              # 5 秒內不再觸發
+        self.clock[0] += auto_reply.TEXT_WATCH_MIN_INTERVAL
+        self.assertTrue(self.watch((5, "d", "c")))
+
+    def test_a_minimised_or_missing_window_clears_the_baseline(self):
+        self.watch((3, "a", "b"))
+        self.assertFalse(self.watch(None))                                       # 縮小 (簽章讀不到)
+        self.assertNotIn("小明", auto_reply._TEXT_SEEN_SIG)
+        self.assertFalse(self.watch((4, "c", "a")))                              # 展開後重新建立基準，不把舊訊息當新的
+        self.assertFalse(self.watch((4, "c", "a"), windows=[]))                  # 視窗沒開
+
+    def test_stop_command_chats_are_never_watched(self):
+        cfg = {"stop_command_chats": ["小明"]}
+        self.watch((3, "a", "b"), config=cfg)
+        self.assertFalse(self.watch((4, "c", "a"), config=cfg))                  # 官方帳號的推播會讓它一直變
+        self.assertNotIn("小明", auto_reply._TEXT_SEEN_SIG)
+
+    def test_rebaseline_records_the_current_signature_or_clears_it(self):
+        with mock.patch.object(auto_reply, "get_all_line_windows", return_value=self.WINDOWS), \
+             mock.patch.object(auto_reply, "_expanded_window_signature", return_value=(9, "x", "y")):
+            auto_reply.text_window_rebaseline("小明")
+        self.assertEqual(auto_reply._TEXT_SEEN_SIG["小明"], (9, "x", "y"))
+        with mock.patch.object(auto_reply, "get_all_line_windows", return_value=self.WINDOWS), \
+             mock.patch.object(auto_reply, "_expanded_window_signature", return_value=None):
+            auto_reply.text_window_rebaseline("小明")
+        self.assertNotIn("小明", auto_reply._TEXT_SEEN_SIG)
+
+    def test_watched_windows_go_to_the_back_instead_of_being_minimised(self):
+        auto_reply._BACKGROUND_WINDOWS.add(CHAT)
+        with mock.patch.object(auto_reply, "_send_to_background") as back, mock.patch.object(auto_reply.win32gui, "ShowWindow") as show:
+            auto_reply._minimize_if_configured(CHAT, {"close_window_after_send": True})
+        back.assert_called_once_with(CHAT)
+        show.assert_not_called()
+
+    def test_other_windows_are_still_minimised(self):
+        with mock.patch.object(auto_reply, "_send_to_background") as back, mock.patch.object(auto_reply.win32gui, "ShowWindow") as show:
+            auto_reply._minimize_if_configured(CHAT, {"close_window_after_send": True})
+        show.assert_called_once_with(CHAT, auto_reply.win32con.SW_MINIMIZE)
+        back.assert_not_called()
+
+    def test_with_close_window_after_send_off_nothing_is_moved(self):
+        auto_reply._BACKGROUND_WINDOWS.add(CHAT)
+        with mock.patch.object(auto_reply, "_send_to_background") as back, mock.patch.object(auto_reply.win32gui, "ShowWindow") as show:
+            auto_reply._minimize_if_configured(CHAT, {"close_window_after_send": False})
+        back.assert_not_called()
+        show.assert_not_called()
+
+    def test_send_to_background_puts_the_window_at_the_bottom_without_activating(self):
+        with mock.patch.object(auto_reply.win32gui, "SetWindowPos") as pos:
+            auto_reply._send_to_background(CHAT)
+        flags = auto_reply.win32con.SWP_NOMOVE | auto_reply.win32con.SWP_NOSIZE | auto_reply.win32con.SWP_NOACTIVATE
+        pos.assert_called_once_with(CHAT, auto_reply.win32con.HWND_BOTTOM, 0, 0, 0, 0, flags)
+
+
+class TestTextWindowWatchInTheLoop(_Base):
+    """偵測階段：標題沒有未讀數，但展開視窗的列表變了 -> 文字觸發"""
+
+    def run_watch(self, changed=True, rebaseline_expected=None, send_result="SKIPPED_TEXT", extra=None, group=False, last_reply_ago=None):
+        sent = []
+        cfg = {"targets": ["小明"], "trigger_mode": "photo_and_sticker", "cooldown_seconds": 30, "min_delay_seconds": 0, "max_delay_seconds": 0}
+        cfg.update(extra or {})
+        windows = [(CHAT, "小明", "Qt", True)]
+        cache = os.path.join(self.tmp.name, "cache")
+        os.makedirs(cache, exist_ok=True)
+
+        def fake_send(target, config, **kw):
+            sent.append((target, kw))
+            return send_result
+
+        with mock.patch.object(auto_reply, "CHAT_MAP_PATH", os.path.join(self.tmp.name, "chat_dirs.json")), \
+             mock.patch.object(auto_reply, "get_active_line_cache_dir", return_value=cache), \
+             mock.patch.object(auto_reply, "get_all_line_windows", return_value=windows), \
+             mock.patch.object(auto_reply, "find_target_chat_window", return_value=windows), \
+             mock.patch.object(auto_reply, "update_target_window_fingerprints"), mock.patch.object(auto_reply, "check_stop_command"), \
+             mock.patch.object(auto_reply, "save_circuit_breaker_state"), mock.patch.object(auto_reply, "check_circuit_breaker", return_value=True), \
+             mock.patch.object(auto_reply, "text_window_changed", return_value=changed) as watch, \
+             mock.patch.object(auto_reply, "text_window_rebaseline") as rebase, \
+             mock.patch.object(auto_reply, "send_grandma_image", side_effect=fake_send):
+            auto_reply.last_global_reply_time = 0.0
+            for d in (auto_reply.LAST_SENT_TIME_BY_TARGET, auto_reply.PENDING_RETRY_MEDIA, auto_reply.SEND_FAIL_COUNTS, auto_reply.last_reply_times):
+                d.pop("小明", None)
+            if last_reply_ago is not None:
+                auto_reply.last_reply_times["小明"] = self.clock[0] - last_reply_ago
+            auto_reply.LAST_PROCESSED_UNREAD["小明"] = 0
+            auto_reply.PROCESSED_CACHE_FILES.clear()
+            auto_reply.last_seen_cache_mtime = self.clock[0] + 1000
+            auto_reply.set_group_targets(["小明"] if group else [])
+            try:
+                auto_reply.check_for_incoming_messages(cfg)
+            finally:
+                auto_reply.set_group_targets([])
+        self.addCleanup(auto_reply.LAST_PROCESSED_UNREAD.pop, "小明", None)
+        self.addCleanup(auto_reply.last_reply_times.pop, "小明", None)
+        return sent, watch, rebase
+
+    def test_a_changed_list_triggers_a_text_check(self):
+        sent, _, _ = self.run_watch()
+        self.assertEqual(len(sent), 1)
+        self.assertTrue(sent[0][1]["text_trigger"])
+        self.assertIn("訊息列表有變化", NL.join(str(c.args[0]) for c in self.log.call_args_list))
+
+    def test_an_unchanged_list_does_nothing(self):
+        sent, _, rebase = self.run_watch(changed=False)
+        self.assertEqual(sent, [])
+        rebase.assert_not_called()
+
+    def test_the_baseline_is_reset_after_the_check(self):
+        for result in ("SKIPPED_TEXT", "SENT_CONFIRMED"):
+            _, _, rebase = self.run_watch(send_result=result)
+            rebase.assert_called_once_with("小明")
+
+    def test_a_failed_send_keeps_the_old_baseline_so_it_is_retried(self):
+        _, _, rebase = self.run_watch(send_result="NOT_SENT")
+        rebase.assert_not_called()
+
+    def test_groups_are_never_watched(self):
+        sent, watch, _ = self.run_watch(group=True)
+        self.assertEqual(sent, [])
+        watch.assert_not_called()
+
+    def test_a_change_inside_the_per_chat_cooldown_does_not_fire(self):
+        sent, _, _ = self.run_watch(last_reply_ago=10)                          # 冷卻 30 秒，10 秒前剛回過
+        self.assertEqual(sent, [])
+        sent, _, _ = self.run_watch(last_reply_ago=40)
+        self.assertEqual(len(sent), 1)
+
+    def test_switch_off_means_no_watching(self):
+        sent, watch, _ = self.run_watch(extra={"reply_to_text": False, "birthday_reply": ""})
+        self.assertEqual(sent, [])
+        watch.assert_not_called()
 
 
 class TestTextTrigger(_Base):

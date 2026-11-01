@@ -56,6 +56,16 @@ class TestFindGroupWindow(GroupTestCase):
     def test_two_windows_with_the_same_group_name_are_refused(self):
         self.assertEqual(self.find([window(5, GROUP), window(6, f"{GROUP} (477)")]), [])
 
+    def test_a_duplicate_group_window_is_remembered_so_the_main_window_is_not_hijacked(self):
+        auto_reply._DUPLICATE_WINDOW_SEEN.clear()
+        self.assertEqual(self.find([window(5, GROUP), window(6, f"{GROUP} (477)")]), [])
+        with mock.patch.object(auto_reply, "log_v"), mock.patch.object(auto_reply.chat_opener, "open_chat_window") as opener:
+            self.assertFalse(auto_reply.open_missing_chat_window(GROUP, {}))
+            opener.assert_not_called()                                                  # 不是沒有視窗，是有兩個：開窗也不會成功，不去搶主視窗
+            auto_reply._DUPLICATE_WINDOW_SEEN[GROUP.lower()] -= auto_reply.DUPLICATE_WINDOW_SKIP_SECONDS + 1
+            auto_reply.open_missing_chat_window(GROUP, {})
+            opener.assert_called_once()                                                 # 過了幾秒 (使用者可能已關掉多餘的) 恢復正常
+
     def test_does_not_need_the_one_to_one_uia_check(self):
         with mock.patch.object(auto_reply, "verify_is_not_group_window_uia", return_value=False) as uia:
             self.assertEqual(len(self.find([window(5, f"{GROUP} (477)")])), 1)

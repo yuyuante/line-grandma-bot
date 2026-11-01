@@ -13,10 +13,12 @@ CHAT = 41
 class FakeInput:
     """假的 UIA 輸入框：記錄寫入與清空，按 Enter 時 (若 sends=True) 當作 LINE 收下並清空"""
 
-    def __init__(self, value="", sends=True, mangles=False):
+    def __init__(self, value="", sends=True, mangles=False, read_fails_after_enter=False):
         self.value = value
         self.sends = sends
         self.mangles = mangles
+        self.read_fails_after_enter = read_fails_after_enter
+        self.pressed = False
         self.sent = []
         self.writes = []
 
@@ -26,6 +28,8 @@ class FakeInput:
         class Pattern:
             @property
             def Value(self):
+                if outer.read_fails_after_enter and outer.pressed:
+                    raise RuntimeError("uia gone")
                 return outer.value
 
             def SetValue(self, text):
@@ -34,6 +38,8 @@ class FakeInput:
         return Pattern()
 
     def press(self, key):
+        if key == "enter":
+            self.pressed = True
         if key == "enter" and self.sends and self.value:
             self.sent.append(self.value)
             self.value = ""
@@ -94,6 +100,31 @@ class TestSendTextViaInput(unittest.TestCase):
         self.assertFalse(ok)
         press.assert_called_once_with("enter")
         self.assertEqual(box.value, "")                                                        # 沒送出去的字不留在輸入框
+
+    def test_losing_track_of_the_input_after_enter_counts_as_sent_and_is_never_retried(self):
+        # 審查發現：按了 Enter 之後 UIA 讀取出錯，以前回報「沒送出」，上層會重試最多 3 次，對方收到好幾個「謝謝」
+        box = FakeInput(sends=True, read_fails_after_enter=True)
+        ok, press, log = self.run_send(box)
+        self.assertTrue(ok)
+        self.assertEqual(box.sent, ["謝謝"])
+        press.assert_called_once_with("enter")                                                  # 只按一次
+        self.assertEqual(box.writes, ["謝謝"])                                                  # 沒有再寫入或清空
+        self.assertIn("視為已送出", log.call_args.args[0])
+
+    def test_the_wait_for_the_input_to_clear_is_long_enough_for_a_slow_line(self):
+        self.assertGreaterEqual(auto_reply.TEXT_SEND_CONFIRM_TIMEOUT, 5.0)
+
+    def test_an_error_before_enter_is_still_a_clean_failure(self):
+        edit = mock.Mock()
+        pattern = mock.Mock()
+        pattern.Value = ""
+        pattern.SetValue.side_effect = [RuntimeError("uia gone"), None]                           # 寫入就失敗 (還沒按 Enter)
+        edit.GetValuePattern.return_value = pattern
+        with mock.patch.object(auto_reply, "_find_message_input", return_value=edit), \
+             mock.patch.object(auto_reply.win32gui, "GetForegroundWindow", return_value=CHAT), \
+             mock.patch.object(auto_reply.pyautogui, "press") as press, mock.patch.object(auto_reply, "log_v"):
+            self.assertFalse(auto_reply.send_text_via_input(CHAT, "謝謝"))
+        press.assert_not_called()
 
     def test_never_writes_or_sends_when_the_window_is_not_in_front(self):
         box = FakeInput()

@@ -28,30 +28,35 @@ def _norm(text):
     return re.sub(r"\s+", "", image_kind.normalize_text(text or "")).casefold()
 
 
-# 搜尋結果列後面可能接的東西：成員數 (群組)、最後一則訊息的時間或日期。OCR 常把整列讀成同一段文字
+# 搜尋結果列後面可能接的東西：成員數 (只有群組才有)、最後一則訊息的時間或日期。OCR 常把整列讀成同一段文字
 _COUNT = r"(?:[(（]\d+[)）]?)?"
 _STAMP = r"(?:(?:上午|下午)?\d{1,2}[:：]\d{2}|昨天|星期.|\d{1,2}/\d{1,2})?"
-_ROW_TAIL = re.compile(_COUNT + _STAMP)
 # 名稱太長時列表會截成「前綴…」，OCR 讀出來是兩個以上的點或刪節號 (例如「服..．」)
 _ELLIPSIS = re.compile(r"(?:[.．。·]{2,}|…+)")
 MIN_TRUNCATED_PREFIX = 5        # 被截斷的名稱至少要露出這麼多字，才拿來當依據
 
 
-def _truncated_match(text, wanted):
-    """text (已正規化) 是不是「name 的開頭 + 刪節號 + 成員數/時間」；是回傳 True"""
+def _tail(allow_count):
+    return re.compile((_COUNT if allow_count else "") + _STAMP)
+
+
+def _truncated_match(text, wanted, tail):
+    """text (已正規化) 是不是「name 的開頭 + 刪節號 + (成員數) + 時間」；是回傳 True"""
     m = _ELLIPSIS.search(text)
     if not m:
         return False
     prefix = text[:m.start()]
     return (len(prefix) >= MIN_TRUNCATED_PREFIX and len(prefix) < len(wanted) and wanted.startswith(prefix)
-            and _ROW_TAIL.fullmatch(text[m.end():]) is not None)
+            and tail.fullmatch(text[m.end():]) is not None)
 
 
-def find_result_rows(boxes, name, min_y):
+def find_result_rows(boxes, name, min_y, allow_count=False):
     """
     boxes: [(文字, (中心x, 中心y))]。回傳搜尋結果裡「整列文字就是 name」的位置 [(x, y)]，由上到下排序。
     min_y 以上 (搜尋欄所在的區域，要用搜尋欄的「底部」) 的文字一律忽略，避免把搜尋欄裡剛貼上的那串字當成結果。
-    - 完整名稱：名稱本身，後面可以接成員數與時間 (「理財幼幼班_Z (142) 上午9:20」)，其餘多一個字都不算。
+    - 完整名稱：名稱本身，後面可以接最後一則訊息的時間 (「羅毓斌 上午9:20」)，其餘多一個字都不算。
+    - allow_count=True (要開的是**群組**) 才接受名稱後面接成員數 (「理財幼幼班_Z (142)」)；
+      一對一的對象不接受，因為「名稱 (12)」那一列是同名的群組，不是這位好友。
     - 名稱太長被列表截斷 (「東南里李武雄服..．（477）上午9:20」)：只有「露出的前綴夠長、確實是名稱開頭、
       整個搜尋結果裡剛好只有這一列」才採用；有兩列以上符合就分不出是哪個聊天室，一律不點。
       (雙擊後仍要等到標題符合的視窗才算成功。)
@@ -59,19 +64,20 @@ def find_result_rows(boxes, name, min_y):
     wanted = _norm(name)
     if not wanted:
         return []
-    exact_pattern = re.compile(re.escape(wanted) + _COUNT + _STAMP)
+    tail = _tail(allow_count)
+    exact_pattern = re.compile(re.escape(wanted) + tail.pattern)
     below = [(_norm(text), (x, y)) for text, (x, y) in boxes if y > min_y]
     exact = sorted((pos for text, pos in below if exact_pattern.fullmatch(text)), key=lambda p: p[1])
     if exact:
         return exact
-    truncated = sorted((pos for text, pos in below if _truncated_match(text, wanted)), key=lambda p: p[1])
+    truncated = sorted((pos for text, pos in below if _truncated_match(text, wanted, tail)), key=lambda p: p[1])
     return truncated if len(truncated) == 1 else []
 
 
-def _find_rows(ui, main, box, name, read_boxes):
+def _find_rows(ui, main, box, name, read_boxes, allow_count=False):
     """對主視窗截圖，找搜尋結果裡整列文字剛好等於 name 的位置 (螢幕座標)，由上到下"""
     shot, origin = ui.screenshot(main)
-    rows = find_result_rows(read_boxes(shot), name, min_y=box[3] - origin[1])
+    rows = find_result_rows(read_boxes(shot), name, min_y=box[3] - origin[1], allow_count=allow_count)
     return [(origin[0] + x, origin[1] + y) for x, y in rows]
 
 
@@ -91,13 +97,14 @@ def _switch_tab(ui, main, index):
                 pass
 
 
-def open_chat_window(name, ui, read_boxes=ocr_engine.read_boxes, log=lambda msg: None, sleep=time.sleep):
+def open_chat_window(name, ui, read_boxes=ocr_engine.read_boxes, log=lambda msg: None, sleep=time.sleep, allow_member_count=False):
     """
     開啟名稱為 name 的好友的獨立聊天視窗，成功 (視窗已存在或已開好) 回傳 True，任何一步沒把握回傳 False。
     先在目前的分頁搜尋 (最不打擾)；找不到才切到「全部」分頁再搜，結束後把使用者原本的分頁切回去。
     ui 提供：find_chat_window(name)、main_window()、bring_to_front(hwnd)、is_front(hwnd)、search_box_rect(hwnd) -> (左, 上, 右, 下)、
     set_search_text(text)、clear_search()、selected_tab(hwnd) -> 索引或 None、select_tab(hwnd, index) -> 是否成功、
     ensure_wide(hwnd) -> 原本的位置 (沒有改動回傳 None)、restore_rect(hwnd, rect)、double_click(x, y)、screenshot(hwnd) -> (PIL 圖, (左, 上))。
+    allow_member_count：要開的是群組時才設 True (搜尋結果的群組名稱後面會接成員數)；一對一不接受那種列。
     """
     if ui.find_chat_window(name):
         return True
@@ -121,17 +128,17 @@ def open_chat_window(name, ui, read_boxes=ocr_engine.read_boxes, log=lambda msg:
         if not ui.is_front(main):
             log("[開啟聊天視窗] 搜尋時主視窗不在前景，放棄。")
             return False
-        rows = _find_rows(ui, main, box, name, read_boxes)
+        rows = _find_rows(ui, main, box, name, read_boxes, allow_member_count)
         if not rows:
             current = ui.selected_tab(main)
             if current is None or current == ALL_TAB_INDEX:
                 log(f"[開啟聊天視窗] 搜尋結果裡找不到「{name}」(名稱必須完全相符)，放棄。")
                 return False
             log("[開啟聊天視窗] 目前的分頁找不到，改到「全部」分頁搜尋。")
+            original_tab = current                          # 先記下：點擊可能已經切過去、只是事後驗證失敗，結束時一律切回使用者原本的分頁
             if not _switch_tab(ui, main, ALL_TAB_INDEX):
                 log("[開啟聊天視窗] 無法切到「全部」分頁，放棄。")
                 return False
-            original_tab = current
             box = ui.search_box_rect(main) or box
             ui.set_search_text("")
             ui.set_search_text(name)
@@ -139,7 +146,7 @@ def open_chat_window(name, ui, read_boxes=ocr_engine.read_boxes, log=lambda msg:
             if not ui.is_front(main):
                 log("[開啟聊天視窗] 搜尋時主視窗不在前景，放棄。")
                 return False
-            rows = _find_rows(ui, main, box, name, read_boxes)
+            rows = _find_rows(ui, main, box, name, read_boxes, allow_member_count)
             if not rows:
                 log(f"[開啟聊天視窗] 「全部」分頁的搜尋結果裡也找不到「{name}」(名稱必須完全相符)，放棄。")
                 return False

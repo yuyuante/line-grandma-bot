@@ -162,6 +162,26 @@ class TestImageKind(unittest.TestCase):
         self.assertEqual(ik.normalize_text(" 早 安\n快乐 "), "早安快樂")
 
 
+class TestBirthdayWish(unittest.TestCase):
+    def test_real_wishes(self):
+        for text in ("生日快樂", "生日快乐", "祝你生日快樂", "生日愉快！", "Happy Birthday", "HAPPY BIRTHDAY!", "HBD", "祝福你生日", "祝媽媽生日快樂 身體健康"):
+            self.assertTrue(ik.is_birthday_wish(text), text)
+
+    def test_merely_mentioning_a_birthday_is_not_a_wish(self):
+        for text in ("明天是我生日", "他生日快到了", "今天誰生日", "生日", "", None):
+            self.assertFalse(ik.is_birthday_wish(text), text)
+
+    def test_short_text_mentioning_a_birthday_is_not_a_greeting_at_all(self):
+        # 文字訊息：「明天是我生日」連回一張生日圖都不該回 (不是祝福)；真的祝福照舊
+        for text in ("明天是我生日", "他生日快到了", "生日"):
+            self.assertIsNone(ik.classify_message(text), text)
+        self.assertTrue(ik.is_birthday(ik.classify_message("生日快樂")))
+        self.assertTrue(ik.is_birthday(ik.classify_message("祝你生日快樂")))
+
+    def test_images_keep_the_festival_classification_even_without_a_wish_phrase(self):
+        self.assertTrue(ik.is_birthday(ik.classify_text("生日蛋糕")))                 # 圖片：維持原本的「生日」節日，是否回謝謝由 is_birthday_wish 另外把關
+
+
 class TestIsBirthday(unittest.TestCase):
     def test_only_the_birthday_festival_counts(self):
         self.assertTrue(ik.is_birthday(ik.classify_message("生日快樂")))

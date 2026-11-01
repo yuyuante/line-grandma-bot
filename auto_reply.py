@@ -13,7 +13,7 @@ import os
 import json
 import time
 import random
-from datetime import datetime
+from datetime import datetime, date as _date, timedelta as _timedelta
 import glob
 import argparse
 import hashlib
@@ -22,6 +22,7 @@ import subprocess
 import logging
 import tempfile
 import ctypes
+import ctypes.wintypes
 import threading
 from io import BytesIO
 import re
@@ -33,7 +34,7 @@ import win32con
 import win32process
 import win32clipboard
 import psutil
-from PIL import Image, ImageGrab, ImageOps
+from PIL import Image, ImageChops, ImageGrab, ImageOps, ImageStat
 import pyautogui
 
 import notifier
@@ -47,7 +48,7 @@ from crawl_images import (crawl_grandma_images, clean_expired_images, retire_ima
                           download_and_validate_image, get_existing_md5s, build_candidate_urls,
                           build_candidates, normalize_sources)
 
-VERSION = "2.11.1"
+VERSION = "2.12.0"
 
 # 0. 全系統單一執行個體鎖 (Windows Named Mutex)，防止重複啟動繞過斷路器
 _app_mutex_handle = None
@@ -79,12 +80,88 @@ except Exception:
     except Exception:
         pass
 
-# 2. 設定標準日誌輸出 (包含版本號碼)
+# 2. 紀錄檔：每天一個檔 (logs/auto_reply_YYYY-MM-DD.log)，內容與畫面相同，只保留 log_keep_days 天；寫檔失敗絕不影響機器人
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+LOG_FILE_PATTERN = re.compile(r"^auto_reply_(\d{4}-\d{2}-\d{2})\.log$")
+_LOG_FILE_LOCK = threading.Lock()          # 啟動時的背景辨識執行緒也會寫 log，兩行不能交錯
+_file_log_settings = {"enabled": False, "keep_days": 7}      # 啟動後由 main() 的 configure_file_log 打開；匯入模組與單元測試都不會碰到真的 logs/
+_file_log_state = {"pruned_day": None}
+
+
+def _notifier_log_line(text):
+    """notifier 自己印的 [通知] 提示 (沒有權杖、被 LINE 拒絕、額度用完…) 也寫進紀錄檔"""
+    _write_log_file(f"[{time.strftime('%H:%M:%S')}][v{VERSION}] {text}")
+
+
+def configure_file_log(config):
+    """依設定開關檔案紀錄與保留天數 (主迴圈每輪呼叫，改 config.json 即時生效)"""
+    _file_log_settings["enabled"] = bool(config.get("log_to_file", True))
+    try:
+        _file_log_settings["keep_days"] = max(1, int(config.get("log_keep_days", 7)))
+    except (TypeError, ValueError):
+        _file_log_settings["keep_days"] = 7
+
+
+def _prune_old_logs(keep_days, today):
+    """刪掉 logs/ 底下「檔名符合 auto_reply_日期.log 且日期早於保留期限」的檔；其他檔名、子資料夾一律不碰。today 是 datetime.date"""
+    try:
+        names = os.listdir(LOG_DIR)
+    except OSError:
+        return
+    oldest_kept = today - _timedelta(days=keep_days - 1)
+    for name in names:
+        m = LOG_FILE_PATTERN.match(name)
+        path = os.path.join(LOG_DIR, name)
+        if not m or not os.path.isfile(path):
+            continue
+        try:
+            if _date.fromisoformat(m.group(1)) < oldest_kept:
+                os.remove(path)
+        except (ValueError, OSError):
+            pass
+
+
+def _write_log_file(text):
+    """把一行紀錄附加到今天的紀錄檔；任何例外一律吞掉 (最多少一行，不能拖垮機器人)"""
+    if not _file_log_settings["enabled"]:
+        return
+    try:
+        with _LOG_FILE_LOCK:
+            day = time.strftime("%Y-%m-%d")
+            os.makedirs(LOG_DIR, exist_ok=True)
+            if _file_log_state["pruned_day"] != day:
+                _file_log_state["pruned_day"] = day
+                _prune_old_logs(_file_log_settings["keep_days"], _date.fromisoformat(day))
+            with open(os.path.join(LOG_DIR, f"auto_reply_{day}.log"), "a", encoding="utf-8") as f:
+                f.write(text + "\n")
+    except Exception:
+        pass
+
+
+def banner_print(text=""):
+    """啟動橫幅：印在畫面，也寫進紀錄檔"""
+    print(text)
+    _write_log_file(text)
+
+
+class _FileLogHandler(logging.Handler):
+    """logging 模組的 WARNING 以上 (設定錯誤這類) 也寫進同一個紀錄檔"""
+    def emit(self, record):
+        try:
+            _write_log_file(self.format(record))
+        except Exception:
+            pass
+
+
+# 3. 設定標準日誌輸出 (包含版本號碼)
 logging.basicConfig(
     level=logging.INFO,
     format=f"[%(asctime)s][v{VERSION}] %(message)s",
     datefmt="%H:%M:%S"
 )
+_file_handler = _FileLogHandler(level=logging.WARNING)
+_file_handler.setFormatter(logging.Formatter(f"[%(asctime)s][v{VERSION}] %(message)s", datefmt="%H:%M:%S"))
+logging.getLogger().addHandler(_file_handler)
 
 ISOLATION_LOG_INTERVAL = 60.0              # 相同的 [安全隔離] 訊息最短間隔 (秒)
 _isolation_last = {}                       # 訊息樣式 -> (上次印出的 monotonic 時間, 之後被略過的次數)
@@ -126,6 +203,7 @@ def log_v(msg):
             print(full_text.encode(enc, errors="replace").decode(enc, errors="replace"))
         except Exception:
             print(full_text.encode("ascii", errors="replace").decode("ascii", errors="replace"))
+    _write_log_file(full_text)           # 紀錄檔 (log_to_file)：與畫面同樣的內容
     try:
         notifier.on_log(msg)             # 警告/錯誤標籤開頭的訊息 (已啟用 notify_log 時) 同步推播到 Notify Bot
     except Exception:
@@ -202,6 +280,8 @@ DEFAULT_CONFIG = {
     "group_max_replies_per_day": 1,     # 每個群組每天最多回覆幾次 (0 = 不限次數)
     "group_cooldown_seconds": 600,      # 同一個群組兩次回覆之間至少間隔幾秒 (多人連續傳圖時只回一次)
     "auto_open_chat_window": True,      # 好友的獨立聊天視窗不見時，自動從 LINE 主視窗的搜尋欄開回來 (關閉則找不到視窗就略過該則訊息)
+    "log_to_file": True,                # 程式自己寫紀錄檔：logs/auto_reply_日期.log，每天一個檔，內容與畫面相同 (不含聊天內容)
+    "log_keep_days": 7,                 # 紀錄檔保留幾天，更早的自動刪除
     "notify_log": False,                # 把啟動、回覆、停止與警告/錯誤推播到 LINE 官方帳號 (需 ~/.line-notify.env，見 notifier.py)
     "notify_monthly_cap": 150           # 每月最多推播則數 (官方帳號免費方案上限 200，留一些給手動測試)
 }
@@ -280,7 +360,7 @@ def load_config():
                 except Exception:
                     pass
         for k in ("replace_after_send", "collect_incoming_images", "auto_crawl_images", "close_window_after_send", "time_aware_images",
-                  "require_grandma_image", "auto_neutral_images", "auto_open_chat_window", "reply_to_text"):
+                  "require_grandma_image", "auto_neutral_images", "auto_open_chat_window", "reply_to_text", "log_to_file"):
             if k in cfg and isinstance(cfg[k], bool):
                 sanitized[k] = cfg[k]
         if isinstance(cfg.get("birthday_reply"), str):
@@ -300,7 +380,7 @@ def load_config():
                     if msg not in _WARNED_ONCE:
                         _WARNED_ONCE.add(msg)            # 主迴圈每秒讀一次設定，同一則警告只印一次
                         logging.warning(f"image_sources {msg}")
-        for k, minimum in (("max_replies_per_day", 0), ("max_image_pool", 1), ("instant_crawl_max_downloads", 1), ("text_reply_max_chars", 1)):
+        for k, minimum in (("max_replies_per_day", 0), ("max_image_pool", 1), ("instant_crawl_max_downloads", 1), ("text_reply_max_chars", 1), ("log_keep_days", 1)):
             if k in cfg:
                 try:
                     sanitized[k] = max(minimum, int(cfg[k]))
@@ -663,7 +743,6 @@ def is_authentic_grandma_image(image_path):
     """圖片檔是不是辨識得出性質的長輩圖 (見 _recognize_file)"""
     return _recognize_file(image_path)[0] is not None
 
-GRANDMA_SCREEN_MIN_WIDTH = 200  # (已不用於判斷貼圖：寬度會被貼圖旁的時間戳記撐大，也有窄的照片；改看「另存新檔」那一列。保留數值給舊程式碼與文件參考)
 GRANDMA_MEDIA_CROP_WIDTH = 420  # 截圖時從左側取樣帶起算的最大寬度 (邏輯像素)，涵蓋圖片縮圖又不會取到太多空白
 
 def _can_decode_image(path):
@@ -702,11 +781,6 @@ def _incoming_media_info(chat_hwnd):
         has_action_row = int((row[0] - row[1] + 1) / scale) < MEDIA_NOISE_MAX_HEIGHT and gap <= MEDIA_ACTION_GAP_MAX
     return shot.crop(box), int((max(xs) - min(xs) + 1) / scale), has_action_row
 
-def _incoming_media_crop(chat_hwnd):
-    """相容層：只要 (截圖, 圖片內容寬度)，細節見 _incoming_media_info"""
-    info = _incoming_media_info(chat_hwnd)
-    return None if info is None else info[:2]
-
 IMAGE_LOAD_WAIT_SECONDS = 8.0   # 圖片縮圖還在載入時 (灰色佔位方塊) 最多等幾秒；等不到變大才當成貼圖或文字
 IMAGE_LOAD_POLL_SECONDS = 1.0
 
@@ -728,7 +802,7 @@ def _recognize_chat_screenshot(chat_hwnd):
         time.sleep(IMAGE_LOAD_POLL_SECONDS)
     if found is None:
         return None, None, ""
-    crop, content_width, has_action_row = found
+    crop, _width, has_action_row = found      # 寬度不參與判斷 (見上)
     if not has_action_row:
         return False, None, ""            # 下面沒有「另存新檔」那一列：貼圖 (或圖片一直沒載入完成)
     try:
@@ -760,6 +834,51 @@ def recognize_incoming_image(triggered_file, chat_hwnd=None):
         pass
     return None, None, ""
 
+CHAT_SETTLE_TIMEOUT = 3.0       # 等聊天室畫面穩定的最長秒數 (視窗剛還原、剛最大化後 LINE 還在重新排版與捲動)
+CHAT_SETTLE_INTERVAL = 0.3      # 每隔多久截一次圖比較
+CHAT_SETTLE_TOLERANCE = 0.6     # 兩次截圖 (縮成 64x64 灰階) 平均每點亮度差小於此值才算「沒變」；輸入框游標閃爍只差一點點，不能算變動
+
+
+def _chat_signature(chat_hwnd):
+    """聊天室訊息區 (不含輸入框) 的 64x64 灰階縮圖，用來比較畫面有沒有還在變"""
+    rect = get_window_true_rect(chat_hwnd)
+    h = rect[3] - rect[1]
+    scale = 1.0
+    try:
+        dpi = ctypes.windll.user32.GetDpiForWindow(chat_hwnd)
+        if dpi > 0:
+            scale = dpi / 96.0
+    except Exception:
+        pass
+    top = rect[1] + int(h * 0.18)
+    bottom = rect[3] - int(145 * scale)
+    shot = ImageGrab.grab(bbox=(rect[0], top, rect[2], max(top + 50, bottom)), all_screens=True)
+    return shot.convert("L").resize((64, 64), Image.BILINEAR)
+
+
+def _wait_until_chat_settled(chat_hwnd, timeout=None, interval=None):
+    """
+    等聊天室畫面穩定 (連續兩次截圖幾乎一樣)；回傳是否穩定。真機實測：視窗偏窄時 is_last_message_from_self_in_chat
+    會暫時最大化再還原，還原後立刻截圖會讀不到最底部那則 (等 1.5 秒就讀得到)，所以讀文字之前一定要先等畫面穩定。
+    逾時、截圖失敗都回傳 False，由呼叫端照常往下 (讀不到就是「待確認，稍後重試」，不會誤回)。
+    """
+    timeout = CHAT_SETTLE_TIMEOUT if timeout is None else timeout
+    interval = CHAT_SETTLE_INTERVAL if interval is None else interval
+    deadline = time.time() + timeout
+    previous = None
+    while True:
+        try:
+            current = _chat_signature(chat_hwnd)
+        except Exception:
+            return False
+        if previous is not None and ImageStat.Stat(ImageChops.difference(previous, current)).mean[0] < CHAT_SETTLE_TOLERANCE:
+            return True
+        previous = current
+        if time.time() >= deadline:
+            return False
+        time.sleep(interval)
+
+
 TEXT_CROP_RIGHT_RATIO = 0.9     # 長文字氣泡可以很寬，右界取視窗寬度的這個比例 (氣泡右外側的時間 clean_text 會去掉)
 
 def _incoming_text_crop(chat_hwnd):
@@ -786,6 +905,7 @@ def recognize_incoming_text(chat_hwnd, max_chars=image_kind.TEXT_MESSAGE_MAX_CHA
         if not (chat_hwnd is not None and win32gui.IsWindow(chat_hwnd) and not win32gui.IsIconic(chat_hwnd)
                 and win32gui.IsWindowVisible(chat_hwnd) and win32gui.GetForegroundWindow() == chat_hwnd):
             return None, None, ""
+        _wait_until_chat_settled(chat_hwnd)              # 視窗剛還原後 LINE 還在重排，立刻讀會讀錯
         crop = _incoming_text_crop(chat_hwnd)
         if crop is None:
             return None, None, ""
@@ -1278,7 +1398,7 @@ def send_image_via_attach_dialog(chat_hwnd, image_path):
             return False
         time.sleep(0.2)
     return True
-TEXT_SEND_CONFIRM_TIMEOUT = 3.0     # 按 Enter 後等輸入框清空 (LINE 收下並送出) 的秒數
+TEXT_SEND_CONFIRM_TIMEOUT = 6.0     # 按 Enter 後等輸入框清空 (LINE 收下並送出) 的秒數；LINE 偶爾反應慢，等太短會把「慢」當成「沒送出」而重送
 
 
 def _find_message_input(chat_hwnd):
@@ -1294,8 +1414,11 @@ def _find_message_input(chat_hwnd):
 def send_text_via_input(chat_hwnd, text):
     """
     把一句文字送進聊天室：用 UIA 直接寫入輸入框 (不經剪貼簿與鍵盤輸入，所以不受輸入法影響、不動到剪貼簿)，讀回來比對後按 Enter。
-    回傳 True 表示已按 Enter 且輸入框已清空 (LINE 已收下)；任何一步沒把握都清掉自己寫的字並回傳 False：
+    回傳 True 表示已按 Enter 且輸入框已清空 (LINE 已收下)；按 Enter 之前任何一步沒把握都清掉自己寫的字並回傳 False：
     輸入框裡本來就有尚未送出的草稿 (絕不覆蓋、也不跟草稿一起送出)、寫入後讀回不一致、按 Enter 前焦點被轉走。
+    **按了 Enter 之後**：輸入框清空 -> True；讀取輸入框時發生例外 (無法確認有沒有送出) -> 也回傳 True (視為已送出，絕不重送，
+    與圖片「按了 Enter 就算送出」同一個原則，寧可少送一次也不重複送「謝謝」)；只有等滿時間、確定輸入框裡還留著我們的字，
+    才清掉並回傳 False (確定沒送出，可以安全重試)。
     """
     if not text or not text.strip():
         return False
@@ -1303,6 +1426,7 @@ def send_text_via_input(chat_hwnd, text):
     if edit is None:
         log_v("[安全攔截] 找不到訊息輸入框，終止發送。")
         return False
+    pressed = False
     try:
         pattern = edit.GetValuePattern()
         if (pattern.Value or "").strip():
@@ -1322,15 +1446,19 @@ def send_text_via_input(chat_hwnd, text):
             pattern.SetValue("")
             return False
         pyautogui.press("enter")
+        pressed = True
         deadline = time.time() + TEXT_SEND_CONFIRM_TIMEOUT
         while time.time() < deadline:
             time.sleep(0.2)
             if not (pattern.Value or "").strip():
                 return True
-        log_v("[安全攔截] 按 Enter 後輸入框沒有清空，無法確認已送出，取消並清掉輸入框。")
+        log_v("[安全攔截] 按 Enter 後輸入框一直留著我們的字，判定沒送出，取消並清掉輸入框。")
         pattern.SetValue("")
         return False
     except Exception as e:
+        if pressed:
+            log_v(f"[警告] 按了 Enter 之後無法確認文字有沒有送出 ({e})，視為已送出，不重送。")
+            return True
         log_v(f"[安全攔截] 送出文字時發生例外: {e}")
         try:
             edit.GetValuePattern().SetValue("")
@@ -1433,6 +1561,10 @@ def title_matches_target(title, name):
     return t.lower() == (name or "").strip().lower()
 
 
+_DUPLICATE_WINDOW_SEEN = {}                # {名稱 (小寫): 上次發現桌面上有重複同名視窗的時間}；重複視窗時 find 會回傳 []，開窗必定失敗
+DUPLICATE_WINDOW_SKIP_SECONDS = 5.0
+
+
 def find_group_chat_window(target_name):
     """尋找群組的獨立聊天視窗：標題必須是「名稱」或「名稱 (成員數)」，且桌面上只能有一個；絕不匹配 LINE 主視窗"""
     main_hwnd = find_line_main_window()
@@ -1445,6 +1577,7 @@ def find_group_chat_window(target_name):
         if title_matches_target(title, target_name):
             found.append((hwnd, title, cls, vis))
     if len(found) > 1:
+        _DUPLICATE_WINDOW_SEEN[target_name.strip().lower()] = time.time()
         log_v(f"[致命安全攔截] 偵測到桌面上存在 {len(found)} 個符合群組「{target_name}」的視窗 (重名或重複開啟衝突)，為防誤傳，嚴格拒絕發送！")
         return []
     return found
@@ -1508,6 +1641,7 @@ def find_target_chat_window(target_name):
 
     # 嚴格禁止任何形式的重名或重複開啟 (即使一個已讀、一個未讀亦徹底攔截，杜絕誤傳)
     if len(all_matched) > 1:
+        _DUPLICATE_WINDOW_SEEN[target_name.strip().lower()] = time.time()
         log_v(f"[致命安全攔截] 偵測到桌面上存在 {len(all_matched)} 個符合「{target_name}」的視窗 (重名或重複開啟衝突)，為防誤傳，嚴格拒絕發送！")
         return []
 
@@ -1611,6 +1745,14 @@ def focus_chat_input(hwnd, target_name=None):
             click_x = rect[0] + int(w * 0.5)
         scale = get_system_dpi_scale(hwnd)
         click_y = rect[1] + h - int(75 * scale)
+        top = _root_window_at(click_x, click_y)
+        if top != hwnd:
+            _raise_to_top(hwnd)                 # 焦點對了但被別的視窗蓋住：提到最上層再核對一次
+            time.sleep(0.2)
+            top = _root_window_at(click_x, click_y)
+        if top != hwnd:
+            log_v(f"[安全攔截] 輸入框座標最上面的視窗 (HWND: {top}) 不是「{target_name or hwnd}」(HWND: {hwnd})，為免點到別的視窗，禁止點擊！")
+            return False
         pyautogui.click(click_x, click_y)
         time.sleep(0.3)
         return True
@@ -1737,8 +1879,37 @@ def open_missing_chat_window(name, config):
     """好友的獨立聊天視窗不見了：從 LINE 主視窗的搜尋欄開回來 (auto_open_chat_window 關閉時不做)；成功回傳 True"""
     if not config.get("auto_open_chat_window", True):
         return False
+    if time.time() - _DUPLICATE_WINDOW_SEEN.get(name.strip().lower(), -1e9) < DUPLICATE_WINDOW_SKIP_SECONDS:
+        log_v(f" -> 「{name}」不是沒有視窗，而是桌面上有重複的同名視窗；請關掉多餘的，不去搶 LINE 主視窗開窗。")
+        return False
     log_v(f" -> 找不到「{name}」的獨立聊天視窗，嘗試從 LINE 主視窗開啟...")
-    return chat_opener.open_chat_window(name, LineMainUi(), log=log_v)
+    return chat_opener.open_chat_window(name, LineMainUi(), log=log_v, allow_member_count=is_group_target(name))
+
+OPEN_ATTEMPT_MIN_INTERVAL = 60.0           # 同一個對象，偵測階段最短隔多久才再從主視窗開窗一次
+_LAST_OPEN_ATTEMPT = {}
+
+
+def _worth_opening_window(target, config, now, cooldown):
+    """
+    圖片快取偵測到新圖、但對象的視窗不在時，要不要去搶 LINE 主視窗把視窗開回來。只做不碰任何視窗的便宜檢查：
+    今天已達回覆上限、還在冷卻、或剛嘗試開過 (每個對象每分鐘最多一次) 就不開，因為反正不會回覆，不值得打擾你的主視窗。
+    (是不是貼圖、是不是長輩圖要等視窗開了才看得出來，那一步沒辦法省。)
+    """
+    if is_group_target(target):
+        max_per_day = config.get("group_max_replies_per_day", DEFAULT_CONFIG["group_max_replies_per_day"])
+        cd = config.get("group_cooldown_seconds", DEFAULT_CONFIG["group_cooldown_seconds"])
+    else:
+        max_per_day = config.get("max_replies_per_day", reply_budget.DEFAULT_MAX_PER_DAY)
+        cd = cooldown
+    if not reply_budget.can_reply(REPLY_COUNTS_PATH, target, max_per_day):
+        return False
+    if now - last_reply_times.get(target, 0) < cd:
+        return False
+    if now - _LAST_OPEN_ATTEMPT.get(target, -1e9) < OPEN_ATTEMPT_MIN_INTERVAL:
+        return False
+    _LAST_OPEN_ATTEMPT[target] = now
+    return True
+
 
 def activate_window(hwnd):
     try:
@@ -1750,15 +1921,95 @@ def activate_window(hwnd):
         pyautogui.press('alt')
         win32gui.SetForegroundWindow(hwnd)
         time.sleep(0.3)
+        if win32gui.GetForegroundWindow() != hwnd:
+            _force_foreground(hwnd)
+        _raise_to_top(hwnd)
         return True
     except Exception as e:
         log_v(f"[警告] 前景切換失敗: {e}")
         return False
 
+
+def _raise_to_top(hwnd):
+    """
+    把視窗提到所有一般視窗的最上層 (不搶焦點、不改大小位置)。真機實測：被放到最底層的視窗即使成了前景 (焦點對了)，
+    仍可能被別的視窗蓋住，這時點輸入框點到的是上面那個視窗。
+    """
+    try:
+        win32gui.SetWindowPos(hwnd, win32con.HWND_TOP, 0, 0, 0, 0,
+                              win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE)
+    except Exception:
+        pass
+
+
+def _root_window_at(x, y):
+    """螢幕座標 (x, y) 最上面那個視窗的最上層擁有者；讀不到回傳 None"""
+    try:
+        user32 = ctypes.windll.user32
+        point = ctypes.wintypes.POINT(int(x), int(y))
+        found = user32.WindowFromPoint(point)
+        return user32.GetAncestor(found, 2) or found or None      # 2 = GA_ROOT
+    except Exception:
+        return None
+
+
+def _force_foreground(hwnd):
+    """
+    一般的 SetForegroundWindow 被 Windows 的前景鎖擋下時 (真機實測：展開、放在最底層的視窗，使用者正在別的視窗打字時就會失敗) 的備案：
+    先附加到目前前景視窗的輸入執行緒再切換；還是不行就縮小再還原 (還原一定會啟用視窗)。回傳是否已在前景。
+    每個階段的結果都寫進紀錄，方便查是哪一步被擋。
+    """
+    def in_front():
+        try:
+            return win32gui.GetForegroundWindow() == hwnd
+        except Exception:
+            return False
+
+    try:
+        user32 = ctypes.windll.user32
+        fg = win32gui.GetForegroundWindow()
+        fg_thread = win32process.GetWindowThreadProcessId(fg)[0] if fg else 0
+        me = ctypes.windll.kernel32.GetCurrentThreadId()
+        attached = bool(fg_thread and fg_thread != me and user32.AttachThreadInput(me, fg_thread, True))
+        try:
+            win32gui.BringWindowToTop(hwnd)
+            win32gui.SetForegroundWindow(hwnd)
+        finally:
+            if attached:
+                user32.AttachThreadInput(me, fg_thread, False)
+        time.sleep(0.2)
+        if in_front():
+            log_v(f" -> [前景切換] 一般切換被擋，改附加輸入執行緒 (附加={attached}) 後成功。")
+            return True
+        win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
+        time.sleep(0.2)
+        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+        time.sleep(0.3)
+    except Exception as e:
+        log_v(f"[警告] 前景切換備案發生例外: {e}")
+    ok = in_front()
+    log_v(f" -> [前景切換] 一般切換與附加輸入執行緒都被擋，改用縮小再還原：{'成功' if ok else '仍失敗'}。")
+    return ok
+
+
+_BACKGROUND_WINDOWS = set()     # 文字偵測在看的視窗 (展開、放背景)：回覆完要放回最底層，不能縮小 (縮小後 LINE 不顯示任何新訊息記號)
+
+
+def _send_to_background(hwnd):
+    """把視窗放到所有視窗的最底層，不縮小、不搶焦點、不改大小位置"""
+    win32gui.SetWindowPos(hwnd, win32con.HWND_BOTTOM, 0, 0, 0, 0,
+                          win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE)
+
+
 def _minimize_if_configured(hwnd, config, log_target=None):
-    """安全將視窗最小化以維持後續未讀狀態"""
+    """安全將視窗最小化以維持後續未讀狀態；文字偵測在看的視窗改放到最底層 (維持展開才偵測得到下一則)"""
     if config.get("close_window_after_send", True) and hwnd:
         try:
+            if hwnd in _BACKGROUND_WINDOWS:
+                _send_to_background(hwnd)
+                if log_target:
+                    log_v(f" -> 已將「{log_target}」視窗放到背景，維持展開以偵測下一則文字。")
+                return
             win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
             if log_target:
                 log_v(f" -> 已自動將「{log_target}」視窗最小化，維持後續未讀狀態。")
@@ -1967,6 +2218,20 @@ def load_chat_dirs_map():
     except Exception as e:
         log_v(f"[警告] 讀取 chat_dirs.json 失敗: {e}")
         return {}
+
+
+def channel_label(chat_hash):
+    """
+    紀錄裡的快取頻道標示：已綁定的帶聊天室名稱，例如「b1acf4e0...」(林如婷)；沒綁定的標「未綁定」。
+    頻道代號是 LINE 自己產生的雜湊，光看代號分不出是誰，所以每一行紀錄都一起帶出名稱。
+    """
+    short = f"「{(chat_hash or '')[:8]}...」"
+    try:
+        name = next((n for h, n in load_chat_dirs_map().items() if h.lower() == (chat_hash or "").lower()), None)
+    except Exception:
+        name = None
+    return f"{short}({name})" if name else f"{short}(未綁定)"
+
 
 def load_provisional_bindings():
     """從 chat_dirs.json 安全讀取已持久化之暫定綁定清單，支援跨重啟延續核驗 (🔴 核心修復：防止重啟遺失暫定狀態)"""
@@ -2324,7 +2589,7 @@ def try_auto_bind_channel(ch, cand_path, cand_m, targets, chat_dirs_map, competi
     # 1. 訊息內容指紋異動驗證與防漂移核驗 (🔴 核心防禦：Fail-Closed)：
     state = _TARGET_WINDOW_STATE.get(target_name)
     if state is None or state["consumed"] or state["changed_at"] == 0.0:
-        log_v(f"[安全隔離] 快取頻道「{ch[:8]}...」抵達，目標好友「{target_name}」視窗近期無未消費的新訊息異動，拒絕自動綁定！")
+        log_v(f"[安全隔離] 快取頻道{channel_label(ch)}抵達，目標好友「{target_name}」視窗近期無未消費的新訊息異動，拒絕自動綁定！")
         return None
 
     now_wall = time.time()
@@ -2347,7 +2612,7 @@ def try_auto_bind_channel(ch, cand_path, cand_m, targets, chat_dirs_map, competi
     # 2. 時間範圍相關性驗證 (中度防禦：精準以圖片出現時間 media_seen_at 比對 ±AUTOBIND_TIME_WINDOW)：
     time_diff = cand_m - first_t
     if cand_m < first_t - AUTOBIND_TIME_WINDOW or cand_m > last_t + AUTOBIND_TIME_WINDOW:
-        log_v(f"[安全隔離] 快取頻道「{ch[:8]}...」寫入時間 ({cand_m:.1f}) 與視窗變更時間 ({first_t:.1f}) 差距超標 ({time_diff:+.1f}s)，拒絕自動綁定！")
+        log_v(f"[安全隔離] 快取頻道{channel_label(ch)}寫入時間 ({cand_m:.1f}) 與視窗變更時間 ({first_t:.1f}) 差距超標 ({time_diff:+.1f}s)，拒絕自動綁定！")
         return None
 
     if ref_media_t is not None:
@@ -2356,12 +2621,12 @@ def try_auto_bind_channel(ch, cand_path, cand_m, targets, chat_dirs_map, competi
             diff_media = abs(cand_m - ref_media_t)
             diff_first = abs(cand_m - first_t)
             if diff_media > AUTOBIND_TIME_WINDOW and diff_first > AUTOBIND_TIME_WINDOW:
-                log_v(f"[安全隔離] 快取頻道「{ch[:8]}...」寫入時間 ({cand_m:.1f}) 與延遲縮圖時間差距超標，拒絕自動綁定！")
+                log_v(f"[安全隔離] 快取頻道{channel_label(ch)}寫入時間 ({cand_m:.1f}) 與延遲縮圖時間差距超標，拒絕自動綁定！")
                 return None
         else:
             # 🟡 核心防禦 3：一般即時照片，快取檔案寫入時間必須嚴格落在圖片時間 ±AUTOBIND_TIME_WINDOW 內！
             if abs(cand_m - ref_media_t) > AUTOBIND_TIME_WINDOW:
-                log_v(f"[安全隔離] 快取頻道「{ch[:8]}...」寫入時間 ({cand_m:.1f}) 與圖片出現時間 ({ref_media_t:.1f}) 差距超標，拒絕自動綁定！")
+                log_v(f"[安全隔離] 快取頻道{channel_label(ch)}寫入時間 ({cand_m:.1f}) 與圖片出現時間 ({ref_media_t:.1f}) 差距超標，拒絕自動綁定！")
                 return None
 
     # 3. 媒體類型與實體位置方向核驗 (快照若因延遲載入為 False，在綁定前即時重測一次)：
@@ -2383,16 +2648,16 @@ def try_auto_bind_channel(ch, cand_path, cand_m, targets, chat_dirs_map, competi
             state["is_thumbnail_settle"] = True
             # 🟡 核心防禦：重測後嚴格核驗時間範圍！延遲縮圖快取檔案時間必須在抵達時間 (first_t) 或重測渲染時間 (now_retest) ±AUTOBIND_TIME_WINDOW (6.0s) 之內
             if abs(cand_m - now_retest) > AUTOBIND_TIME_WINDOW and abs(cand_m - first_t) > AUTOBIND_TIME_WINDOW:
-                log_v(f"[安全隔離] 快取頻道「{ch[:8]}...」寫入時間 ({cand_m:.1f}) 與延遲重測時間 ({now_retest:.1f}) 及抵達時間 ({first_t:.1f}) 差距超標，拒絕自動綁定！")
+                log_v(f"[安全隔離] 快取頻道{channel_label(ch)}寫入時間 ({cand_m:.1f}) 與延遲重測時間 ({now_retest:.1f}) 及抵達時間 ({first_t:.1f}) 差距超標，拒絕自動綁定！")
                 return None
             # 🟢 不更新 last_fp_change，避免將有效上界往後推！
 
     if not has_media:
-        log_v(f"[安全隔離] 快取頻道「{ch[:8]}...」為圖片/貼圖，但目標好友「{target_name}」異動訊息無真實圖片控制項 (純文字訊息)，拒絕自動綁定！")
+        log_v(f"[安全隔離] 快取頻道{channel_label(ch)}為圖片/貼圖，但目標好友「{target_name}」異動訊息無真實圖片控制項 (純文字訊息)，拒絕自動綁定！")
         return None
 
     if not is_incoming:
-        log_v(f"[安全隔離] 快取頻道「{ch[:8]}...」抵達，但目標好友「{target_name}」異動圖片為本機送出 (靠右對齊)，拒絕自動綁定！")
+        log_v(f"[安全隔離] 快取頻道{channel_label(ch)}抵達，但目標好友「{target_name}」異動圖片為本機送出 (靠右對齊)，拒絕自動綁定！")
         return None
 
     # 4. 通過所有核驗，原子持久化儲存 (成功後才標記已消費)
@@ -2411,7 +2676,7 @@ def try_auto_bind_channel(ch, cand_path, cand_m, targets, chat_dirs_map, competi
             chat_dirs_map[ch] = target_name
         state["consumed"] = True
         _PROVISIONAL_BINDINGS[ch] = p_info
-        log_v(f"[自動學習綁定] 快取頻道「{ch[:8]}...」經視窗多媒體指紋與接收狀態核驗無誤，已成功自動綁定至「{target_name}」！")
+        log_v(f"[自動學習綁定] 快取頻道{channel_label(ch)}經視窗多媒體指紋與接收狀態核驗無誤，已成功自動綁定至「{target_name}」！")
         return target_name
     except Exception as e:
         chat_dirs_map.pop(ch, None)
@@ -2809,6 +3074,7 @@ def _media_type_with_retry(chat_hwnd, expect_media=False):
     會被看成文字氣泡，所以判成文字也要重試，最多等 IMAGE_LOAD_WAIT_SECONDS 秒。
     """
     result = None
+    _wait_until_chat_settled(chat_hwnd)    # 前一步檢查自己訊息會最大化再還原視窗，畫面還在重排時判斷會讀錯
     attempts = MEDIA_CHECK_ATTEMPTS
     wait = MEDIA_CHECK_RETRY_WAIT
     if expect_media:
@@ -3038,9 +3304,80 @@ def _expanded_window_signature(hwnd):
             r = item.BoundingRectangle
             return (r.left, r.top, r.right, r.bottom)
 
-        return (len(items), rect(items[-1]), rect(items[-2]) if len(items) > 1 else None)
+        def ident(item):
+            # 每個列表項目有獨一無二的 runtime ID：列表已滿時新訊息把舊的擠出去，項目數與最底部位置可能完全不變，只有 ID 會換
+            try:
+                return tuple(item.GetRuntimeId())
+            except Exception:
+                return None
+
+        return (len(items), rect(items[-1]), rect(items[-2]) if len(items) > 1 else None,
+                ident(items[-1]), ident(items[-2]) if len(items) > 1 else None)
     except Exception:
         return None
+
+TEXT_WATCH_MIN_INTERVAL = 5.0     # 同一個聊天室兩次「列表變了」觸發之間最短間隔 (秒)
+_TEXT_SEEN_SIG = {}               # {聊天室: 上次記下的訊息列表簽章}
+_TEXT_LAST_TRIGGER = {}           # {聊天室: 上次觸發的時間}
+
+
+def _user_is_viewing(hwnd):
+    """
+    你正在看這個視窗：它是前景視窗，而且視窗中心點最上面真的是它。
+    只看前景不夠：回覆完我們把視窗放到最底層，但它仍是「前景視窗」(只是被別的視窗蓋住)，
+    這時你看不到它，之後進來的新文字卻會被當成你正在看而漏掉 (真機實測 2026-11-01 19:39)。
+    """
+    try:
+        if win32gui.GetForegroundWindow() != hwnd:
+            return False
+        left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+        return _root_window_at((left + right) // 2, (top + bottom) // 2) == hwnd
+    except Exception:
+        return True                       # 讀不到：保守當成你正在看，不去打擾
+
+
+def text_window_changed(windows, target, config):
+    """
+    一對一視窗展開、放在背景時，訊息列表有變化 (對方傳來新文字，或我們自己剛送出東西) 回傳 True。
+    真機實測 (2026-11-01)：這個版本的 LINE 獨立視窗不論縮小或展開，標題都不顯示未讀數，所以文字訊息只能靠列表變化偵測 (同停止指令)。
+    視窗縮小或沒開：偵測不到 (清掉舊簽章)。視窗在前景 (你正在看)：只更新簽章不觸發。
+    停止指令的聊天室不看 (官方帳號的推播會讓它一直變)。觸發時不更新簽章，由呼叫端處理完再 text_window_rebaseline，
+    處理失敗 (本次沒送出) 就保留舊簽章，下一輪還會再試。
+    """
+    if target in (config.get("stop_command_chats") or []):
+        return False
+    hwnd = _window_hwnd(windows, target)
+    sig = _expanded_window_signature(hwnd) if hwnd else None
+    if sig is None:
+        _TEXT_SEEN_SIG.pop(target, None)
+        _BACKGROUND_WINDOWS.discard(hwnd)
+        return False
+    old = _TEXT_SEEN_SIG.get(target)
+    if old is None or sig == old:
+        _TEXT_SEEN_SIG[target] = sig
+        return False
+    if _user_is_viewing(hwnd):
+        _TEXT_SEEN_SIG[target] = sig
+        return False
+    if time.time() - _TEXT_LAST_TRIGGER.get(target, 0.0) < TEXT_WATCH_MIN_INTERVAL:
+        return False
+    _TEXT_LAST_TRIGGER[target] = time.time()
+    _BACKGROUND_WINDOWS.add(hwnd)
+    return True
+
+
+def text_window_rebaseline(target):
+    """處理完 (含略過) 後記下現在的列表簽章，之後只有再變化才觸發"""
+    try:
+        matched = _window_hwnd(get_all_line_windows(), target)
+        sig = _expanded_window_signature(matched) if matched else None
+        if sig is not None:
+            _TEXT_SEEN_SIG[target] = sig
+        else:
+            _TEXT_SEEN_SIG.pop(target, None)
+    except Exception:
+        pass
+
 
 def init_stop_baselines(config, chats=None):
     """啟動 (或熱重載新增聊天室時) 記下停止指令聊天室目前的視窗簽章，避免先前留在聊天室的舊指令在啟動後立刻停止程式"""
@@ -3296,6 +3633,31 @@ def choose_reply_image(target_name, incoming_kind, incoming_text, config):
         library = image_library.scan_library(abs_dir, KIND_INDEX, log=log_v)     # 抓的過程中留下的庫存，下一個池子可能用得到
     return None
 
+def _peek_incoming_text(target_name, config):
+    """
+    文字觸發時，在「隨機等待」之前先把視窗帶到前景看一眼最後一則文字是不是短問候或祝福，看完馬上縮回去。
+    不是就不用睡 5~900 秒 (主迴圈是單執行緒，睡著時其他好友都被擋住)，也不必往下走。
+    回傳 (狀態, 性質, 文字)，同 recognize_incoming_text：True / False / None (暫時看不到，稍後重試)。
+    """
+    matched = find_target_chat_window(target_name)
+    if not matched:
+        return None, None, ""
+    hwnd = matched[0][0]
+    try:
+        if win32gui.IsIconic(hwnd):
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            time.sleep(0.3)
+        activate_window(hwnd)
+        time.sleep(0.4)
+        if win32gui.GetForegroundWindow() != hwnd:
+            return None, None, ""
+        if is_last_message_from_self_in_chat(hwnd):
+            return False, None, ""                      # 最底部是自己發的：沒有新訊息要回
+        return recognize_incoming_text(hwnd, config.get("text_reply_max_chars", image_kind.TEXT_MESSAGE_MAX_CHARS))
+    finally:
+        _minimize_if_configured(hwnd, config)
+
+
 def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_file=None, text_trigger=False):
     """執行長輩圖發送"""
     global last_global_reply_time
@@ -3324,11 +3686,20 @@ def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_f
             return _skip_not_grandma(target_name, triggered_file, config, incoming_text)
         if state:
             log_v(f" -> [長輩圖識別]「{target_name}」傳來的圖通過識別，性質：{incoming_kind.label}。")
-            if thanks_enabled and image_kind.is_birthday(incoming_kind):
+            if thanks_enabled and image_kind.is_birthday(incoming_kind) and image_kind.is_birthday_wish(incoming_text):
                 reply_text = thanks_text
         deferred_identify = state is None     # 加密快取且視窗不在前景：等實際要回覆、視窗已帶到前景時再用截圖辨識
     else:
         incoming_kind = image_kind.ImageKind("greeting")     # 關閉識別：不管對方傳什麼，一律照現在時段回問候圖 (舊行為)
+
+    if deferred_text:
+        peek_state, _peek_kind, _peek_text = _peek_incoming_text(target_name, config)
+        if peek_state is None:
+            log_v(f"[文字識別待確認]「{target_name}」暫時看不到最後一則文字，本次不處理，稍後重試。")
+            return "NOT_SENT"
+        if not peek_state:
+            log_v(f"[文字訊息略過]「{target_name}」最後一則文字不是短問候或祝福 (太長、不是問候、競選相關或讀不到字)，不回覆。")
+            return "SKIPPED_TEXT"
 
     # 借花獻佛：僅精確收納本次觸發該回覆的圖片，絕不掃描其他聊天室快取
     if config.get("collect_incoming_images", True) and triggered_file:
@@ -3444,7 +3815,7 @@ def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_f
             _minimize_if_configured(chat_hwnd, config)
             return "SKIPPED_TEXT"
         log_v(f" -> [文字識別]「{target_name}」傳來的文字通過識別，性質：{incoming_kind.label}。")
-        if thanks_enabled and image_kind.is_birthday(incoming_kind):
+        if thanks_enabled and image_kind.is_birthday(incoming_kind) and image_kind.is_birthday_wish(incoming_text):
             reply_text = thanks_text
             log_v(f" -> 對方傳來的是生日祝福，只回一句「{reply_text}」，不回圖。")
         elif not config.get("reply_to_text", True):
@@ -3468,7 +3839,7 @@ def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_f
             _minimize_if_configured(chat_hwnd, config)
             return _skip_not_grandma(target_name, triggered_file, config, incoming_text)
         log_v(f" -> [長輩圖識別]「{target_name}」傳來的圖通過識別 (視窗截圖)，性質：{incoming_kind.label}。")
-        if thanks_enabled and image_kind.is_birthday(incoming_kind):
+        if thanks_enabled and image_kind.is_birthday(incoming_kind) and image_kind.is_birthday_wish(incoming_text):
             reply_text = thanks_text
             log_v(f" -> 對方傳來的是生日祝福，只回一句「{reply_text}」，不回圖。")
         else:
@@ -3715,6 +4086,22 @@ def check_for_incoming_messages(config):
         if target_to_reply:
             break
 
+    # 1b. 文字訊息：視窗展開、放在背景時看訊息列表有沒有變化 (標題沒有未讀數的 LINE 版本只能這樣偵測)
+    if not target_to_reply and (config.get("reply_to_text", True) or birthday_reply_text(config)) and config.get("require_grandma_image", True):
+        for target in targets:
+            if is_group_target(target):
+                continue
+            try:
+                changed = text_window_changed(windows, target, config)
+            except Exception as e:
+                log_v(f"[警告] 檢查「{target}」的訊息列表時發生例外: {e}")
+                continue
+            if changed and current_time - last_reply_times.get(target, 0) >= cooldown and current_time - LAST_SENT_TIME_BY_TARGET.get(target, 0) >= 5:
+                log_v(f" -> [文字訊息觸發]「{target}」視窗的訊息列表有變化，準備讀取最後一則文字！")
+                target_to_reply = target
+                text_trigger = True
+                break
+
     # 2. 次要檢查：底層快取新圖片監聽 (照片與貼圖專屬通道)
     if not target_to_reply:
         prune_ignored_cache_files()
@@ -3905,7 +4292,7 @@ def check_for_incoming_messages(config):
 
                     if cand_target and cand_target in targets:
                         matched = find_target_chat_window(cand_target)
-                        if not matched and open_missing_chat_window(cand_target, config):
+                        if not matched and _worth_opening_window(cand_target, config, current_time, cooldown) and open_missing_chat_window(cand_target, config):
                             matched = find_target_chat_window(cand_target)
                         if matched:
                             # 電腦版獨立視窗標題正常為好友名稱 (不帶括號未讀數)，視窗上線即刻確認
@@ -3917,18 +4304,18 @@ def check_for_incoming_messages(config):
                         else:
                             PROCESSED_CACHE_FILES.add((cand_path, cand_m))
                             max_processed_m = max(max_processed_m, cand_m)
-                            log_v(f"[安全隔離] 快取頻道「{ch[:8]}...」對應「{cand_target}」，但桌面無該好友專屬視窗，安全略過。")
+                            log_v(f"[安全隔離] 快取頻道{channel_label(ch)}對應「{cand_target}」，但桌面無該好友專屬視窗，安全略過。")
                     else:
                         # 中度 #2 防禦：若為尚未綁定之頻道，暫緩加入 PROCESSED_CACHE_FILES，並納入 deferred_mtimes 防吞
                         if ch and ch not in chat_dirs_map:
                             file_age = current_time - cand_m
                             if file_age <= AUTOBIND_TIMEOUT:
                                 deferred_mtimes.append(cand_m)
-                                log_v(f"[安全暫緩] 快取頻道「{ch[:8]}...」暫未匹配視窗異動 (保留重試機會，暫不標記為已處理)。")
+                                log_v(f"[安全暫緩] 快取頻道{channel_label(ch)}暫未匹配視窗異動 (保留重試機會，暫不標記為已處理)。")
                             else:
                                 PROCESSED_CACHE_FILES.add((cand_path, cand_m))
                                 max_processed_m = max(max_processed_m, cand_m)
-                                log_v(f"[安全隔離] 快取頻道「{ch[:8]}...」超逾 15 秒未通過目標綁定核驗，標記略過。")
+                                log_v(f"[安全隔離] 快取頻道{channel_label(ch)}超逾 15 秒未通過目標綁定核驗，標記略過。")
                         else:
                             PROCESSED_CACHE_FILES.add((cand_path, cand_m))
                             max_processed_m = max(max_processed_m, cand_m)
@@ -3955,7 +4342,7 @@ def check_for_incoming_messages(config):
             elif current_time - last_reply_times.get(chosen_target, 0) >= eff_cooldown:
                 target_to_reply = chosen_target
                 new_image_found = chosen_candidate
-                log_v(f"\n[即時偵測] 鎖定快取頻道「{extract_chat_hash_from_path(new_image_found)[:8]}...」對應好友「{target_to_reply}」收到新貼圖/照片！(檔案: {os.path.basename(new_image_found)})")
+                log_v(f"\n[即時偵測] 鎖定快取頻道{channel_label(extract_chat_hash_from_path(new_image_found))}收到新貼圖/照片！(檔案: {os.path.basename(new_image_found)})")
             else:
                 remain = int(eff_cooldown - (current_time - last_reply_times.get(chosen_target, 0)))
                 log_v(f"[冷卻中]「{chosen_target}」距上次回覆未滿 {int(eff_cooldown)} 秒 (剩餘 {remain} 秒)，本次新圖不回覆。")
@@ -3978,6 +4365,8 @@ def check_for_incoming_messages(config):
         send_result = send_grandma_image(target_to_reply, config, triggered_file=new_image_found, text_trigger=text_trigger)
         # 對方只傳文字而略過時沒有送出任何東西，不啟動冷卻 (避免擋住隨後真正的新圖)
         last_reply_times[target_to_reply] = prev_reply_time if send_result in SKIPPED_RESULTS else time.time()
+        if text_trigger and send_result != "NOT_SENT":
+            text_window_rebaseline(target_to_reply)          # 沒送出 (NOT_SENT) 就保留舊簽章，下一輪再試
 
         if send_result in ("SENT_CONFIRMED", "SENT_UNCERTAIN") + SKIPPED_RESULTS:
             # 為防重複刷屏一律視為已處理並更新基準線 (SKIPPED_TEXT：對方只傳文字，同樣標記已處理且不重試)
@@ -4373,31 +4762,33 @@ def main():
         log_v(f"手動測試結果: {result}")
         return
 
-    print("=" * 65)
-    print(f"  LINE 電腦版 - 長輩圖智慧自動回覆程式 v{VERSION} (常駐背景)")
-    print("=" * 65)
-    print(f"程式版本 (version)       : v{VERSION}")
-    print(f"監控對象名單 (targets)   : {config.get('targets', [])}")
+    configure_file_log(config)        # 先打開檔案紀錄，橫幅也要寫進去
+    banner_print("=" * 65)
+    banner_print(f"  LINE 電腦版 - 長輩圖智慧自動回覆程式 v{VERSION} (常駐背景)")
+    banner_print("=" * 65)
+    banner_print(f"程式版本 (version)       : v{VERSION}")
+    banner_print(f"監控對象名單 (targets)   : {config.get('targets', [])}")
     t_mode = config.get('trigger_mode', 'photo_and_sticker')
     mode_desc = "照片與貼圖皆回" if t_mode == "photo_and_sticker" else ("只回照片" if t_mode == "photo_only" else "文字照片貼圖皆回")
-    print(f"觸發模式 (trigger_mode)  : {t_mode} ({mode_desc})")
-    print(f"隨機延遲範圍 (delay)     : {config.get('min_delay_seconds', 5)} ~ {config.get('max_delay_seconds', 900)} 秒")
-    print(f"每位聯絡人記憶輪數       : {config.get('history_rounds', 100)} 輪 (不重複發送或回送對方發過的圖)")
-    print(f"自動收納對方圖片 (借花獻佛): {config.get('collect_incoming_images', True)}")
-    print(f"發送後自動汰換新圖       : {config.get('replace_after_send', True)}")
-    print(f"舊圖保存期限 (TTL)       : {config.get('image_ttl_days', 7)} 天")
-    print(f"防洗版冷卻 (cooldown)    : {config.get('cooldown_seconds', 30)} 秒")
-    print(f"文字訊息回圖 (reply_to_text): {'開 (一對一、' + str(config.get('text_reply_max_chars', 30)) + ' 字內)' if config.get('reply_to_text', True) else '關'}")
-    print(f"回覆後安全最小化         : {config.get('close_window_after_send', True)}")
+    banner_print(f"觸發模式 (trigger_mode)  : {t_mode} ({mode_desc})")
+    banner_print(f"隨機延遲範圍 (delay)     : {config.get('min_delay_seconds', 5)} ~ {config.get('max_delay_seconds', 900)} 秒")
+    banner_print(f"每位聯絡人記憶輪數       : {config.get('history_rounds', 100)} 輪 (不重複發送或回送對方發過的圖)")
+    banner_print(f"自動收納對方圖片 (借花獻佛): {config.get('collect_incoming_images', True)}")
+    banner_print(f"發送後自動汰換新圖       : {config.get('replace_after_send', True)}")
+    banner_print(f"舊圖保存期限 (TTL)       : {config.get('image_ttl_days', 7)} 天")
+    banner_print(f"防洗版冷卻 (cooldown)    : {config.get('cooldown_seconds', 30)} 秒")
+    banner_print(f"紀錄檔 (log_to_file)     : {'開 (logs/，保留 ' + str(config.get('log_keep_days', 7)) + ' 天)' if config.get('log_to_file', True) else '關'}")
+    banner_print(f"文字訊息回圖 (reply_to_text): {'開 (一對一、' + str(config.get('text_reply_max_chars', 30)) + ' 字內)' if config.get('reply_to_text', True) else '關'}")
+    banner_print(f"回覆後安全最小化         : {config.get('close_window_after_send', True)}")
     stop_chats = config.get("stop_command_chats", [])
-    print(f"停止指令                 : {'在 ' + '、'.join(stop_chats) + ' 聊天室自己發「' + config.get('stop_command', '') + '」' if stop_chats else '未啟用'}")
-    print("-" * 65)
-    print("說明：")
-    print("1. 對方傳長輩圖來時，程式會隨機等待數秒，並挑選一張不同的長輩圖回傳。")
-    print("2. 圖片送出後自動淘汰換新，且定期清理超過期限的舊圖，保持圖庫新鮮。")
-    print("3. 視窗會自動最小化，維持後續未讀。")
-    print("4. 按下 Ctrl + C 即可隨時停止程式。")
-    print("=" * 65)
+    banner_print(f"停止指令                 : {'在 ' + '、'.join(stop_chats) + ' 聊天室自己發「' + config.get('stop_command', '') + '」' if stop_chats else '未啟用'}")
+    banner_print("-" * 65)
+    banner_print("說明：")
+    banner_print("1. 對方傳長輩圖來時，程式會隨機等待數秒，並挑選一張不同的長輩圖回傳。")
+    banner_print("2. 圖片送出後自動淘汰換新，且定期清理超過期限的舊圖，保持圖庫新鮮。")
+    banner_print("3. 視窗會自動最小化，維持後續未讀。")
+    banner_print("4. 按下 Ctrl + C 即可隨時停止程式。")
+    banner_print("=" * 65)
 
     # 建立目前快取基準線，確保啟動後只監聽「新傳入」的圖片，絕不觸發舊圖或剛才發送的圖
     advance_cache_mtime_to_current()
@@ -4410,6 +4801,8 @@ def main():
     report_ocr_engine()
     warm_up_image_library(config)
     configure_notifier(config)
+    configure_file_log(config)
+    notifier.log_sink = _notifier_log_line
     notifier.install_logging_handler()
     stop_chats_desc = "、".join(config.get("stop_command_chats", [])) or "未啟用"
     notifier.notify(f"🟢 長輩圖機器人 v{VERSION} 已啟動\n監控：{'、'.join(config.get('targets', [])) or '無'}\n停止指令：{stop_chats_desc}")
@@ -4423,6 +4816,7 @@ def main():
             try:
                 config = load_config()
                 configure_notifier(config)
+                configure_file_log(config)
                 configure_image_options(config)
 
                 # 熱重載偵測：若背景修改了 config.json 中的名單，即時印出提示

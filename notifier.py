@@ -40,26 +40,39 @@ _worker = None
 _creds = None
 _creds_checked = False
 _synced = False                     # 本次執行是否已向 LINE 查過本月用量
+log_sink = None                     # 呼叫端 (auto_reply) 設定：本模組自己印的 [通知] 提示也寫進紀錄檔；參數是不含時間的文字
+_rejected = {"code": None}          # LINE 明確拒絕 (400/401/403/404) 之後本次執行不再推播：紀錄仍照常寫在本機檔案
+REJECTED_CODES = (400, 401, 403, 404)   # 權杖無效、這個帳號沒加 Notify Bot 為好友 (推播對象不存在)、對象封鎖等：重試也不會好
 
 
 def configure(enabled, monthly_cap=DEFAULT_MONTHLY_CAP, state_path=None):
     """更新設定 (主迴圈每輪都會呼叫，重複呼叫沒有副作用)"""
     with _lock:
+        if enabled and not _settings["enabled"]:
+            _rejected["code"] = None                    # 使用者重新開啟 notify_log：給它再試一次 (可能剛換了權杖或加了好友)
+            _warned.pop("rejected", None)               # 重試又被拒絕時，提示要再印一次 (否則看起來像還在正常運作)
         _settings["enabled"] = bool(enabled)
         _settings["monthly_cap"] = max(1, int(monthly_cap))
         if state_path:
             _settings["state_path"] = state_path
 
 
-def _warn(key, msg):
-    """只印在本機 (不用 logging，避免推播自己的錯誤又觸發推播)，同一類提示隔一段時間才印一次"""
+def _warn(key, msg, force=False):
+    """只印在本機 (不用 logging，避免推播自己的錯誤又觸發推播)，同一類提示隔一段時間才印一次；force 表示第一次一定要印"""
     now = time.time()
     with _lock:
-        if now - _warned.get(key, 0.0) < WARN_INTERVAL_SECONDS:
+        if not force and now - _warned.get(key, 0.0) < WARN_INTERVAL_SECONDS:
+            return
+        if force and key in _warned:
             return
         _warned[key] = now
     try:
         print(f"[通知] {msg}")
+    except Exception:
+        pass
+    try:
+        if log_sink is not None:
+            log_sink(f"[通知] {msg}")
     except Exception:
         pass
 
@@ -152,6 +165,10 @@ def _deliver(text):
             state["count"] = cap                               # LINE 說額度用完，本月不再嘗試
             _save_state(state)
             _warn("quota", "LINE 回報本月推播額度已用完，本月不再推播。")
+        elif e.code in REJECTED_CODES:
+            _rejected["code"] = e.code
+            _warn("rejected", f"LINE 拒絕了推播 (HTTP {e.code})：這個 LINE 帳號可能沒有加 Notify Bot 為好友，或 LINE_TOKEN／LINE_USER_ID 不對。"
+                              "本次執行不再推播，紀錄只寫在畫面與 logs/ 檔案；要重試請把 notify_log 關掉再打開，或重新啟動。", force=True)
         else:
             _warn("http", f"推播失敗：LINE API 回應 {e.code}。請確認 LINE_TOKEN 是否有效。")
         return
@@ -183,7 +200,7 @@ def notify(text, key=None, throttle=0.0, alert=False):
     把訊息排進推播佇列 (非同步，立刻返回)。回傳是否排入：未啟用、被節流、超過每小時警告上限都回傳 False。
     key 與 throttle：同一個 key 在 throttle 秒內只排入一次。alert 為 True 時另計每小時總上限。
     """
-    if not _settings["enabled"]:
+    if not _settings["enabled"] or _rejected["code"] is not None:
         return False
     now = time.time()
     with _lock:

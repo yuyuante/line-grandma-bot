@@ -175,6 +175,14 @@ def find_slots(text):
     return tuple(found)
 
 
+_BIRTHDAY_WISH = re.compile(r"生日快[樂乐]|生日愉快|生日喜[樂乐]|生日萬歲|HappyBirthday|HBD|祝.{0,12}生日", re.IGNORECASE)
+
+
+def is_birthday_wish(text):
+    """文字裡是不是在祝賀生日 (「生日快樂」「Happy Birthday」「祝你生日…」)；「明天是我生日」「他生日快到了」只是提到生日，不算"""
+    return bool(_BIRTHDAY_WISH.search(normalize_text(text or "")))
+
+
 def is_birthday(kind):
     """是不是「生日快樂」類的祝福 (節日裡的「生日」)：一對一收到這種圖或文字只回一句謝謝，不回圖"""
     return kind is not None and kind.category == "festival" and kind.festival == "生日"
@@ -195,7 +203,10 @@ def classify_message(text, max_chars=TEXT_MESSAGE_MAX_CHARS):
     """
     if message_length(text) > max_chars:
         return None
-    return classify_text(text)
+    kind = classify_text(text)
+    if is_birthday(kind) and not is_birthday_wish(text):
+        return None                                      # 只是提到生日 (「明天是我生日」)，不是祝福，不回
+    return kind
 
 
 def classify_text(text):
