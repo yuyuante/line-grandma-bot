@@ -113,11 +113,11 @@ class TestRecognizeFile(_Base):
 
 
 class TestRecognizeScreenshot(_Base):
-    def run_shot(self, crop_result, text="", ocr_error=None):
+    def run_shot(self, crop_result, text="", ocr_error=None, row=True):
         from PIL import Image
         self.crop_text = text
-        crop = (Image.new("RGB", (300, 200), (255, 255, 255)), crop_result) if crop_result is not None else None
-        with mock.patch.object(auto_reply, "_incoming_media_crop", return_value=crop):
+        crop = (Image.new("RGB", (300, 200), (255, 255, 255)), crop_result, row) if crop_result is not None else None
+        with mock.patch.object(auto_reply, "_incoming_media_info", return_value=crop):
             if ocr_error:
                 with mock.patch.object(auto_reply, "ocr_text", side_effect=ocr_error):
                     return auto_reply._recognize_chat_screenshot(CHAT)
@@ -128,10 +128,20 @@ class TestRecognizeScreenshot(_Base):
         self.assertEqual(self.run_shot(300, "FORMOSA!"), (False, None, ""))               # 讀得到字但辨識不出性質：捨棄
         self.assertEqual(self.run_shot(300, ""), (False, None, ""))                         # 一般照片，沒有字
         self.ocr_calls.clear()
-        self.assertEqual(self.run_shot(150, "早安"), (False, None, ""))                    # 內容太窄：貼圖
+        self.assertEqual(self.run_shot(150, "早安", row=False), (False, None, ""))         # 下面沒有「另存新檔」那一列：貼圖
         self.assertEqual(self.ocr_calls, [])                                               # 貼圖不做 OCR
         self.assertEqual(self.run_shot(None), (None, None, ""))                            # 暫時截不到
         self.assertEqual(self.run_shot(300, ocr_error=RuntimeError("down")), (None, None, ""))   # OCR 暫時不能用：等下次
+
+    def test_a_narrow_photo_is_still_a_photo_because_it_has_the_save_as_row(self):
+        # 照片下方有「儲存｜另存新檔｜分享」那一列，貼圖沒有：縮圖很窄 (直幅、小張) 的照片不能被當成貼圖
+        self.assertEqual(self.run_shot(150, "早安 平安喜樂", row=True), (True, ik.classify_text("早安 平安喜樂"), "早安平安喜樂"))
+        self.assertEqual(self.run_shot(150, "FORMOSA!", row=True), (False, None, ""))      # 是照片，但辨識不出性質：照舊捨棄
+        self.ocr_calls.clear()
+        self.assertEqual(self.run_shot(150, "早安", row=False), (False, None, ""))         # 又窄又沒有那一列：貼圖
+        # 真機 (2026-11-01)：貼圖旁邊的時間戳記把量到的寬度撐到 327，舊規則當成照片；只看那一列就不會被騙
+        self.assertEqual(self.run_shot(327, "早安 平安喜樂", row=False), (False, None, ""))
+        self.assertEqual(self.ocr_calls, [])
 
 
 class TestRecognizeIncomingText(_Base):
@@ -189,12 +199,45 @@ class TestRecognizeIncomingText(_Base):
         self.assertEqual(self.run_text("早安祝你有美好的一天", max_chars=20)[0], True)
 
 
+class TestMediaInfoActionRow(_Base):
+    """_incoming_media_info 的第三個值：圖片正下方緊貼著一條矮矮的連結列 = 照片"""
+
+    def info(self, blocks, content_width=100):
+        from PIL import Image, ImageDraw
+        shot = Image.new("RGB", (400, 400), (255, 255, 255))
+        draw = ImageDraw.Draw(shot)
+        for bottom, top in blocks:
+            draw.rectangle([90, top, 90 + content_width, bottom], fill=(10, 90, 160))
+        is_content = lambda px: sum(abs(a - b) for a, b in zip(px, (255, 255, 255))) > 30
+        found = (shot, 1.0, 84, 324, is_content, blocks)
+        with mock.patch.object(auto_reply, "_left_message_blocks", return_value=found):
+            return auto_reply._incoming_media_info(CHAT)
+
+    def test_photo_with_the_link_row_below_it(self):
+        crop, width, row = self.info([(310, 302), (290, 60)])            # 連結列 (8px 高) 緊貼在圖片 (230px 高) 下方
+        self.assertTrue(row)
+        self.assertGreaterEqual(width, 100)
+
+    def test_sticker_or_loading_placeholder_has_no_link_row(self):
+        self.assertFalse(self.info([(290, 60)])[2])                       # 底部就是那塊圖，下面什麼都沒有
+        self.assertFalse(self.info([(290, 60), (150, 100)])[2])           # 圖片上方還有別的訊息，但圖片下面沒有連結列
+
+    def test_a_tall_block_below_or_a_far_away_row_is_not_a_link_row(self):
+        self.assertFalse(self.info([(400, 330), (290, 60)])[2])           # 下面是另一則高訊息，不是連結列 (太高)
+        self.assertFalse(self.info([(390, 382), (290, 60)])[2])           # 矮但離圖片太遠 (不緊貼)
+
+    def test_the_two_value_wrapper_still_works(self):
+        crop, width = self.info.__func__(self, [(310, 302), (290, 60)])[:2], 0
+        self.assertIsNotNone(crop)
+
+
 class TestRecognizeScreenshotWaitsForLoading(_Base):
-    def shots(self, widths, text="中秋節快樂"):
+    def shots(self, widths, text="中秋節快樂", rows=None):
         from PIL import Image
         self.crop_text = text
         crop = Image.new("RGB", (300, 200), (255, 255, 255))
-        results = iter([None if w is None else (crop, w) for w in widths])
+        rows = rows or [w is not None and w >= 200 for w in widths]
+        results = iter([None if w is None else (crop, w, r) for w, r in zip(widths, rows)])      # 預設：寬 (>= 200) 代表圖載入完成、那一列已出現
         last = {"v": None}
 
         def next_shot(hwnd):
@@ -204,7 +247,7 @@ class TestRecognizeScreenshotWaitsForLoading(_Base):
                 pass
             return last["v"]
 
-        with mock.patch.object(auto_reply, "_incoming_media_crop", side_effect=next_shot) as m:
+        with mock.patch.object(auto_reply, "_incoming_media_info", side_effect=next_shot) as m:
             result = auto_reply._recognize_chat_screenshot(CHAT)
         return result, m.call_count
 
@@ -212,6 +255,10 @@ class TestRecognizeScreenshotWaitsForLoading(_Base):
         result, calls = self.shots([60, 60, 60, 300])                                       # 先是灰色小方塊，三秒後圖載入完成
         self.assertEqual(result, (True, MID_AUTUMN, "中秋節快樂"))
         self.assertEqual((calls, self.sleeps), (4, [1.0, 1.0, 1.0]))
+
+    def test_a_narrow_image_with_the_link_row_needs_no_waiting(self):
+        result, calls = self.shots([150], rows=[True])                                        # 已經有「另存新檔」那一列：圖已經載入完成
+        self.assertEqual((result[0], calls, self.sleeps), (True, 1, []))
 
     def test_stays_small_means_sticker_after_the_full_wait(self):
         result, calls = self.shots([60])
@@ -684,6 +731,17 @@ class TestSendFlow(_Base):
             self.assertEqual(self.run_flow()[0], "SENT_CONFIRMED")
         self.assertEqual(self.run_flow()[0], "SKIPPED_DAILY_LIMIT")
 
+    def test_groups_are_always_recognised_even_when_recognition_is_switched_off(self):
+        auto_reply.set_group_targets(["小明"])
+        self.addCleanup(auto_reply.set_group_targets, [])
+        result, m, _ = self.run_flow(config={"require_grandma_image": False}, recognize=[(False, None, "")])
+        self.assertEqual(result, "SKIPPED_NOT_GRANDMA")                                     # 貼圖或辨識不出的：群組不回
+        m["attach"].assert_not_called()
+        auto_reply.set_group_targets([])
+        result, m, _ = self.run_flow(config={"require_grandma_image": False}, recognize=[(False, None, "")])
+        self.assertEqual(result, "SENT_CONFIRMED")                                          # 1:1：關掉識別就是舊行為，什麼都回
+        m["recognize"].assert_not_called()
+
     def test_group_window_title_with_member_count_may_send_but_a_one_to_one_one_may_not(self):
         result, m, _ = self.run_flow(title="小明 (477)")                                       # 1:1 前景標題帶括號 = 群組冒充，擋下
         self.assertEqual(result, "NOT_SENT")
@@ -932,14 +990,14 @@ class TestStartup(_Base):
 class TestDetectionReopensTheWindow(_Base):
     """偵測階段：頻道已綁定、但好友的獨立視窗不見了，不再直接丟掉事件，先試著把視窗開回來"""
 
-    def run_detection(self, window_open, opener_result, config_extra=None, group=False, photo=True, last_reply_ago=None, windows=()):
+    def run_detection(self, window_open, opener_result, config_extra=None, group=False, photo=True, last_reply_ago=None, windows=(), size=300000):
         cache = os.path.join(self.tmp.name, "cache")
         fake_hash = "888803ef1234567890abcdef1234567890abcdef"
         chat_m = os.path.join(cache, fake_hash, "m")
         os.makedirs(chat_m, exist_ok=True)
         img = os.path.join(chat_m, "t.eimg")
         with open(img, "wb") as f:
-            f.write(b"\x00" * 300000)
+            f.write(b"\x00" * size)
         now = time.time()
         os.utime(img, (now, now))
         sent = []
@@ -987,14 +1045,15 @@ class TestDetectionReopensTheWindow(_Base):
         self.assertIn("桌面無該好友專屬視窗", NL.join(str(c.args[0]) for c in self.log.call_args_list))
         opener.assert_called_once()
 
-    def test_group_replies_to_a_photo_but_not_to_a_sticker(self):
-        sent, _ = self.run_detection(window_open=True, opener_result=True, group=True, photo=True)
-        self.assertEqual(sent, ["小明"])
-        sent, _ = self.run_detection(window_open=True, opener_result=True, group=True, photo=False)
-        self.assertEqual(sent, [])                                                          # 群組只回照片
-        self.assertIn("群組只回照片", NL.join(str(c.args[0]) for c in self.log.call_args_list))
-        sent, _ = self.run_detection(window_open=True, opener_result=True, group=False, photo=False)
-        self.assertEqual(sent, ["小明"])                                                    # 1:1 照舊：貼圖也回
+    def test_group_never_judges_photo_or_sticker_by_cache_file_size(self):
+        # 真機 (2026-11-01)：理財幼幼班_Z 傳來的照片，快取檔只有 13KB 與 7KB，被當成貼圖略過。
+        # 快取檔大小和是不是照片沒有可靠的關係 (Notify Bot 的 38 張照片：最小 20KB、中位數 112KB)，一律交給視窗截圖裡
+        # 「另存新檔」那一列辨識 (照片有、貼圖沒有)
+        for size in (2000, 7000, 13000, 60000, 300000):
+            sent, _ = self.run_detection(window_open=True, opener_result=True, group=True, size=size)
+            self.assertEqual(sent, ["小明"], size)
+            sent, _ = self.run_detection(window_open=True, opener_result=True, group=False, size=size)
+            self.assertEqual(sent, ["小明"], size)
 
     def test_group_cooldown_is_much_longer_than_the_normal_one(self):
         sent, _ = self.run_detection(window_open=True, opener_result=True, group=True, last_reply_ago=120)

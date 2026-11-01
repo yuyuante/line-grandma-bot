@@ -143,5 +143,29 @@ class TestBindView(GroupTestCase):
         bound.assert_not_called()
 
 
+class TestAutoBindIgnoresGroups(GroupTestCase):
+    """自動綁定只認一對一：開著的群組視窗不算候選，不會擋住一對一的綁定，也不會被自動綁上"""
+
+    def run_bind(self, windows):
+        calls = []
+
+        def fake_find(name):
+            return windows.get(name, [])
+
+        with mock.patch.object(auto_reply, "find_target_chat_window", side_effect=fake_find),              mock.patch.object(auto_reply, "verify_is_not_group_window_uia", return_value=True),              mock.patch.object(auto_reply, "get_all_open_chat_windows", side_effect=lambda: calls.append(1) or [(7, "林如婷", "Qt", True)]),              mock.patch.object(auto_reply.win32gui, "IsIconic", return_value=True), mock.patch.object(auto_reply, "log_v"):
+            result = auto_reply.try_auto_bind_channel("a" * 40, "x.eimg", 100.0, [GROUP, "林如婷"], {}, 1)
+        return result, calls
+
+    def test_an_open_group_window_does_not_block_a_one_to_one_candidate(self):
+        both = {GROUP: [(5, GROUP, "Qt", True)], "林如婷": [(7, "林如婷", "Qt", True)]}
+        _, reached_the_next_check = self.run_bind(both)
+        self.assertEqual(reached_the_next_check, [1])                                   # 只剩林如婷一位候選，才會往下做後面的核驗
+
+    def test_a_group_window_alone_is_never_a_candidate(self):
+        result, reached_the_next_check = self.run_bind({GROUP: [(5, GROUP, "Qt", True)]})
+        self.assertIsNone(result)
+        self.assertEqual(reached_the_next_check, [])                                   # 沒有一對一候選：直接拒絕，群組不會被自動綁上
+
+
 if __name__ == "__main__":
     unittest.main()

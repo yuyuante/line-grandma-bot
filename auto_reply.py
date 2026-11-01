@@ -47,7 +47,7 @@ from crawl_images import (crawl_grandma_images, clean_expired_images, retire_ima
                           download_and_validate_image, get_existing_md5s, build_candidate_urls,
                           build_candidates, normalize_sources)
 
-VERSION = "2.11.0"
+VERSION = "2.11.1"
 
 # 0. 全系統單一執行個體鎖 (Windows Named Mutex)，防止重複啟動繞過斷路器
 _app_mutex_handle = None
@@ -663,7 +663,7 @@ def is_authentic_grandma_image(image_path):
     """圖片檔是不是辨識得出性質的長輩圖 (見 _recognize_file)"""
     return _recognize_file(image_path)[0] is not None
 
-GRANDMA_SCREEN_MIN_WIDTH = 200  # 聊天室截圖裡，圖片內容寬度 (邏輯像素) 低於此值視為貼圖 (LINE 貼圖約 120~180px，照片縮圖 250px 以上)
+GRANDMA_SCREEN_MIN_WIDTH = 200  # (已不用於判斷貼圖：寬度會被貼圖旁的時間戳記撐大，也有窄的照片；改看「另存新檔」那一列。保留數值給舊程式碼與文件參考)
 GRANDMA_MEDIA_CROP_WIDTH = 420  # 截圖時從左側取樣帶起算的最大寬度 (邏輯像素)，涵蓋圖片縮圖又不會取到太多空白
 
 def _can_decode_image(path):
@@ -674,11 +674,12 @@ def _can_decode_image(path):
     except Exception:
         return False
 
-def _incoming_media_crop(chat_hwnd):
+def _incoming_media_info(chat_hwnd):
     """
-    截取聊天室最底部左側 (對方) 圖片訊息的縮圖區域，回傳 (截圖, 圖片內容寬度 (邏輯像素))；
-    視窗縮小、被遮住、太窄或找不到夠高的區塊回傳 None。最底部若是「儲存｜另存新檔｜分享」連結列 (很矮)，
-    圖片在它上方的區塊，所以在最底部兩個區塊裡挑第一個夠高的。
+    截取聊天室最底部左側 (對方) 圖片訊息的縮圖區域，回傳 (截圖, 圖片內容寬度 (邏輯像素), 下方有沒有「儲存｜另存新檔｜分享」連結列)；
+    視窗縮小、被遮住、太窄或找不到夠高的區塊回傳 None。
+    照片下方一定有那一列連結，貼圖沒有，所以它是「照片 (相對於貼圖)」最可靠的記號；縮圖還在載入時 (灰色小方塊) 則兩者都還沒有。
+    最底部若是連結列 (很矮)，圖片在它上方的區塊，所以在最底部兩個區塊裡挑第一個夠高的。
     """
     found = _left_message_blocks(chat_hwnd, side="left")
     if found is None:
@@ -694,7 +695,17 @@ def _incoming_media_crop(chat_hwnd):
         return None
     pad = int(4 * scale)
     box = (max(0, min(xs) - pad), max(0, top - pad), min(shot.width, max(xs) + pad + 1), min(shot.height, bottom + pad + 1))
-    return shot.crop(box), int((max(xs) - min(xs) + 1) / scale)
+    has_action_row = False
+    if len(blocks) >= 2 and media == blocks[1]:
+        row = blocks[0]
+        gap = int((row[1] - media[0]) / scale)
+        has_action_row = int((row[0] - row[1] + 1) / scale) < MEDIA_NOISE_MAX_HEIGHT and gap <= MEDIA_ACTION_GAP_MAX
+    return shot.crop(box), int((max(xs) - min(xs) + 1) / scale), has_action_row
+
+def _incoming_media_crop(chat_hwnd):
+    """相容層：只要 (截圖, 圖片內容寬度)，細節見 _incoming_media_info"""
+    info = _incoming_media_info(chat_hwnd)
+    return None if info is None else info[:2]
 
 IMAGE_LOAD_WAIT_SECONDS = 8.0   # 圖片縮圖還在載入時 (灰色佔位方塊) 最多等幾秒；等不到變大才當成貼圖或文字
 IMAGE_LOAD_POLL_SECONDS = 1.0
@@ -703,20 +714,23 @@ def _recognize_chat_screenshot(chat_hwnd):
     """
     用聊天室截圖辨識最底部左側那張圖，回傳 (狀態, 性質, 文字)：
     狀態 True (辨識得出性質)、False (貼圖，或辨識不出來)、None (暫時無法判斷：截不到圖、OCR 暫時不能用)。
-    內容寬度不到 GRANDMA_SCREEN_MIN_WIDTH 可能是貼圖，也可能是圖片還在載入 (LINE 先顯示一個灰色小方塊)，
-    所以每秒重新截圖，最多等 IMAGE_LOAD_WAIT_SECONDS 秒，還是很小才判定是貼圖。
+    只看一件事：圖片正下方有沒有「儲存｜另存新檔｜分享」那一列連結。照片一定有，貼圖沒有。
+    不能看縮圖寬度：真機實測貼圖旁邊的時間戳記會把量到的「內容寬度」撐到 327 (舊規則當成照片)，
+    而直幅或小張的照片只有 183 (舊規則當成貼圖)。
+    圖片還在載入時 (LINE 先顯示一個灰色小方塊) 那一列還沒出現，所以每秒重新截圖，最多等 IMAGE_LOAD_WAIT_SECONDS 秒，
+    等滿了還是沒有那一列才判定是貼圖。
     """
     deadline = time.time() + IMAGE_LOAD_WAIT_SECONDS
     while True:
-        found = _incoming_media_crop(chat_hwnd)
-        if (found is not None and found[1] >= GRANDMA_SCREEN_MIN_WIDTH) or time.time() >= deadline:
+        found = _incoming_media_info(chat_hwnd)
+        if (found is not None and found[2]) or time.time() >= deadline:
             break
         time.sleep(IMAGE_LOAD_POLL_SECONDS)
     if found is None:
         return None, None, ""
-    crop, content_width = found
-    if content_width < GRANDMA_SCREEN_MIN_WIDTH:
-        return False, None, ""
+    crop, content_width, has_action_row = found
+    if not has_action_row:
+        return False, None, ""            # 下面沒有「另存新檔」那一列：貼圖 (或圖片一直沒載入完成)
     try:
         text = ocr_text(crop)
     except Exception:
@@ -2283,6 +2297,8 @@ def try_auto_bind_channel(ch, cand_path, cand_m, targets, chat_dirs_map, competi
 
     candidate_targets = []
     for t in targets:
+        if is_group_target(t):
+            continue                    # 群組只能手動綁定 (--bind-view)：開著的群組視窗不能算候選，更不能被自動綁上
         wins = find_target_chat_window(t)
         if wins and verify_is_not_group_window_uia(wins[0][0]):
             candidate_targets.append((t, wins[0][0]))
@@ -3301,7 +3317,7 @@ def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_f
     thanks_enabled = bool(thanks_text)
     if text_trigger and (config.get("reply_to_text", True) or thanks_enabled) and config.get("require_grandma_image", True) and not is_group_target(target_name):
         deferred_text = deferred_identify = True      # 文字訊息：讀字要視窗在前景，等視窗帶到前景再辨識 (群組不適用)
-    elif config.get("require_grandma_image", True):
+    elif config.get("require_grandma_image", True) or is_group_target(target_name):     # 群組一律要先辨識出是長輩圖才回 (貼圖、生活照、辨識不出的不理會)
         early = find_target_chat_window(target_name)
         state, incoming_kind, incoming_text = recognize_incoming_image(triggered_file, early[0][0] if early else None)
         if state is False:
@@ -3891,11 +3907,7 @@ def check_for_incoming_messages(config):
                         matched = find_target_chat_window(cand_target)
                         if not matched and open_missing_chat_window(cand_target, config):
                             matched = find_target_chat_window(cand_target)
-                        if matched and is_group_target(cand_target) and not is_likely_photo(cand_path):
-                            PROCESSED_CACHE_FILES.add((cand_path, cand_m))
-                            max_processed_m = max(max_processed_m, cand_m)
-                            log_v(f"[群組略過]「{cand_target}」的新圖不是照片 (疑似貼圖)，群組只回照片。")
-                        elif matched:
+                        if matched:
                             # 電腦版獨立視窗標題正常為好友名稱 (不帶括號未讀數)，視窗上線即刻確認
                             chosen_candidate = cand_path
                             chosen_target = cand_target

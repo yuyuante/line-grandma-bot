@@ -1,6 +1,6 @@
 # LINE 長輩圖智慧自動回覆機器人 (line-grandma-bot)
 
-[![Version](https://img.shields.io/badge/version-2.11.0-blue.svg)](auto_reply.py)
+[![Version](https://img.shields.io/badge/version-2.11.1-blue.svg)](auto_reply.py)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D6.svg)](https://microsoft.com)
 [![Python](https://img.shields.io/badge/python-3.10%2B-green.svg)](https://python.org)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey.svg)](LICENSE)
@@ -49,7 +49,7 @@ line-grandma-bot/
 ├── image_kind.py        # 由圖上文字判斷性質：節日、時段問候、平安叮嚀、祝福鼓勵、心靈雞湯；競選圖一律不回
 ├── image_library.py     # 圖庫性質索引、挑圖規則、沒庫存時立即上網抓圖
 ├── reply_budget.py      # 每個聊天室每天的回覆次數上限
-├── auto_reply.py        # 核心自動回覆常駐程式 (v2.11.0)
+├── auto_reply.py        # 核心自動回覆常駐程式 (v2.11.1)
 ├── crawl_images.py      # 台塑貼圖酷長輩圖抓取與過期清理模組
 ├── config.example.json  # 設定檔範本
 ├── config.json          # 個人實際設定檔 (已列入 .gitignore 保護隱私)
@@ -227,6 +227,15 @@ python auto_reply.py --unbind "媽媽"
 ---
 
 ## 📝 版本異動紀錄 (Changelog)
+
+### [v2.11.1] - 2026-11-01
+- **修正：自動綁定把開著的群組視窗算成候選**。自動綁定規定「桌面上只能有一位一對一目標的視窗」，但群組目標沒被排除：桌面上開著「理財幼幼班_Z」這類群組視窗時，會讓一對一對象的綁定被當成「有多位候選」而拒絕，嚴重時群組甚至可能被自動綁上。現在群組一律不算候選，**群組只能手動綁定**（`--bind-view`），與 v2.9.0 的設計一致。
+- **修正：照片被當成貼圖、貼圖被當成照片**（真機：理財幼幼班_Z 傳來早安照片，紀錄卻是「不是照片 (疑似貼圖)」而沒有回）。原因有兩個：
+  - v2.9.0 的群組用「快取檔 ≥ 250KB 才是照片」判斷，但 LINE 的照片快取多半很小（Notify Bot 的 38 張照片裡 33 張小於 250KB，中位數 112KB；那張早安圖只有 13KB）。**群組不再用檔案大小判斷**，所有新圖都交給視窗截圖辨識。
+  - 一對一與群組共用的「貼圖還是照片」判斷看縮圖寬度（≥ 200 才算照片），但實測貼圖旁邊的時間戳記會把量到的寬度撐到 327（誤當成照片），直幅或小張的照片只有 183（誤當成貼圖）。**改成只看圖片正下方有沒有「儲存｜另存新檔｜分享」那一列連結**：照片一定有，貼圖沒有（照片左右兩側、貼圖都在 Notify Bot 實測過）。縮圖還在載入時那一列還沒出現，會每秒重看、最多等 8 秒，等滿了還是沒有才判定是貼圖。
+  - 群組**一律強制辨識**，即使 `require_grandma_image` 設為 `false` 也一樣。
+- 已知取捨：群組的貼圖也會讓視窗被還原到前景一下才判斷得出來（當天還沒回覆過、尚未達每日上限之前）；達到每日上限後在開視窗之前就直接略過。
+- **自動綁定使用提醒**（沒有舊圖可以 `--bind-view` 時）：要綁某位一對一對象，桌面上只開著**他一位**的獨立視窗（不能最小化，Notify Bot 的視窗也要關掉）、不要有其他非監控對象的聊天視窗，等他傳來一張**照片**（不是貼圖）。群組開著不影響。
 
 ### [v2.11.0] - 2026-11-01
 #### 收到「生日快樂」只回一句「謝謝」
