@@ -1,6 +1,6 @@
 # LINE 長輩圖智慧自動回覆機器人 (line-grandma-bot)
 
-[![Version](https://img.shields.io/badge/version-2.10.0-blue.svg)](auto_reply.py)
+[![Version](https://img.shields.io/badge/version-2.10.1-blue.svg)](auto_reply.py)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D6.svg)](https://microsoft.com)
 [![Python](https://img.shields.io/badge/python-3.10%2B-green.svg)](https://python.org)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey.svg)](LICENSE)
@@ -49,7 +49,7 @@ line-grandma-bot/
 ├── image_kind.py        # 由圖上文字判斷性質：節日、時段問候、平安叮嚀、祝福鼓勵、心靈雞湯；競選圖一律不回
 ├── image_library.py     # 圖庫性質索引、挑圖規則、沒庫存時立即上網抓圖
 ├── reply_budget.py      # 每個聊天室每天的回覆次數上限
-├── auto_reply.py        # 核心自動回覆常駐程式 (v2.10.0)
+├── auto_reply.py        # 核心自動回覆常駐程式 (v2.10.1)
 ├── crawl_images.py      # 台塑貼圖酷長輩圖抓取與過期清理模組
 ├── config.example.json  # 設定檔範本
 ├── config.json          # 個人實際設定檔 (已列入 .gitignore 保護隱私)
@@ -226,6 +226,13 @@ python auto_reply.py --unbind "媽媽"
 ---
 
 ## 📝 版本異動紀錄 (Changelog)
+
+### [v2.10.1] - 2026-11-01
+- **修正：名稱太長的群組開不出視窗**。LINE 搜尋結果列會把長名稱截斷，例如「東南里李武雄服務處-公用」顯示成「東南里李武雄服..（477）上午9:20」（名稱、成員數、最後訊息時間被 OCR 讀成同一段），原本「整列必須完全等於名稱」永遠比對不上，群組傳來圖片時機器人開不出視窗、整則被略過（Notify Bot 收到「桌面無該好友專屬視窗，安全略過」）。
+  - 完整名稱後面現在可以接成員數與時間（「名稱 (142) 上午9:20」）。
+  - 名稱被截斷時，只在「露出的前綴至少 5 個字、確實是名稱的開頭、後面只有刪節號＋成員數＋時間、整個搜尋結果裡剛好只有這一列」才採用；有兩列以上符合（可能是同前綴的另一個聊天室）就分不出來，一律不點。
+  - 安全條件不變：雙擊後仍要等到標題符合的視窗才算成功，搜尋欄裡自己打的字與第二行的訊息預覽不會被當成結果。
+- 已知限制：兩個聊天室名稱的前幾個字一樣、而且都被截斷時，會因為分不出來而放棄開視窗（寧可不回，也不點錯）。
 
 ### [v2.10.0] - 2026-11-01
 #### 對方傳「短文字訊息」，也回同性質的圖

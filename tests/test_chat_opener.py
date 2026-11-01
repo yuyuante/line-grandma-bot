@@ -114,6 +114,42 @@ class TestFindResultRows(unittest.TestCase):
         boxes = [("理财幼幼班_Z (142)", (300, 250)), ("理财幼幼班_Z", (300, 120))]
         self.assertEqual(chat_opener.find_result_rows(boxes, "理財幼幼班_Z", min_y=200), [(300, 250)])
 
+    NAME = "東南里李武雄服務處-公用"
+
+    def test_real_search_result_with_a_truncated_name_count_and_time(self):
+        # 真機 (2026-11-01)：名稱太長被列表截成「服...」，OCR 把名稱、成員數、時間讀成同一段；第二行是最後一則訊息的預覽
+        boxes = [("东南里李武雄服務處-公用", (273, 124)),                  # 搜尋欄裡剛打的字 (在 min_y 以上)
+                 ("東南里李武雄服..．（477）上午9:20", (371, 224)),
+                 ("李武雄理事長傳送了圖", (320, 251))]
+        self.assertEqual(chat_opener.find_result_rows(boxes, self.NAME, min_y=151), [(371, 224)])
+
+    def test_full_name_may_be_followed_by_count_and_time(self):
+        for text in ("東南里李武雄服務處-公用（477）上午9:20", "東南里李武雄服務處-公用 (477) 下午 3:05", "東南里李武雄服務處-公用 昨天", "東南里李武雄服務處-公用"):
+            self.assertEqual(chat_opener.find_result_rows([(text, (1, 300))], self.NAME, 0), [(1, 300)], text)
+        self.assertEqual(chat_opener.find_result_rows([("Notify Bot 上午9:20", (1, 300))], "Notify Bot", 0), [(1, 300)])
+
+    def test_truncated_rows_are_refused_when_they_are_not_clearly_this_chat(self):
+        N = self.NAME
+        for text in ("東南里..（477）上午9:20",                      # 露出的前綴太短
+                     "西南里李武雄服..（477）上午9:20",                 # 前綴不是名稱的開頭
+                     "東南里李武雄服務處-公用..（477）上午9:20",         # 前綴已經是整個名稱：這不是截斷
+                     "東南里李武雄服..（477）上午9:20 轉寄",             # 尾巴多了別的字
+                     "東南里李武雄服..（x）上午9:20",                   # 括號裡不是數字
+                     "東南里李武雄服.（477）上午9:20"):                 # 只有一個點，不是刪節號
+            self.assertEqual(chat_opener.find_result_rows([(text, (1, 300))], N, 0), [], text)
+
+    def test_two_truncated_rows_are_ambiguous_so_nothing_is_clicked(self):
+        boxes = [("東南里李武雄服..．（477）上午9:20", (1, 300)), ("東南里李武雄服..．（12）上午8:01", (1, 400))]
+        self.assertEqual(chat_opener.find_result_rows(boxes, self.NAME, 0), [])          # 另一個同前綴的聊天室也在結果裡：分不出來
+        self.assertEqual(chat_opener.find_result_rows(boxes[:1], self.NAME, 0), [(1, 300)])
+
+    def test_an_exact_row_wins_over_truncated_rows(self):
+        boxes = [("東南里李武雄服..（5）上午9:20", (1, 300)), ("東南里李武雄服務處-公用（477）", (1, 400)), ("東南里李武雄服..（9）上午9:21", (1, 500))]
+        self.assertEqual(chat_opener.find_result_rows(boxes, self.NAME, 0), [(1, 400)])
+
+    def test_rows_above_the_search_box_bottom_never_count_even_when_truncated(self):
+        self.assertEqual(chat_opener.find_result_rows([("東南里李武雄服..（477）上午9:20", (1, 100))], self.NAME, 151), [])
+
     def test_sorted_top_down_and_empty(self):
         boxes = [("Mom", (1, 400)), ("Mom", (1, 250))]
         self.assertEqual(chat_opener.find_result_rows(boxes, "Mom", 0), [(1, 250), (1, 400)])

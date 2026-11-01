@@ -6,7 +6,8 @@
 等標題剛好等於好友名稱的獨立視窗出現。LINE 的清單項目沒有名字可以用 UIA 讀，所以只能靠 OCR 找位置。
 
 安全原則 (Fail-Closed)：
-- 只接受「整列文字完全等於好友名稱」(忽略空白與大小寫)，不接受「包含」；找不到、找到不只一個位置不合理都放棄。
+- 只接受「整列文字就是好友名稱」(忽略空白與大小寫，後面可接成員數與時間；名稱太長被列表截斷時，要前綴夠長且全搜尋結果只有一列符合)，
+  不接受「包含」；找不到、分不出是哪一列都放棄。
 - 主視窗裡是使用者真實的聊天清單：每一次點擊或貼上之前都核驗主視窗在前景，OCR 只在記憶體裡找名稱，
   不記錄也不輸出其他文字。
 - 成功的唯一標準是出現標題剛好等於好友名稱的視窗；做完 (不論成敗) 都把搜尋欄清掉。
@@ -27,18 +28,44 @@ def _norm(text):
     return re.sub(r"\s+", "", image_kind.normalize_text(text or "")).casefold()
 
 
+# 搜尋結果列後面可能接的東西：成員數 (群組)、最後一則訊息的時間或日期。OCR 常把整列讀成同一段文字
+_COUNT = r"(?:[(（]\d+[)）]?)?"
+_STAMP = r"(?:(?:上午|下午)?\d{1,2}[:：]\d{2}|昨天|星期.|\d{1,2}/\d{1,2})?"
+_ROW_TAIL = re.compile(_COUNT + _STAMP)
+# 名稱太長時列表會截成「前綴…」，OCR 讀出來是兩個以上的點或刪節號 (例如「服..．」)
+_ELLIPSIS = re.compile(r"(?:[.．。·]{2,}|…+)")
+MIN_TRUNCATED_PREFIX = 5        # 被截斷的名稱至少要露出這麼多字，才拿來當依據
+
+
+def _truncated_match(text, wanted):
+    """text (已正規化) 是不是「name 的開頭 + 刪節號 + 成員數/時間」；是回傳 True"""
+    m = _ELLIPSIS.search(text)
+    if not m:
+        return False
+    prefix = text[:m.start()]
+    return (len(prefix) >= MIN_TRUNCATED_PREFIX and len(prefix) < len(wanted) and wanted.startswith(prefix)
+            and _ROW_TAIL.fullmatch(text[m.end():]) is not None)
+
+
 def find_result_rows(boxes, name, min_y):
     """
-    boxes: [(文字, (中心x, 中心y))]。回傳整列文字剛好等於 name 的位置 [(x, y)]，由上到下排序。
+    boxes: [(文字, (中心x, 中心y))]。回傳搜尋結果裡「整列文字就是 name」的位置 [(x, y)]，由上到下排序。
     min_y 以上 (搜尋欄所在的區域，要用搜尋欄的「底部」) 的文字一律忽略，避免把搜尋欄裡剛貼上的那串字當成結果。
+    - 完整名稱：名稱本身，後面可以接成員數與時間 (「理財幼幼班_Z (142) 上午9:20」)，其餘多一個字都不算。
+    - 名稱太長被列表截斷 (「東南里李武雄服..．（477）上午9:20」)：只有「露出的前綴夠長、確實是名稱開頭、
+      整個搜尋結果裡剛好只有這一列」才採用；有兩列以上符合就分不出是哪個聊天室，一律不點。
+      (雙擊後仍要等到標題符合的視窗才算成功。)
     """
     wanted = _norm(name)
     if not wanted:
         return []
-    # 群組的搜尋結果會在名稱後面接成員數，例如「理財幼幼班_Z (142)」，視窗標題則只有名稱；其餘一律要完全相等
-    pattern = re.compile(re.escape(wanted) + r"(?:[(（]\d+[)）])?")
-    rows = [(x, y) for text, (x, y) in boxes if pattern.fullmatch(_norm(text)) and y > min_y]
-    return sorted(rows, key=lambda p: p[1])
+    exact_pattern = re.compile(re.escape(wanted) + _COUNT + _STAMP)
+    below = [(_norm(text), (x, y)) for text, (x, y) in boxes if y > min_y]
+    exact = sorted((pos for text, pos in below if exact_pattern.fullmatch(text)), key=lambda p: p[1])
+    if exact:
+        return exact
+    truncated = sorted((pos for text, pos in below if _truncated_match(text, wanted)), key=lambda p: p[1])
+    return truncated if len(truncated) == 1 else []
 
 
 def _find_rows(ui, main, box, name, read_boxes):
