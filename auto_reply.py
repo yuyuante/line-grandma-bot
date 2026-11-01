@@ -1451,7 +1451,7 @@ class LineMainUi:
         pyautogui.doubleClick(x, y)
 
     # --- 分頁列 (全部 / 好友 / 群組 / ...)：UIA 的預設動作對它沒有作用，只能用滑鼠點；位置與選取狀態可以從 UIA 讀 ---
-    MIN_MAIN_WIDTH = 960            # 主視窗至少這麼寬，LINE 才會把分頁全部排出來
+    MIN_MAIN_WIDTH = 1300           # 主視窗至少這麼寬，分頁才全部排得下 (捲動歸零、沒有淡出遮罩；窄一點第一個分頁會被遮罩蓋住點不到)
 
     def ensure_wide(self, hwnd):
         """主視窗太窄就暫時拉寬 (位置與高度不變)，回傳原本的 (左, 上, 右, 下) 讓呼叫端還原；不需要拉寬回傳 None"""
@@ -1500,9 +1500,9 @@ class LineMainUi:
         if bar is None or index >= len(buttons) or not self.is_front(hwnd):
             return False
         view, tab = bar.BoundingRectangle, buttons[index].BoundingRectangle
-        if tab.left < view.left or tab.right > view.right:
-            return False
         x, y = (tab.left + tab.right) // 2, (tab.top + tab.bottom) // 2
+        if not (view.left <= x < view.right and view.top <= y < view.bottom):
+            return False                                             # 中心點在可視區外 = 被捲到看不見；邊緣被切掉幾 px 沒關係
         left, top, right, bottom = win32gui.GetWindowRect(hwnd)
         if not (left <= x < right and top <= y < bottom):
             return False

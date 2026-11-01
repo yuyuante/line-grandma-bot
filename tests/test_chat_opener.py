@@ -121,7 +121,7 @@ class TestOpenChatWindow(unittest.TestCase):
         ok, _ = run(ui, [ECHO, RESULT_LOW, RESULT_TOP, ("別人", (200, 300))])
         self.assertTrue(ok)
         self.assertEqual(ui.events, [
-            ("bring_to_front", MAIN), ("ensure_wide",),
+            ("bring_to_front", MAIN),
             ("set_search_text", "Notify Bot"), ("screenshot",),
             ("double_click", 100 + 267, 50 + 225),                                       # 最上面那一列；搜尋欄裡的回聲文字不算
             ("clear_search",)])                                                          # 最後一定清掉搜尋欄
@@ -139,12 +139,13 @@ class TestOpenChatWindow(unittest.TestCase):
         ok, logs = run(ui, {1: [ECHO], 0: [ECHO, RESULT_TOP]})
         self.assertTrue(ok)
         self.assertEqual(ui.events, [
-            ("bring_to_front", MAIN), ("ensure_wide",),
+            ("bring_to_front", MAIN),
             ("set_search_text", "Notify Bot"), ("screenshot",),
-            ("select_tab", 0),
+            ("ensure_wide",), ("select_tab", 0),
             ("set_search_text", ""), ("set_search_text", "Notify Bot"), ("screenshot",),
             ("double_click", 100 + 267, 50 + 225),
-            ("clear_search",), ("bring_to_front", MAIN), ("select_tab", 1)])             # 使用者原本的分頁要切回去 (先把主視窗帶回前景)
+            ("clear_search",), ("bring_to_front", MAIN),                                  # 使用者原本的分頁要切回去 (先把主視窗帶回前景)
+            ("ensure_wide",), ("select_tab", 1)])
         self.assertEqual(ui.tab, 1)
 
     def test_not_found_while_already_on_the_all_tab_gives_up_without_switching(self):
@@ -172,21 +173,32 @@ class TestOpenChatWindow(unittest.TestCase):
         ok, _ = run(ui, [ECHO])
         self.assertFalse(ok)
         self.assertNotIn("double_click", ui.names())
-        self.assertEqual(ui.events[-3:], [("clear_search",), ("bring_to_front", MAIN), ("select_tab", 1)])
+        self.assertEqual(ui.events[-4:], [("clear_search",), ("bring_to_front", MAIN), ("ensure_wide",), ("select_tab", 1)])
 
-    def test_narrow_window_is_widened_and_always_restored(self):
+    def test_narrow_window_is_widened_only_for_the_tab_switch_and_shrunk_right_after(self):
+        # 真機：寬版面下雙擊好友不會彈出獨立視窗，搜尋與雙擊一定要在原本的寬度做
+        ui = FakeUi(narrow=True, tab=1)
+        ok, _ = run(ui, {1: [ECHO], 0: [ECHO, RESULT_TOP]})
+        self.assertTrue(ok)
+        names = ui.names()
+        first = names.index("ensure_wide")
+        self.assertEqual(names[first:first + 3], ["ensure_wide", "select_tab", "restore_rect"])    # 拉寬 → 切分頁 → 馬上縮回
+        self.assertLess(names.index("restore_rect"), names.index("double_click"))                   # 雙擊時已經是原本的寬度
+        self.assertEqual(names.count("ensure_wide"), names.count("restore_rect"))                    # 每次拉寬都有縮回
+        self.assertEqual(ui.events[-1], ("restore_rect", (0, 0, 546, 700)))
+
+    def test_the_window_is_shrunk_back_even_when_the_tab_switch_fails(self):
+        ui = FakeUi(narrow=True, tab=1, can_select=False)
+        ok, _ = run(ui, {1: [ECHO], 0: [ECHO, RESULT_TOP]})
+        self.assertFalse(ok)
+        self.assertEqual(ui.names().count("ensure_wide"), ui.names().count("restore_rect"))
+        self.assertNotIn("double_click", ui.names())
+
+    def test_found_in_the_current_tab_never_resizes_the_window(self):
         ui = FakeUi(narrow=True)
         ok, _ = run(ui, [ECHO, RESULT_TOP])
         self.assertTrue(ok)
-        self.assertEqual(ui.events[-1], ("restore_rect", (0, 0, 546, 700)))
-        ui = FakeUi(narrow=True)
-        ok, _ = run(ui, [ECHO])                                                          # 失敗也要縮回去
-        self.assertFalse(ok)
-        self.assertEqual(ui.events[-1], ("restore_rect", (0, 0, 546, 700)))
-
-    def test_wide_window_is_not_restored(self):
-        ui = FakeUi(narrow=False)
-        run(ui, [ECHO, RESULT_TOP])
+        self.assertNotIn("ensure_wide", ui.names())
         self.assertNotIn("restore_rect", ui.names())
 
     def test_no_main_window(self):
@@ -364,6 +376,13 @@ class TestLineMainUiTabs(unittest.TestCase):
             self.assertFalse(ui.select_tab(MAIN, 9))                                       # 沒有這個分頁
         click.assert_not_called()
 
+    def test_select_tab_clicks_a_tab_whose_edge_is_slightly_clipped(self):
+        # 真機：分頁列捲動了 5px，第一個分頁左緣在可視區外一點點，但中心點看得到，照樣可以點
+        ui, marks = self.make(selected=1, view=(105, 10, 700, 70), tabs=((100, 10, 150, 70), (170, 10, 220, 70)))
+        with mock.patch.object(auto_reply.win32gui, "GetWindowRect", return_value=(0, 0, 1000, 800)),              mock.patch.object(auto_reply.pyautogui, "click", side_effect=lambda x, y: marks.update(sel=0)) as click,              mock.patch.object(auto_reply.time, "sleep"):
+            self.assertTrue(ui.select_tab(MAIN, 0))
+        click.assert_called_once_with(125, 40)
+
     def test_select_tab_never_drags(self):
         with mock.patch.object(auto_reply.pyautogui, "mouseDown") as down, mock.patch.object(auto_reply.pyautogui, "moveTo") as move:
             ui, _ = self.make(tabs=((-143, 10, -101, 70),))
@@ -379,7 +398,7 @@ class TestLineMainUiTabs(unittest.TestCase):
             move.assert_called_once_with(MAIN, 1368, 50, ui.MIN_MAIN_WIDTH, 1074, True)
             ui.restore_rect(MAIN, (1368, 50, 1914, 1124))
             move.assert_called_with(MAIN, 1368, 50, 546, 1074, True)
-        with mock.patch.object(auto_reply.win32gui, "GetWindowRect", return_value=(0, 0, 1200, 800)), \
+        with mock.patch.object(auto_reply.win32gui, "GetWindowRect", return_value=(0, 0, 1400, 800)), \
              mock.patch.object(auto_reply.win32gui, "MoveWindow") as move:
             self.assertIsNone(ui.ensure_wide(MAIN))
             move.assert_not_called()

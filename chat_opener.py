@@ -42,6 +42,22 @@ def _find_rows(ui, main, box, name, read_boxes):
     return [(origin[0] + x, origin[1] + y) for x, y in rows]
 
 
+def _switch_tab(ui, main, index):
+    """
+    切到指定分頁。分頁列太窄時第一個分頁會被淡出遮罩蓋住點不到，所以只在切分頁的這一下把主視窗拉寬，
+    切完立刻縮回原本的位置與大小 (寬版面下雙擊好友不會彈出獨立視窗，搜尋與雙擊一定要在原本的寬度做)。
+    """
+    wide_from = ui.ensure_wide(main)
+    try:
+        return ui.select_tab(main, index)
+    finally:
+        if wide_from is not None:
+            try:
+                ui.restore_rect(main, wide_from)
+            except Exception:
+                pass
+
+
 def open_chat_window(name, ui, read_boxes=ocr_engine.read_boxes, log=lambda msg: None, sleep=time.sleep):
     """
     開啟名稱為 name 的好友的獨立聊天視窗，成功 (視窗已存在或已開好) 回傳 True，任何一步沒把握回傳 False。
@@ -49,7 +65,6 @@ def open_chat_window(name, ui, read_boxes=ocr_engine.read_boxes, log=lambda msg:
     ui 提供：find_chat_window(name)、main_window()、bring_to_front(hwnd)、is_front(hwnd)、search_box_rect(hwnd) -> (左, 上, 右, 下)、
     set_search_text(text)、clear_search()、selected_tab(hwnd) -> 索引或 None、select_tab(hwnd, index) -> 是否成功、
     ensure_wide(hwnd) -> 原本的位置 (沒有改動回傳 None)、restore_rect(hwnd, rect)、double_click(x, y)、screenshot(hwnd) -> (PIL 圖, (左, 上))。
-    主視窗太窄時 LINE 會把分頁捲到看不見 (在分頁列上拖曳只會拖動整個視窗)，所以暫時把視窗拉寬，做完縮回原本的大小。
     """
     if ui.find_chat_window(name):
         return True
@@ -59,13 +74,11 @@ def open_chat_window(name, ui, read_boxes=ocr_engine.read_boxes, log=lambda msg:
         return False
     opened = False
     original_tab = None
-    original_rect = None
     try:
         ui.bring_to_front(main)
         if not ui.is_front(main):
             log("[開啟聊天視窗] 無法把 LINE 主視窗帶到前景，放棄。")
             return False
-        original_rect = ui.ensure_wide(main)
         box = ui.search_box_rect(main)
         if box is None:
             log("[開啟聊天視窗] 找不到主視窗的搜尋欄，放棄。")
@@ -82,10 +95,11 @@ def open_chat_window(name, ui, read_boxes=ocr_engine.read_boxes, log=lambda msg:
                 log(f"[開啟聊天視窗] 搜尋結果裡找不到「{name}」(名稱必須完全相符)，放棄。")
                 return False
             log("[開啟聊天視窗] 目前的分頁找不到，改到「全部」分頁搜尋。")
-            if not ui.select_tab(main, ALL_TAB_INDEX):
+            if not _switch_tab(ui, main, ALL_TAB_INDEX):
                 log("[開啟聊天視窗] 無法切到「全部」分頁，放棄。")
                 return False
             original_tab = current
+            box = ui.search_box_rect(main) or box
             ui.set_search_text("")
             ui.set_search_text(name)
             sleep(SEARCH_RESULT_WAIT)
@@ -117,11 +131,6 @@ def open_chat_window(name, ui, read_boxes=ocr_engine.read_boxes, log=lambda msg:
         if original_tab is not None:
             try:
                 ui.bring_to_front(main)                     # 剛開好的聊天視窗會搶走前景，select_tab 要主視窗在前景才肯動
-                ui.select_tab(main, original_tab)           # 把使用者原本的分頁還原 (視窗還是寬的時候才看得到分頁)
-            except Exception:
-                pass
-        if original_rect is not None:
-            try:
-                ui.restore_rect(main, original_rect)        # 視窗縮回原本的位置與大小
+                _switch_tab(ui, main, original_tab)         # 把使用者原本的分頁還原
             except Exception:
                 pass
