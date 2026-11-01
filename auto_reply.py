@@ -47,7 +47,7 @@ from crawl_images import (crawl_grandma_images, clean_expired_images, retire_ima
                           download_and_validate_image, get_existing_md5s, build_candidate_urls,
                           build_candidates, normalize_sources)
 
-VERSION = "2.10.1"
+VERSION = "2.11.0"
 
 # 0. 全系統單一執行個體鎖 (Windows Named Mutex)，防止重複啟動繞過斷路器
 _app_mutex_handle = None
@@ -195,6 +195,7 @@ DEFAULT_CONFIG = {
     "image_sources": [],                # 圖庫來源 (網址範本、編號範圍、選填時段類別，見 crawl_images.py)；空白 = 預設的 Formosa 貼圖酷每日問候攝影與插畫
     "require_grandma_image": True,      # 對方傳來的圖要先辨識為長輩圖才回覆；貼圖、生活照、無法辨識的一律不理會
     "reply_to_text": True,              # 對方傳來的「短文字訊息」(例如早安、中秋節快樂) 屬於本專案處理的性質時，也回同性質但不同張的圖 (只限一對一；讀文字要把聊天視窗帶到前景)
+    "birthday_reply": "謝謝",           # 一對一收到「生日快樂」的圖或短文字時，只回這句話 (不回圖)；空字串 = 不特別處理，照一般節日圖回覆。群組不適用
     "text_reply_max_chars": 30,         # 文字訊息超過這麼多字 (去掉空白與標點) 就當作一般聊天，不回圖
     "auto_neutral_images": False,       # 【開發中，預設關閉】沒有符合目前時段的圖時，用 OCR 讀得到字、但沒有問候語與節慶字樣的圖代替。實測 OCR 常讀不出藝術字的問候語，開啟會把早安圖誤判成無時段
     "group_targets": [],                # 要回覆的群組名單 (名稱同 targets 的寫法，不含人數)；群組另有更保守的規則，只能手動綁定快取頻道 (--bind-view)
@@ -207,6 +208,16 @@ DEFAULT_CONFIG = {
 
 last_reply_times = {}
 _last_valid_config = None
+
+BIRTHDAY_REPLY_MAX_CHARS = 20      # 生日回覆的字數上限：這是要「打」進輸入框的一句話，不是長篇大論
+
+
+def birthday_reply_text(config, target_name=None):
+    """一對一收到生日快樂時要回的那句話；空字串表示不特別處理。群組 (target_name 在 group_targets) 一律回空字串"""
+    if target_name is not None and is_group_target(target_name):
+        return ""
+    return str(config.get("birthday_reply", DEFAULT_CONFIG["birthday_reply"]) or "").strip()
+
 
 def configure_notifier(config):
     """依設定啟用或停用 Notify Bot 推播 (主迴圈每輪呼叫，改 config.json 即時生效)"""
@@ -272,6 +283,8 @@ def load_config():
                   "require_grandma_image", "auto_neutral_images", "auto_open_chat_window", "reply_to_text"):
             if k in cfg and isinstance(cfg[k], bool):
                 sanitized[k] = cfg[k]
+        if isinstance(cfg.get("birthday_reply"), str):
+            sanitized["birthday_reply"] = cfg["birthday_reply"].strip()[:BIRTHDAY_REPLY_MAX_CHARS]
         if isinstance(cfg.get("stop_command"), str) and cfg["stop_command"].strip():
             if len(re.sub(r"[\W_]+", "", cfg["stop_command"])) >= STOP_COMMAND_MIN_LEN:
                 sanitized["stop_command"] = cfg["stop_command"].strip()
@@ -1251,6 +1264,67 @@ def send_image_via_attach_dialog(chat_hwnd, image_path):
             return False
         time.sleep(0.2)
     return True
+TEXT_SEND_CONFIRM_TIMEOUT = 3.0     # 按 Enter 後等輸入框清空 (LINE 收下並送出) 的秒數
+
+
+def _find_message_input(chat_hwnd):
+    """聊天視窗底部的訊息輸入框 (UIA EditControl，類別 AutoSuggestTextArea)；找不到回傳 None"""
+    try:
+        import uiautomation as auto
+        edit = auto.ControlFromHandle(chat_hwnd).EditControl(ClassName="AutoSuggestTextArea")
+        return edit if edit.Exists(2, 0.2) else None
+    except Exception:
+        return None
+
+
+def send_text_via_input(chat_hwnd, text):
+    """
+    把一句文字送進聊天室：用 UIA 直接寫入輸入框 (不經剪貼簿與鍵盤輸入，所以不受輸入法影響、不動到剪貼簿)，讀回來比對後按 Enter。
+    回傳 True 表示已按 Enter 且輸入框已清空 (LINE 已收下)；任何一步沒把握都清掉自己寫的字並回傳 False：
+    輸入框裡本來就有尚未送出的草稿 (絕不覆蓋、也不跟草稿一起送出)、寫入後讀回不一致、按 Enter 前焦點被轉走。
+    """
+    if not text or not text.strip():
+        return False
+    edit = _find_message_input(chat_hwnd)
+    if edit is None:
+        log_v("[安全攔截] 找不到訊息輸入框，終止發送。")
+        return False
+    try:
+        pattern = edit.GetValuePattern()
+        if (pattern.Value or "").strip():
+            log_v("[安全攔截] 輸入框裡有尚未送出的文字 (草稿)，為避免覆蓋或連同草稿一起送出，終止發送。")
+            return False
+        if win32gui.GetForegroundWindow() != chat_hwnd:
+            log_v("[安全攔截] 寫入文字前焦點已被移轉至其他視窗，終止發送。")
+            return False
+        pattern.SetValue(text)
+        time.sleep(0.3)
+        if (pattern.Value or "") != text:
+            log_v("[安全攔截] 文字寫入輸入框後讀回不一致，取消發送。")
+            pattern.SetValue("")
+            return False
+        if win32gui.GetForegroundWindow() != chat_hwnd:
+            log_v("[安全攔截] 按 Enter 前焦點已被移轉至其他視窗，取消發送。")
+            pattern.SetValue("")
+            return False
+        pyautogui.press("enter")
+        deadline = time.time() + TEXT_SEND_CONFIRM_TIMEOUT
+        while time.time() < deadline:
+            time.sleep(0.2)
+            if not (pattern.Value or "").strip():
+                return True
+        log_v("[安全攔截] 按 Enter 後輸入框沒有清空，無法確認已送出，取消並清掉輸入框。")
+        pattern.SetValue("")
+        return False
+    except Exception as e:
+        log_v(f"[安全攔截] 送出文字時發生例外: {e}")
+        try:
+            edit.GetValuePattern().SetValue("")
+        except Exception:
+            pass
+        return False
+
+
 def get_line_pids():
     pids = set()
     for p in psutil.process_iter(['pid', 'name']):
@@ -3222,7 +3296,10 @@ def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_f
     deferred_identify = False
     deferred_text = False
     incoming_kind, incoming_text = None, ""
-    if text_trigger and config.get("reply_to_text", True) and config.get("require_grandma_image", True) and not is_group_target(target_name):
+    reply_text = None                               # 要回的是一句文字 (生日快樂 -> 謝謝)，不是圖
+    thanks_text = birthday_reply_text(config, target_name)
+    thanks_enabled = bool(thanks_text)
+    if text_trigger and (config.get("reply_to_text", True) or thanks_enabled) and config.get("require_grandma_image", True) and not is_group_target(target_name):
         deferred_text = deferred_identify = True      # 文字訊息：讀字要視窗在前景，等視窗帶到前景再辨識 (群組不適用)
     elif config.get("require_grandma_image", True):
         early = find_target_chat_window(target_name)
@@ -3231,6 +3308,8 @@ def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_f
             return _skip_not_grandma(target_name, triggered_file, config, incoming_text)
         if state:
             log_v(f" -> [長輩圖識別]「{target_name}」傳來的圖通過識別，性質：{incoming_kind.label}。")
+            if thanks_enabled and image_kind.is_birthday(incoming_kind):
+                reply_text = thanks_text
         deferred_identify = state is None     # 加密快取且視窗不在前景：等實際要回覆、視窗已帶到前景時再用截圖辨識
     else:
         incoming_kind = image_kind.ImageKind("greeting")     # 關閉識別：不管對方傳什麼，一律照現在時段回問候圖 (舊行為)
@@ -3246,7 +3325,9 @@ def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_f
     selected_image = None
     picked_slot = current_time_slot()
     log_v(f"\n偵測到「{target_name}」發來訊息！")
-    if not deferred_identify:
+    if reply_text:
+        log_v(f" -> 對方傳來的是生日祝福，只回一句「{reply_text}」，不回圖。")
+    elif not deferred_identify:
         selected_image = choose_reply_image(target_name, incoming_kind, incoming_text, config)
         if not selected_image:
             log_v(f"[無合適圖片]「{target_name}」傳來 {incoming_kind.label}，圖庫與即時抓圖都找不到合適的回覆圖，本次不回覆。")
@@ -3347,12 +3428,20 @@ def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_f
             _minimize_if_configured(chat_hwnd, config)
             return "SKIPPED_TEXT"
         log_v(f" -> [文字識別]「{target_name}」傳來的文字通過識別，性質：{incoming_kind.label}。")
-        selected_image = choose_reply_image(target_name, incoming_kind, incoming_text, config)
-        if not selected_image:
-            log_v(f"[無合適圖片]「{target_name}」傳來 {incoming_kind.label} 的文字，圖庫與即時抓圖都找不到合適的回覆圖，本次不回覆。")
+        if thanks_enabled and image_kind.is_birthday(incoming_kind):
+            reply_text = thanks_text
+            log_v(f" -> 對方傳來的是生日祝福，只回一句「{reply_text}」，不回圖。")
+        elif not config.get("reply_to_text", True):
+            log_v(f"[文字訊息略過]「{target_name}」傳來的文字不是生日祝福，而且 reply_to_text 已關閉，不回覆。")
             _minimize_if_configured(chat_hwnd, config)
-            return "SKIPPED_NO_IMAGE"
-        log_v(f" -> 挑選回覆圖片: {os.path.basename(selected_image)}")
+            return "SKIPPED_TEXT"
+        else:
+            selected_image = choose_reply_image(target_name, incoming_kind, incoming_text, config)
+            if not selected_image:
+                log_v(f"[無合適圖片]「{target_name}」傳來 {incoming_kind.label} 的文字，圖庫與即時抓圖都找不到合適的回覆圖，本次不回覆。")
+                _minimize_if_configured(chat_hwnd, config)
+                return "SKIPPED_NO_IMAGE"
+            log_v(f" -> 挑選回覆圖片: {os.path.basename(selected_image)}")
     elif deferred_identify:
         state, incoming_kind, incoming_text = recognize_incoming_image(triggered_file, chat_hwnd)
         if state is None:
@@ -3363,12 +3452,16 @@ def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_f
             _minimize_if_configured(chat_hwnd, config)
             return _skip_not_grandma(target_name, triggered_file, config, incoming_text)
         log_v(f" -> [長輩圖識別]「{target_name}」傳來的圖通過識別 (視窗截圖)，性質：{incoming_kind.label}。")
-        selected_image = choose_reply_image(target_name, incoming_kind, incoming_text, config)
-        if not selected_image:
-            log_v(f"[無合適圖片]「{target_name}」傳來 {incoming_kind.label}，圖庫與即時抓圖都找不到合適的回覆圖，本次不回覆。")
-            _minimize_if_configured(chat_hwnd, config)
-            return "SKIPPED_NO_IMAGE"
-        log_v(f" -> 挑選回覆圖片: {os.path.basename(selected_image)}")
+        if thanks_enabled and image_kind.is_birthday(incoming_kind):
+            reply_text = thanks_text
+            log_v(f" -> 對方傳來的是生日祝福，只回一句「{reply_text}」，不回圖。")
+        else:
+            selected_image = choose_reply_image(target_name, incoming_kind, incoming_text, config)
+            if not selected_image:
+                log_v(f"[無合適圖片]「{target_name}」傳來 {incoming_kind.label}，圖庫與即時抓圖都找不到合適的回覆圖，本次不回覆。")
+                _minimize_if_configured(chat_hwnd, config)
+                return "SKIPPED_NO_IMAGE"
+            log_v(f" -> 挑選回覆圖片: {os.path.basename(selected_image)}")
 
     # 發送前先對快取進行檔案集合快照 (包含 mtime 與大小)
     active_cache = get_active_line_cache_dir()
@@ -3385,11 +3478,18 @@ def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_f
     accounting_done = False
     history_recorded = False
     try:
-        log_v(" -> 透過附加檔案按鈕送出長輩圖...")
-        if not send_image_via_attach_dialog(chat_hwnd, selected_image):
-            log_v("[安全攔截] 無法經由附加檔案對話框送出長輩圖，本次未送出。")
-            _minimize_if_configured(chat_hwnd, config)
-            return "NOT_SENT"
+        if reply_text:
+            log_v(f" -> 送出文字「{reply_text}」...")
+            if not send_text_via_input(chat_hwnd, reply_text):
+                log_v("[安全攔截] 無法把文字送進輸入框，本次未送出。")
+                _minimize_if_configured(chat_hwnd, config)
+                return "NOT_SENT"
+        else:
+            log_v(" -> 透過附加檔案按鈕送出長輩圖...")
+            if not send_image_via_attach_dialog(chat_hwnd, selected_image):
+                log_v("[安全攔截] 無法經由附加檔案對話框送出長輩圖，本次未送出。")
+                _minimize_if_configured(chat_hwnd, config)
+                return "NOT_SENT"
         enter_sent = True
         time.sleep(1.0)
 
@@ -3431,25 +3531,27 @@ def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_f
             time.sleep(1.5)
             _minimize_if_configured(chat_hwnd, config, log_target=target_name)
 
-        # Enter 已按下：無論氣泡是否延遲渲染，一律寫入百輪記憶庫，杜絕未來重複挑選同一張發送
-        sent_md5 = get_file_md5(selected_image)
-        record_contact_sent(target_name, sent_md5, max_rounds=config.get("history_rounds", 100))
+        # Enter 已按下：無論氣泡是否延遲渲染，一律寫入百輪記憶庫，杜絕未來重複挑選同一張發送 (只回文字時沒有圖)
+        if not reply_text:
+            sent_md5 = get_file_md5(selected_image)
+            record_contact_sent(target_name, sent_md5, max_rounds=config.get("history_rounds", 100))
         history_recorded = True
 
         # 若啟用 replace_after_send，送出後自動淘汰該張長輩圖以維持圖庫滾動換新
-        if config.get("replace_after_send", True) and selected_image:
+        if config.get("replace_after_send", True) and selected_image and not reply_text:
             try:
                 images_dir_path = os.path.join(SCRIPT_DIR, config.get("images_dir", "images"))
                 retire_image(selected_image, images_dir=images_dir_path)
             except Exception as e:
                 log_v(f"[圖庫汰換] 自動汰換圖片失敗: {e}")
 
-        notifier.notify(f"📨 已回覆「{target_name}」長輩圖：{os.path.basename(selected_image)}")
+        what = f"文字「{reply_text}」" if reply_text else "長輩圖"
+        notifier.notify(f"📨 已回覆「{target_name}」{what}" if reply_text else f"📨 已回覆「{target_name}」長輩圖：{os.path.basename(selected_image)}")
         if verified_bubble:
-            log_v(f"[送達確認]「{target_name}」聊天視窗右側氣泡驗證通過，長輩圖確認已成功送出！")
+            log_v(f"[送達確認]「{target_name}」聊天視窗右側氣泡驗證通過，{what}確認已成功送出！")
             return "SENT_CONFIRMED"
         else:
-            log_v("長輩圖已按下 Enter 送出，視覺氣泡暫無法 100% 辨識 (判定為 SENT_UNCERTAIN)。已記為送出並記入百輪歷史，絕不重複重送。")
+            log_v(f"{what}已按下 Enter 送出，視覺氣泡暫無法 100% 辨識 (判定為 SENT_UNCERTAIN)。已記為送出並記入百輪歷史，絕不重複重送。")
             return "SENT_UNCERTAIN"
     except Exception as e:
         log_v(f"[例外防護] 發送流程發生異常: {e}")
@@ -3465,8 +3567,9 @@ def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_f
                 _record_reply(target_name)
                 accounting_done = True
             if not history_recorded:
-                sent_md5 = get_file_md5(selected_image)
-                record_contact_sent(target_name, sent_md5, max_rounds=config.get("history_rounds", 100))
+                if not reply_text:
+                    sent_md5 = get_file_md5(selected_image)
+                    record_contact_sent(target_name, sent_md5, max_rounds=config.get("history_rounds", 100))
                 history_recorded = True
             return "SENT_UNCERTAIN"
 
@@ -3572,7 +3675,7 @@ def check_for_incoming_messages(config):
                                 log_v(f" -> [文字訊息觸發]「{target}」未讀數增加 (all 模式)，準備自動回覆！")
                                 target_to_reply = target
                                 break
-                        elif config.get("reply_to_text", True) and config.get("require_grandma_image", True):
+                        elif (config.get("reply_to_text", True) or birthday_reply_text(config)) and config.get("require_grandma_image", True):
                             # 文字訊息沒有快取檔，只能靠未讀數增加；內容要等視窗帶到前景才讀得到，是不是問候由送出流程判斷
                             if current_time - last_time >= cooldown and current_time - LAST_SENT_TIME_BY_TARGET.get(target, 0) >= 5:
                                 log_v(f" -> [文字訊息觸發]「{target}」未讀數增加且沒有新的圖片或貼圖，準備讀取最後一則文字！")

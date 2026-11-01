@@ -9,7 +9,7 @@
     python tools/line_push_test.py info            # 核驗 token，顯示官方帳號名稱 (填入 config.json 的 targets)
     python tools/line_push_test.py image [檔名]     # 傳長輩圖 (預設從 images/ 隨機挑一張已推上 GitHub 的圖)
     python tools/line_push_test.py sticker         # 傳 LINE 貼圖
-    python tools/line_push_test.py text [內容]      # 傳純文字：短問候 (早安、中秋節快樂) 程式會回同性質的圖；一般聊天 (今天吃什麼) 程式應保持沉默
+    python tools/line_push_test.py text [內容]      # 傳純文字：短問候 (早安、中秋節快樂) 程式會回同性質的圖，「生日快樂」只回文字「謝謝」；一般聊天 (今天吃什麼) 程式應保持沉默
     python tools/line_push_test.py stop            # 傳遠端停止指令「結束長輩圖機器人」
     python tools/line_push_test.py quota           # 查詢本月推播則數用量
 """

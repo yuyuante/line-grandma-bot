@@ -18,6 +18,7 @@ NL = chr(10)
 CHAT = 77
 MID_AUTUMN = K("festival", (), "中秋節")
 MORNING = K("greeting", ("morning",))
+BIRTHDAY = K("festival", (), "生日")
 
 
 class _Base(unittest.TestCase):
@@ -428,13 +429,15 @@ class TestSendFlow(_Base):
 
     def run_flow(self, *, recognize=((True, MID_AUTUMN, "中秋節快樂"),), choose=None, attach=True, config=None,
                  triggered=True, slots=None, find_results=None, opener=False, title="小明",
-                 text_trigger=False, text_result=(True, MORNING, "早安"), media_result=True, target="小明", self_last=False):
+                 text_trigger=False, text_result=(True, MORNING, "早安"), media_result=True, target="小明", self_last=False,
+                 send_text=True):
         mocks = {}
         minimized = []
         patches = {
             "recognize": mock.patch.object(auto_reply, "recognize_incoming_image", side_effect=list(recognize)),
             "choose": mock.patch.object(auto_reply, "choose_reply_image", side_effect=choose if choose is not None else [self.image]),
             "attach": mock.patch.object(auto_reply, "send_image_via_attach_dialog", return_value=attach),
+            "send_text": mock.patch.object(auto_reply, "send_text_via_input", return_value=send_text),
             "slot": mock.patch.object(auto_reply, "current_time_slot", side_effect=slots or (lambda: self.slot)),
             "contact_received": mock.patch.object(auto_reply, "record_contact_received"),
             "find": mock.patch.object(auto_reply, "find_target_chat_window",
@@ -505,6 +508,85 @@ class TestSendFlow(_Base):
         kw.setdefault("media_result", False)               # 最底部是文字氣泡
         return self.run_flow(text_trigger=True, **kw)
 
+    def assert_thanks_only(self, result, m, text="謝謝"):
+        self.assertEqual(result, "SENT_CONFIRMED")
+        m["send_text"].assert_called_once_with(CHAT, text)
+        m["attach"].assert_not_called()                                                        # 只回文字，不回圖
+        m["choose"].assert_not_called()
+        m["contact_sent"].assert_not_called()                                                  # 沒有圖，沒有百輪記憶要記
+        m["retire"].assert_not_called()
+        self.assertEqual(self.today(), 1)                                                      # 但算一次回覆 (與其他回覆共用每日上限)
+
+    def test_birthday_picture_gets_only_a_thank_you(self):
+        result, m, _ = self.run_flow(recognize=[(True, BIRTHDAY, "生日快樂")])
+        self.assert_thanks_only(result, m)
+        m["notify"].assert_called_once()
+        self.assertIn("謝謝", m["notify"].call_args.args[0])
+
+    def test_birthday_text_gets_only_a_thank_you(self):
+        result, m, _ = self.text_flow(text_result=(True, BIRTHDAY, "生日快樂"))
+        self.assert_thanks_only(result, m)
+
+    def test_birthday_picture_recognised_late_from_the_window_screenshot_also_gets_a_thank_you(self):
+        result, m, _ = self.run_flow(recognize=[(None, None, ""), (True, BIRTHDAY, "生日快樂")])      # 視窗不在前景：先延後，帶到前景再辨識
+        self.assert_thanks_only(result, m)
+
+    def test_the_thank_you_text_comes_from_the_config(self):
+        result, m, _ = self.run_flow(recognize=[(True, BIRTHDAY, "生日快樂")], config={"birthday_reply": "謝謝你的祝福"})
+        self.assert_thanks_only(result, m, "謝謝你的祝福")
+
+    def test_other_festivals_and_greetings_still_get_pictures(self):
+        result, m, _ = self.run_flow()                                                         # 中秋節
+        self.assertEqual(result, "SENT_CONFIRMED")
+        m["attach"].assert_called_once()
+        m["send_text"].assert_not_called()
+        result, m, _ = self.text_flow(text_result=(True, MORNING, "早安"))
+        m["attach"].assert_called_once()
+        m["send_text"].assert_not_called()
+
+    def test_blank_birthday_reply_keeps_the_old_behaviour(self):
+        result, m, _ = self.run_flow(recognize=[(True, BIRTHDAY, "生日快樂")], config={"birthday_reply": ""})
+        self.assertEqual(result, "SENT_CONFIRMED")
+        m["attach"].assert_called_once()                                                       # 回一張生日圖
+        m["send_text"].assert_not_called()
+
+    def test_groups_keep_getting_a_birthday_picture(self):
+        auto_reply.set_group_targets(["小明"])
+        self.addCleanup(auto_reply.set_group_targets, [])
+        result, m, _ = self.run_flow(recognize=[(True, BIRTHDAY, "生日快樂")])
+        self.assertEqual(result, "SENT_CONFIRMED")
+        m["attach"].assert_called_once()
+        m["send_text"].assert_not_called()                                                     # 群組的生日祝福常常是祝別人，不回謝謝
+
+    def test_birthday_thanks_shares_the_daily_limit(self):
+        for _ in range(2):
+            self.assertEqual(self.run_flow()[0], "SENT_CONFIRMED")
+        self.assertEqual(self.run_flow(recognize=[(True, BIRTHDAY, "生日快樂")])[0], "SENT_CONFIRMED")
+        self.assertEqual(self.today(), 3)
+        result, m, _ = self.run_flow(recognize=[(True, BIRTHDAY, "生日快樂")])
+        self.assertEqual(result, "SKIPPED_DAILY_LIMIT")                                        # 第 4 次 (謝謝也算) 不回
+        m["send_text"].assert_not_called()
+
+    def test_failed_text_send_is_retried_and_leaves_no_trace(self):
+        result, m, minimized = self.run_flow(recognize=[(True, BIRTHDAY, "生日快樂")], send_text=False)
+        self.assertEqual(result, "NOT_SENT")
+        self.assertEqual(self.today(), 0)
+        m["contact_sent"].assert_not_called()
+        self.assertEqual(minimized, [CHAT])
+
+    def test_birthday_text_still_gets_thanks_when_text_replies_are_off_but_other_text_does_not(self):
+        result, m, _ = self.text_flow(text_result=(True, BIRTHDAY, "生日快樂"), config={"reply_to_text": False})
+        self.assert_thanks_only(result, m)
+        result, m, _ = self.text_flow(text_result=(True, MORNING, "早安"), config={"reply_to_text": False})
+        self.assertEqual(result, "SKIPPED_TEXT")
+        m["attach"].assert_not_called()
+        m["send_text"].assert_not_called()
+
+    def test_text_flow_is_not_entered_when_both_text_replies_and_birthday_thanks_are_off(self):
+        result, m, _ = self.text_flow(config={"reply_to_text": False, "birthday_reply": ""}, recognize=[(False, None, "")])
+        self.assertEqual(result, "SKIPPED_NOT_GRANDMA")
+        m["recognize_text"].assert_not_called()
+
     def test_short_greeting_text_gets_a_picture_of_the_same_kind(self):
         result, m, _ = self.text_flow(text_result=(True, MID_AUTUMN, "中秋節快樂"))
         self.assertEqual(result, "SENT_CONFIRMED")
@@ -567,7 +649,7 @@ class TestSendFlow(_Base):
         self.assertEqual(m["chat_map"].return_value, {})
 
     def test_switch_off_and_requirements_keep_the_old_behaviour(self):
-        result, m, _ = self.text_flow(config={"reply_to_text": False}, recognize=[(False, None, "")])
+        result, m, _ = self.text_flow(config={"reply_to_text": False, "birthday_reply": ""}, recognize=[(False, None, "")])
         self.assertEqual(result, "SKIPPED_NOT_GRANDMA")                                        # 關掉：沒有觸發檔 = 不是長輩圖
         m["recognize_text"].assert_not_called()
         result, m, _ = self.text_flow(config={"require_grandma_image": False})
@@ -997,8 +1079,12 @@ class TestTextTrigger(_Base):
         self.assertEqual(self.run_detection(title="小明"), [])                                  # 沒有未讀數
 
     def test_switch_off_keeps_the_old_silence_and_advances_the_baseline(self):
-        self.assertEqual(self.run_detection(config_extra={"reply_to_text": False}), [])
+        self.assertEqual(self.run_detection(config_extra={"reply_to_text": False, "birthday_reply": ""}), [])
         self.assertEqual(auto_reply.LAST_PROCESSED_UNREAD["小明"], 2)                           # 同一則文字不會一直被看
+
+    def test_birthday_thanks_alone_is_enough_to_trigger_a_text_check(self):
+        self.assertEqual(len(self.run_detection(config_extra={"reply_to_text": False, "birthday_reply": "謝謝"})), 1)
+        self.assertEqual(self.run_detection(config_extra={"reply_to_text": False, "birthday_reply": ""}), [])
 
     def test_without_grandma_recognition_there_is_no_kind_to_match_so_no_text_trigger(self):
         self.assertEqual(self.run_detection(config_extra={"require_grandma_image": False}), [])
@@ -1033,6 +1119,14 @@ class TestConfigTextKeys(_Base):
         self.assertEqual((cfg["reply_to_text"], cfg["text_reply_max_chars"]), (True, 1))        # 不是布林：沿用預設；字數最少 1
         cfg = self.load({"targets": ["a"], "text_reply_max_chars": "many"})
         self.assertEqual(cfg["text_reply_max_chars"], 30)
+
+    def test_birthday_reply_setting(self):
+        self.assertEqual(self.load({"targets": ["a"]})["birthday_reply"], "謝謝")
+        self.assertEqual(self.load({"targets": ["a"], "birthday_reply": "  謝謝你  "})["birthday_reply"], "謝謝你")
+        self.assertEqual(self.load({"targets": ["a"], "birthday_reply": ""})["birthday_reply"], "")           # 空字串 = 關閉
+        self.assertEqual(self.load({"targets": ["a"], "birthday_reply": 5})["birthday_reply"], "謝謝")          # 不是字串：沿用預設
+        long = self.load({"targets": ["a"], "birthday_reply": "謝" * 50})["birthday_reply"]
+        self.assertEqual(len(long), auto_reply.BIRTHDAY_REPLY_MAX_CHARS)                                    # 這是要打進輸入框的一句話
 
 
 class TestConfigKeys(_Base):

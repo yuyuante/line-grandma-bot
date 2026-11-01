@@ -24,6 +24,7 @@
   "image_sources": [],
   "require_grandma_image": true,
   "reply_to_text": true,
+  "birthday_reply": "謝謝",
   "text_reply_max_chars": 30,
   "notify_log": false,
   "notify_monthly_cap": 150,

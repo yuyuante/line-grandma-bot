@@ -1,6 +1,6 @@
 # LINE 長輩圖智慧自動回覆機器人 (line-grandma-bot)
 
-[![Version](https://img.shields.io/badge/version-2.10.1-blue.svg)](auto_reply.py)
+[![Version](https://img.shields.io/badge/version-2.11.0-blue.svg)](auto_reply.py)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D6.svg)](https://microsoft.com)
 [![Python](https://img.shields.io/badge/python-3.10%2B-green.svg)](https://python.org)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey.svg)](LICENSE)
@@ -49,7 +49,7 @@ line-grandma-bot/
 ├── image_kind.py        # 由圖上文字判斷性質：節日、時段問候、平安叮嚀、祝福鼓勵、心靈雞湯；競選圖一律不回
 ├── image_library.py     # 圖庫性質索引、挑圖規則、沒庫存時立即上網抓圖
 ├── reply_budget.py      # 每個聊天室每天的回覆次數上限
-├── auto_reply.py        # 核心自動回覆常駐程式 (v2.10.1)
+├── auto_reply.py        # 核心自動回覆常駐程式 (v2.11.0)
 ├── crawl_images.py      # 台塑貼圖酷長輩圖抓取與過期清理模組
 ├── config.example.json  # 設定檔範本
 ├── config.json          # 個人實際設定檔 (已列入 .gitignore 保護隱私)
@@ -146,6 +146,7 @@ copy config.example.json config.json
 | `group_max_replies_per_day` | `1` | 每個群組每天最多回覆幾次（本機午夜重置；`0` = 不限次數）。 |
 | `group_cooldown_seconds` | `600` | 同一個群組兩次回覆之間至少間隔幾秒，避免多人連續傳圖時一直回。 |
 | `reply_to_text` | `true` | 對方傳來的**短文字訊息**（例如「早安」「中秋節快樂」）屬於本專案處理的性質（節日、平安叮嚀、祝福鼓勵、時段問候、心靈雞湯）時，也回同性質但不同張的圖。只限一對一聊天室，不需要綁定快取頻道；與圖片共用每日上限與冷卻。讀文字要把聊天視窗帶到前景（見下方限制），不想被打擾就設 `false`。 |
+| `birthday_reply` | `"謝謝"` | 一對一收到「生日快樂」的**圖或短文字**時，只回這句話（打進輸入框送出），不回圖；算一次回覆，與其他回覆共用每日上限。**群組不適用**（群組裡的生日祝福常常是祝別人），群組的生日圖維持原本回一張圖。設為空字串 `""` 就關閉，照一般節日圖回覆。最多 20 字。 |
 | `text_reply_max_chars` | `30` | 文字訊息超過這麼多字（去掉空白與標點）就當作一般聊天，不回圖。 |
 | `auto_open_chat_window` | `true` | 找不到某位對象的獨立聊天視窗時，自動從 LINE 主視窗搜尋並雙擊開啟（名稱必須完全相符；必要時暫時拉寬主視窗、切到「全部」分頁，做完還原）。設 `false` 就維持手動開視窗。 |
 | `notify_log` | `false` | 把啟動、回覆、停止與警告/錯誤推播到 LINE 官方帳號（例如 `Notify Bot`），在聊天室裡看程式的狀況。需要先建立憑證檔，見下方「Notify Bot 推播」。修改後即時生效。 |
@@ -226,6 +227,16 @@ python auto_reply.py --unbind "媽媽"
 ---
 
 ## 📝 版本異動紀錄 (Changelog)
+
+### [v2.11.0] - 2026-11-01
+#### 收到「生日快樂」只回一句「謝謝」
+- **新功能**：一對一對象傳來「生日快樂」的圖或短文字（性質判斷為節日裡的「生日」，`image_kind.is_birthday`），不再回生日圖，改成只回文字「謝謝」。文字可用 `birthday_reply` 改，設為空字串就關閉（回到回一張生日圖）。
+- **機器人第一次「打字」**（`send_text_via_input`）：用 UIA 直接把文字寫進輸入框（`AutoSuggestTextArea`），不經剪貼簿與鍵盤，所以不動到你的剪貼簿、不受注音等輸入法影響；寫入後讀回比對，一致才按 Enter，再等輸入框清空確認 LINE 已收下。
+  - **絕不動你的草稿**：輸入框裡本來就有尚未送出的文字就放棄，不覆蓋、也不連同草稿一起送出。
+  - 讀回不一致、按 Enter 前焦點被轉走、按 Enter 後輸入框沒清空，都會清掉自己寫的字並回報沒送出（走原本的重試流程）。
+- **範圍**：只限一對一；**群組維持原樣**（群組的生日祝福常常是祝別人，回「謝謝」可能回錯人，群組的生日圖仍回一張圖）。與其他回覆共用每日上限（一對一每天 3 次）、冷卻、斷路器、前景標題核對、送達確認；只回文字所以不記百輪圖片記憶、不淘汰圖庫的圖。
+- **文字偵測**：只開 `birthday_reply`、關掉 `reply_to_text` 時，一對一的文字訊息仍會被讀取（讀文字要把視窗帶到前景），只有生日祝福會被回，其他文字略過。要完全不讀文字，兩個都關。
+- **真機驗證**：在 Notify Bot 把「謝謝」寫進輸入框並送出，輸入框清空、右側氣泡驗證通過。
 
 ### [v2.10.1] - 2026-11-01
 - **修正：名稱太長的群組開不出視窗**。LINE 搜尋結果列會把長名稱截斷，例如「東南里李武雄服務處-公用」顯示成「東南里李武雄服..（477）上午9:20」（名稱、成員數、最後訊息時間被 OCR 讀成同一段），原本「整列必須完全等於名稱」永遠比對不上，群組傳來圖片時機器人開不出視窗、整則被略過（Notify Bot 收到「桌面無該好友專屬視窗，安全略過」）。

@@ -162,6 +162,16 @@ class TestImageKind(unittest.TestCase):
         self.assertEqual(ik.normalize_text(" 早 安\n快乐 "), "早安快樂")
 
 
+class TestIsBirthday(unittest.TestCase):
+    def test_only_the_birthday_festival_counts(self):
+        self.assertTrue(ik.is_birthday(ik.classify_message("生日快樂")))
+        self.assertTrue(ik.is_birthday(ik.classify_text("祝你 Happy Birthday 生日快樂")))
+        self.assertFalse(ik.is_birthday(ik.classify_message("中秋節快樂")))
+        self.assertFalse(ik.is_birthday(ik.classify_message("早安")))
+        self.assertFalse(ik.is_birthday(None))
+        self.assertFalse(ik.is_birthday(ik.ImageKind("greeting", ("morning",))))
+
+
 class TestClassifyMessage(unittest.TestCase):
     def test_short_greetings_and_festivals_are_recognised(self):
         self.assertEqual(ik.classify_message("早安！").category, "greeting")

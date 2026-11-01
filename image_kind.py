@@ -175,6 +175,11 @@ def find_slots(text):
     return tuple(found)
 
 
+def is_birthday(kind):
+    """是不是「生日快樂」類的祝福 (節日裡的「生日」)：一對一收到這種圖或文字只回一句謝謝，不回圖"""
+    return kind is not None and kind.category == "festival" and kind.festival == "生日"
+
+
 TEXT_MESSAGE_MAX_CHARS = 30      # 對方傳來的「文字訊息」超過這麼多字 (去掉空白與標點) 就當作一般聊天，不回圖
 
 
