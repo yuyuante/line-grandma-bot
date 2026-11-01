@@ -41,6 +41,8 @@ _creds = None
 _creds_checked = False
 _synced = False                     # 本次執行是否已向 LINE 查過本月用量
 log_sink = None                     # 呼叫端 (auto_reply) 設定：本模組自己印的 [通知] 提示也寫進紀錄檔；參數是不含時間的文字
+fallback_sink = None                # 呼叫端 (auto_reply) 設定：推播額度用完時，改把這則通知交給它 (從使用者自己的帳號送進聊天室)；參數是完整文字
+fallback_busy = False               # 呼叫端正在送備援訊息時為 True：notify() 在這段期間不再收新通知 (在產生當下判斷，不在背景執行緒送出時才判斷，否則先排進佇列的通知會被誤丟)
 _rejected = {"code": None}          # LINE 明確拒絕 (400/401/403/404) 之後本次執行不再推播：紀錄仍照常寫在本機檔案
 REJECTED_CODES = (400, 401, 403, 404)   # 權杖無效、這個帳號沒加 Notify Bot 為好友 (推播對象不存在)、對象封鎖等：重試也不會好
 
@@ -73,6 +75,16 @@ def _warn(key, msg, force=False):
     try:
         if log_sink is not None:
             log_sink(f"[通知] {msg}")
+    except Exception:
+        pass
+
+
+def _to_fallback(text):
+    """額度用完 (LINE 回 429，或本機月上限已到)：這則通知不丟掉，交給備援 (如果有設定)；任何錯誤都不往外擲"""
+    if fallback_sink is None:
+        return
+    try:
+        fallback_sink(text)
     except Exception:
         pass
 
@@ -155,8 +167,9 @@ def _deliver(text):
         except Exception:
             pass                                               # 查不到就只信本機記錄
     if state["count"] >= cap:
-        _warn("cap", f"本月推播已達上限 ({cap} 則)，之後只記在本機，下個月恢復。")
+        _warn("cap", f"本月推播已達上限 ({cap} 則)，之後只記在本機，下個月恢復。" + (" 通知改由你的帳號送進聊天室 (視窗有開才送)。" if fallback_sink else ""))
         _save_state(state)
+        _to_fallback(text)
         return
     try:
         _call(creds, "POST", "/message/push", {"to": creds["user_id"], "messages": [{"type": "text", "text": text}]})
@@ -164,7 +177,8 @@ def _deliver(text):
         if e.code == 429:
             state["count"] = cap                               # LINE 說額度用完，本月不再嘗試
             _save_state(state)
-            _warn("quota", "LINE 回報本月推播額度已用完，本月不再推播。")
+            _warn("quota", "LINE 回報本月推播額度已用完，本月不再推播。" + (" 通知改由你的帳號送進聊天室 (視窗有開才送)。" if fallback_sink else ""))
+            _to_fallback(text)
         elif e.code in REJECTED_CODES:
             _rejected["code"] = e.code
             _warn("rejected", f"LINE 拒絕了推播 (HTTP {e.code})：這個 LINE 帳號可能沒有加 Notify Bot 為好友，或 LINE_TOKEN／LINE_USER_ID 不對。"
@@ -202,6 +216,8 @@ def notify(text, key=None, throttle=0.0, alert=False):
     """
     if not _settings["enabled"] or _rejected["code"] is not None:
         return False
+    if fallback_busy:
+        return False                    # 備援正在送出：這段期間「產生」的通知不再排入 (避免自己送自己)；已經排在佇列裡的不受影響
     now = time.time()
     with _lock:
         if key is not None and now - _throttle.get(key, -1e18) < throttle:

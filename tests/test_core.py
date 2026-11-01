@@ -3950,6 +3950,20 @@ class TestLineGrandmaBotCore(unittest.TestCase):
         self.assertEqual(auto_reply._window_hwnd(wins, "別人"), 3)
         self.assertIsNone(auto_reply._window_hwnd(wins, "不存在"))
 
+    def test_load_config_sanitizes_notify_fallback_chat(self):
+        path = os.path.join(self.temp_dir.name, "fallback_cfg.json")
+
+        def load(value):
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"targets": ["a"], "notify_fallback_chat": value}, f)
+            with mock.patch.object(auto_reply, "CONFIG_PATH", path):
+                return auto_reply.load_config()["notify_fallback_chat"]
+
+        self.assertEqual(load("  我的通知  "), "我的通知")                  # 去掉前後空白
+        self.assertEqual(load(""), "")                                     # 空字串 = 不備援
+        self.assertEqual(load(123), "Notify Bot")                          # 型別錯誤沿用預設
+        self.assertEqual(load(None), "Notify Bot")
+
     def test_load_config_sanitizes_notify_settings(self):
         path = os.path.join(self.temp_dir.name, "notify_cfg.json")
         with open(path, "w", encoding="utf-8") as f:

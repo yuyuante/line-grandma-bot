@@ -48,7 +48,7 @@ from crawl_images import (crawl_grandma_images, clean_expired_images, retire_ima
                           download_and_validate_image, get_existing_md5s, build_candidate_urls,
                           build_candidates, normalize_sources)
 
-VERSION = "2.12.0"
+VERSION = "2.13.0"
 
 # 0. 全系統單一執行個體鎖 (Windows Named Mutex)，防止重複啟動繞過斷路器
 _app_mutex_handle = None
@@ -283,7 +283,8 @@ DEFAULT_CONFIG = {
     "log_to_file": True,                # 程式自己寫紀錄檔：logs/auto_reply_日期.log，每天一個檔，內容與畫面相同 (不含聊天內容)
     "log_keep_days": 7,                 # 紀錄檔保留幾天，更早的自動刪除
     "notify_log": False,                # 把啟動、回覆、停止與警告/錯誤推播到 LINE 官方帳號 (需 ~/.line-notify.env，見 notifier.py)
-    "notify_monthly_cap": 150           # 每月最多推播則數 (官方帳號免費方案上限 200，留一些給手動測試)
+    "notify_monthly_cap": 150,          # 每月最多推播則數 (官方帳號免費方案上限 200，留一些給手動測試)
+    "notify_fallback_chat": "Notify Bot"  # 推播額度用完時 (LINE 回 429 或到 notify_monthly_cap)，改從你自己的帳號把通知送進這個聊天室；視窗要已開著，沒開就只寫紀錄檔；空字串 = 不備援
 }
 
 last_reply_times = {}
@@ -302,6 +303,145 @@ def birthday_reply_text(config, target_name=None):
 def configure_notifier(config):
     """依設定啟用或停用 Notify Bot 推播 (主迴圈每輪呼叫，改 config.json 即時生效)"""
     notifier.configure(config.get("notify_log", False), config.get("notify_monthly_cap", DEFAULT_CONFIG["notify_monthly_cap"]), NOTIFY_STATE_PATH)
+    chat = str(config.get("notify_fallback_chat", DEFAULT_CONFIG["notify_fallback_chat"]) or "").strip()
+    if chat and is_group_target(chat):
+        if "fallback_group" not in _WARNED_ONCE:
+            _WARNED_ONCE.add("fallback_group")
+            logging.warning(f"notify_fallback_chat「{chat}」同時是群組，不能當備援聊天室，備援已關閉。")
+        chat = ""
+    with _FALLBACK_LOCK:
+        _FALLBACK["chat"] = chat
+        if not chat:
+            _FALLBACK["pending"].clear()
+            _FALLBACK["failures"] = 0
+    notifier.fallback_sink = queue_fallback_notice if chat else None
+
+
+FALLBACK_MIN_INTERVAL = 300.0    # 備援訊息兩次嘗試送進聊天室的最短間隔 (秒)：累積幾則合併成一則，不要一直打擾你
+FALLBACK_FAILURE_INTERVAL = 900.0   # 送不進去 (輸入框有草稿、焦點被搶走) 之後拉長到這個間隔再試，不要每 5 分鐘打擾一次
+FALLBACK_WINDOW_RECHECK = 30.0   # 聊天室視窗沒開時，多久才再找一次 (找視窗要掃行程與視窗列表，不必每輪都做)
+FALLBACK_MAX_PENDING = 200       # 最多暫存幾則 (超過丟最舊的，完整紀錄仍在 logs/ 檔案)
+FALLBACK_MAX_CHARS = 1200        # 合併後單則訊息字數上限
+_FALLBACK = {"chat": "", "pending": [], "last": 0.0, "window_checked": 0.0, "failures": 0}
+_FALLBACK_LOCK = threading.Lock()
+_EMOJI_RE = re.compile(r"[\U00010000-\U0010ffff\u2600-\u27bf\ufe0f\u200d]")      # 表情符號、符號區 (警告三角形、打勾等) 與變體選擇符：輸入框可能改寫它們，造成讀回比對不一致
+
+
+def queue_fallback_notice(text):
+    """推播額度用完時，notifier 把通知交到這裡暫存 (背景執行緒呼叫)；備援沒開就丟掉"""
+    with _FALLBACK_LOCK:
+        if not _FALLBACK["chat"]:
+            return
+        _FALLBACK["pending"].append(str(text))
+        del _FALLBACK["pending"][:-FALLBACK_MAX_PENDING]
+
+
+def _first_safe(candidates, phrase):
+    """候選文字裡第一個「不像停止指令」的；全部都像就用最後一個 (最短、最不可能含任何指令的省略號)"""
+    for candidate in candidates:
+        if not phrase or not text_matches_stop_command(candidate, phrase):
+            return candidate
+    return candidates[-1]
+
+
+def _fallback_message(lines, stop_phrase, plain=False):
+    """
+    把暫存的通知合併成一則，回傳 (文字, 用掉幾則)。換行改成「／」。
+    **停止指令那句話一律換掉**：停止指令是「你自己發的訊息裡含那句話就停」，備援訊息正是從你的帳號送出，
+    通知文字 (例如啟動說明) 裡若帶著那句話，機器人會把自己停掉。換掉用的文字本身也要不像停止指令
+    (停止指令若剛好是「停止指令」四個字，括號裡的「停止指令」就還是會中)，所以每個替代文字都逐一核對。
+    plain 為 True 時去掉表情符號與變體選擇符 (前一次因為讀回不一致送不進去時改用)；去除要在核對之前做
+    (去掉夾在中間的符號，才不會拼出停止指令)。
+    """
+    phrase = (stop_phrase or "").strip()
+    repl = _first_safe(["（停止指令）", "（已省略）", "…"], phrase)
+    omitted = _first_safe(["（這則通知含停止指令字樣，已省略）", "（已省略）", "…"], phrase)
+
+    def safe(line):
+        line = str(line)
+        if plain:
+            line = re.sub(r"[ \t]{2,}", " ", _EMOJI_RE.sub("", line))
+        line = re.sub(r"\s*[\r\n]+\s*", " ／ ", line).strip()
+        if phrase:
+            line = line.replace(phrase, repl)
+            if text_matches_stop_command(line, phrase):
+                return omitted
+        return line
+
+    header = "[備援] " if plain else "📝[備援] "
+    picked, size = [], len(header)
+    for line in lines:
+        piece = safe(line)
+        if picked and size + len(piece) + 3 > FALLBACK_MAX_CHARS:
+            break
+        picked.append(piece[:FALLBACK_MAX_CHARS])
+        size += len(piece) + 3
+    text = header + " ｜ ".join(picked)
+    if phrase and text_matches_stop_command(text, phrase):
+        text = _first_safe([header + "（通知內容含停止指令字樣，已省略）", "（已省略）", "…"], phrase)
+    return text, len(picked)
+
+
+def flush_fallback_notices(config, force=False):
+    """
+    推播額度用完後，把暫存的通知從你自己的帳號送進 notify_fallback_chat (主迴圈每輪呼叫)。
+    只在聊天室視窗已經開著時才送 (不為了送紀錄去動你的主視窗)；最多每 FALLBACK_MIN_INTERVAL 秒送一則合併的訊息；
+    送完照 close_window_after_send 放回去。送不進去 (輸入框有草稿、焦點被搶走、讀回不一致) 就保留，
+    間隔拉長到 FALLBACK_FAILURE_INTERVAL 再試，而且改送去掉表情符號的版本。
+    force 為 True (程式結束前最後一次) 時不看間隔，把最後的通知 (例如「已停止」) 盡量送出去。
+    """
+    with _FALLBACK_LOCK:
+        chat = _FALLBACK["chat"]
+        lines = list(_FALLBACK["pending"])
+    if not chat or not lines or is_group_target(chat):
+        return
+    now = time.time()
+    if not force and (now - _FALLBACK["last"] < FALLBACK_MIN_INTERVAL or now - _FALLBACK["window_checked"] < FALLBACK_WINDOW_RECHECK):
+        return
+    matched = find_target_chat_window(chat)
+    if not matched:
+        _FALLBACK["window_checked"] = now               # 視窗沒開：通知只留在 logs/ 檔案，稍後才再找
+        return
+    _FALLBACK["window_checked"] = 0.0
+    _FALLBACK["last"] = now
+    text, used = _fallback_message(lines, config.get("stop_command", ""), plain=_FALLBACK["failures"] > 0)
+    hwnd = matched[0][0]
+    sent = False
+    notifier.fallback_busy = True
+    try:
+        if win32gui.IsIconic(hwnd):
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            time.sleep(0.3)
+        activate_window(hwnd)
+        time.sleep(0.4)
+        if win32gui.GetForegroundWindow() == hwnd and title_matches_target(win32gui.GetWindowText(hwnd), chat):
+            sent = send_text_via_input(hwnd, text)
+    except Exception as e:
+        log_v(f" -> [通知備援] 送進「{chat}」時發生例外: {e}")           # 刻意不用 [警告] 標籤：那種行會再被推播/備援
+    finally:
+        _minimize_if_configured(hwnd, config)
+        notifier.fallback_busy = False
+    if sent:
+        _FALLBACK["failures"] = 0
+        with _FALLBACK_LOCK:
+            for item in lines[:used]:
+                try:
+                    _FALLBACK["pending"].remove(item)
+                except ValueError:
+                    pass                                    # 送出期間已被裁掉的舊通知
+        log_v(f" -> [通知備援] 推播額度已用完，已改從你的帳號把 {used} 則通知送進「{chat}」。")
+    else:
+        _FALLBACK["failures"] += 1
+        _FALLBACK["last"] = now - FALLBACK_MIN_INTERVAL + FALLBACK_FAILURE_INTERVAL
+        log_v(f" -> [通知備援] 暫時送不進「{chat}」，{int(FALLBACK_FAILURE_INTERVAL)} 秒後再試 (已暫存 {len(lines)} 則)。")
+
+
+def flush_fallback_notices_at_exit(config):
+    """程式結束前最後一次把備援暫存的通知 (例如「已停止」) 送出去；任何錯誤都不影響結束流程"""
+    try:
+        flush_fallback_notices(config, force=True)
+    except Exception:
+        pass
 
 def load_config():
     global _last_valid_config
@@ -392,6 +532,8 @@ def load_config():
             sanitized["notify_monthly_cap"] = max(1, int(cfg.get("notify_monthly_cap", DEFAULT_CONFIG["notify_monthly_cap"])))
         except Exception:
             pass
+        if isinstance(cfg.get("notify_fallback_chat"), str):
+            sanitized["notify_fallback_chat"] = cfg["notify_fallback_chat"].strip()
         if isinstance(cfg.get("stop_command_chats"), list):
             sanitized["stop_command_chats"] = [str(t).strip() for t in cfg["stop_command_chats"] if str(t).strip()]
         if "images_dir" in cfg and isinstance(cfg["images_dir"], str):
@@ -4844,6 +4986,7 @@ def main():
                     clean_expired_images(images_dir=target_dir, ttl_days=ttl)
                     last_cleanup_time = time.time()
 
+                flush_fallback_notices(config)
                 check_for_incoming_messages(config)
             except pyautogui.FailSafeException:
                 logging.warning("[防護] 滑鼠移至螢幕角落觸發 pyautogui 安全保護，等待 3 秒後繼續監聽...")
@@ -4857,10 +5000,12 @@ def main():
         log_v("\n程式已停止。")
         notifier.notify("🔴 長輩圖機器人已停止 (Ctrl+C)")
         notifier.flush()
+        flush_fallback_notices_at_exit(config)          # 推播額度用完時，「已停止」是最想看到的通知，結束前盡量送出
     except StopRequested as e:
         log_v(f"\n[遠端停止] {e}，程式立即結束。")
         notifier.notify(f"🔴 長輩圖機器人已停止：{e}")
         notifier.flush()
+        flush_fallback_notices_at_exit(config)
         sys.exit(STOP_EXIT_CODE)
 
 if __name__ == "__main__":

@@ -30,6 +30,7 @@
   "log_keep_days": 7,
   "notify_log": false,
   "notify_monthly_cap": 150,
+  "notify_fallback_chat": "Notify Bot",
   "group_targets": [],
   "group_max_replies_per_day": 1,
   "group_cooldown_seconds": 600,

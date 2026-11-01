@@ -240,6 +240,115 @@ class TestNotifier(unittest.TestCase):
         notifier.flush(3)
         self.assertEqual(len(self.pushes()), 1)
 
+    # ---------- 額度用完的備援 (改從使用者自己的帳號把通知送進聊天室) ----------
+    def with_sink(self):
+        got = []
+        notifier.fallback_sink = got.append
+        self.addCleanup(setattr, notifier, "fallback_sink", None)
+        self.addCleanup(setattr, notifier, "fallback_busy", False)
+        return got
+
+    def test_http_429_hands_the_notice_to_the_fallback(self):
+        got = self.with_sink()
+        self.push_error = urllib.error.HTTPError("u", 429, "Too Many", {}, None)
+        notifier.notify("第一則")
+        notifier.flush(3)
+        self.assertEqual(len(got), 1)
+        self.assertIn("第一則", got[0])
+        self.push_error = None
+        notifier.notify("第二則")                                                   # 額度已記為用完：不再打 API，直接走備援
+        notifier.flush(3)
+        self.assertEqual(len(self.pushes()), 1)
+        self.assertEqual(len(got), 2)
+
+    def test_reaching_the_local_monthly_cap_uses_the_fallback_without_calling_the_api(self):
+        got = self.with_sink()
+        notifier.configure(True, 2, self.state_path)
+        for n in range(4):
+            notifier.notify(f"通知{n}")
+            notifier.flush(3)
+        self.assertEqual(len(self.pushes()), 2)
+        self.assertEqual(len(got), 2)
+        self.assertIn("通知2", got[0])
+        self.assertIn("通知3", got[1])
+
+    def test_normal_pushes_never_touch_the_fallback(self):
+        got = self.with_sink()
+        notifier.notify("一般通知")
+        notifier.flush(3)
+        self.assertEqual(len(self.pushes()), 1)
+        self.assertEqual(got, [])
+
+    def test_a_rejected_account_never_uses_the_fallback(self):
+        # 另一台電腦的帳號沒加 Notify Bot 為好友 (400/401/403/404)：只寫檔案，不往聊天室塞東西
+        got = self.with_sink()
+        self.reject(403)
+        notifier.notify("a")
+        notifier.flush(3)
+        notifier.notify("b")
+        notifier.flush(3)
+        self.assertEqual(got, [])
+
+    def test_missing_credentials_never_use_the_fallback(self):
+        got = self.with_sink()
+        notifier._creds = None
+        notifier._creds_checked = True
+        notifier.notify("a")
+        notifier.flush(3)
+        self.assertEqual(got, [])
+
+    def test_notices_produced_while_the_fallback_is_sending_are_dropped(self):
+        got = self.with_sink()
+        notifier.configure(True, 1, self.state_path)
+        notifier.notify("先用掉額度")
+        notifier.flush(3)
+        notifier.fallback_busy = True
+        notifier.notify("備援送出期間產生的")
+        notifier.flush(3)
+        self.assertEqual(got, [])                                                   # 避免自己送自己
+
+    def test_notices_already_queued_are_not_lost_when_the_fallback_starts_sending(self):
+        # 審查：busy 旗標在背景執行緒送出時才檢查的話，先排進佇列的通知會被誤丟；現在只在「產生」當下 (notify) 判斷
+        got = self.with_sink()
+        notifier.configure(True, 1, self.state_path)
+        notifier.notify("先用掉額度")
+        notifier.flush(3)
+        self.assertTrue(notifier.notify("已排進佇列的通知"))
+        notifier.fallback_busy = True                                           # 備援開始送出，佇列裡的通知這時才被背景執行緒處理
+        notifier.flush(3)
+        self.assertTrue(any("已排進佇列的通知" in g for g in got))
+
+    def test_no_new_notice_is_accepted_while_the_fallback_is_sending(self):
+        self.with_sink()
+        notifier.fallback_busy = True
+        self.assertFalse(notifier.notify("備援送出期間產生的"))
+        notifier.fallback_busy = False
+        self.assertTrue(notifier.notify("備援結束後產生的", key="x2"))
+
+    def test_a_broken_fallback_never_breaks_the_worker(self):
+        notifier.fallback_sink = mock.Mock(side_effect=RuntimeError("boom"))
+        self.addCleanup(setattr, notifier, "fallback_sink", None)
+        notifier.configure(True, 1, self.state_path)
+        notifier.notify("a")
+        notifier.notify("b")
+        self.assertTrue(notifier.flush(3))
+
+    def test_a_new_month_goes_back_to_normal_pushes(self):
+        got = self.with_sink()
+        with open(self.state_path, "w", encoding="utf-8") as f:
+            json.dump({"month": "1999-01", "count": 999}, f)
+        notifier.notify("x")
+        notifier.flush(3)
+        self.assertEqual(len(self.pushes()), 1)
+        self.assertEqual(got, [])
+
+    def test_the_quota_notice_mentions_the_fallback_only_when_it_is_on(self):
+        self.with_sink()
+        self.push_error = urllib.error.HTTPError("u", 429, "Too Many", {}, None)
+        notifier.notify("a")
+        notifier.flush(3)
+        self.assertTrue(any("送進聊天室" in str(c.args[0]) for c in self.printed.call_args_list))
+
     def test_other_http_error_is_swallowed_and_not_counted(self):
         self.push_error = urllib.error.HTTPError("u", 401, "Unauthorized", {}, None)
         notifier.notify("a")

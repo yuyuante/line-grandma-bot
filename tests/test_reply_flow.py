@@ -1281,6 +1281,388 @@ class TestDetectionReopensTheWindow(_Base):
         opener.assert_not_called()
 
 
+class TestNotifyFallback(_Base):
+    """推播額度用完時，改從使用者自己的帳號把通知送進 Notify Bot 聊天室 (視窗要已開著)"""
+    PHRASE = "結束長輩圖機器人"
+
+    def setUp(self):
+        super().setUp()
+        with auto_reply._FALLBACK_LOCK:
+            auto_reply._FALLBACK.update({"chat": "Notify Bot", "pending": [], "last": 0.0, "window_checked": 0.0, "failures": 0})
+        self.addCleanup(auto_reply._FALLBACK.update, {"chat": "", "pending": [], "last": 0.0, "window_checked": 0.0, "failures": 0})
+        self.addCleanup(setattr, auto_reply.notifier, "fallback_sink", None)
+        self.addCleanup(setattr, auto_reply.notifier, "fallback_busy", False)
+
+    def flush(self, window=True, foreground=CHAT, title="Notify Bot", sent=True, iconic=False, send_error=None):
+        busy_during_send = []
+
+        def fake_send(hwnd, text):
+            busy_during_send.append(auto_reply.notifier.fallback_busy)
+            if send_error:
+                raise send_error
+            self.sent_text = text
+            return sent
+
+        self.sent_text = None
+        with mock.patch.object(auto_reply, "find_target_chat_window", return_value=[(CHAT, "Notify Bot", "Qt", True)] if window else []), \
+             mock.patch.object(auto_reply.win32gui, "IsIconic", return_value=iconic), \
+             mock.patch.object(auto_reply.win32gui, "ShowWindow") as show, \
+             mock.patch.object(auto_reply, "activate_window"), \
+             mock.patch.object(auto_reply.win32gui, "GetForegroundWindow", return_value=foreground), \
+             mock.patch.object(auto_reply.win32gui, "GetWindowText", return_value=title), \
+             mock.patch.object(auto_reply, "send_text_via_input", side_effect=fake_send) as send, \
+             mock.patch.object(auto_reply, "_minimize_if_configured") as put_back:
+            auto_reply.flush_fallback_notices({"stop_command": self.PHRASE})
+        return send, put_back, show, busy_during_send
+
+    # --- 暫存 ---
+    def test_notices_are_queued_when_the_fallback_is_on(self):
+        auto_reply.queue_fallback_notice("[10:00:00] a")
+        self.assertEqual(auto_reply._FALLBACK["pending"], ["[10:00:00] a"])
+
+    def test_notices_are_dropped_when_the_fallback_is_off(self):
+        auto_reply._FALLBACK["chat"] = ""
+        auto_reply.queue_fallback_notice("a")
+        self.assertEqual(auto_reply._FALLBACK["pending"], [])
+
+    def test_the_queue_keeps_only_the_newest_notices(self):
+        for n in range(auto_reply.FALLBACK_MAX_PENDING + 5):
+            auto_reply.queue_fallback_notice(f"n{n}")
+        pending = auto_reply._FALLBACK["pending"]
+        self.assertEqual(len(pending), auto_reply.FALLBACK_MAX_PENDING)
+        self.assertEqual(pending[-1], f"n{auto_reply.FALLBACK_MAX_PENDING + 4}")
+        self.assertEqual(pending[0], "n5")
+
+    def test_configure_wires_the_sink_and_an_empty_name_turns_it_off(self):
+        with mock.patch.object(auto_reply.notifier, "configure"):
+            auto_reply.configure_notifier({"notify_fallback_chat": "Notify Bot"})
+            self.assertIs(auto_reply.notifier.fallback_sink, auto_reply.queue_fallback_notice)
+            auto_reply.queue_fallback_notice("x")
+            auto_reply.configure_notifier({"notify_fallback_chat": ""})
+        self.assertIsNone(auto_reply.notifier.fallback_sink)
+        self.assertEqual(auto_reply._FALLBACK["pending"], [])                 # 關掉就清空，不留舊通知
+
+    # --- 合併成一則 ---
+    def test_lines_are_merged_into_one_message_with_newlines_flattened(self):
+        text, used = auto_reply._fallback_message(["[10:00:00] 第一行\n第二行", "[10:01:00] b"], self.PHRASE)
+        self.assertEqual(used, 2)
+        self.assertEqual(text, "📝[備援] [10:00:00] 第一行 ／ 第二行 ｜ [10:01:00] b")
+
+    def test_the_stop_phrase_is_always_replaced_so_the_bot_cannot_stop_itself(self):
+        line = "[10:00:00] 🟢 已啟動\n停止指令：在 Notify Bot 自己發「結束長輩圖機器人」"
+        text, _ = auto_reply._fallback_message([line], self.PHRASE)
+        self.assertNotIn(self.PHRASE, text)
+        self.assertFalse(auto_reply.text_matches_stop_command(text, self.PHRASE))
+
+    # 停止指令的三層防護各自單獨測 (互相掩護時，拿掉任何一層結果都一樣，測試就看不出來)
+    def test_layer_one_the_literal_phrase_is_replaced_even_if_the_matcher_says_no(self):
+        with mock.patch.object(auto_reply, "text_matches_stop_command", return_value=False):
+            text, _ = auto_reply._fallback_message(["[10:00:00] 自己發「結束長輩圖機器人」"], self.PHRASE)
+        self.assertNotIn(self.PHRASE, text)
+        self.assertIn("（停止指令）", text)
+
+    def test_layer_two_a_line_the_matcher_still_flags_is_replaced_by_itself(self):
+        def flags(text, phrase):
+            return "可疑" in text and "省略" not in text
+        with mock.patch.object(auto_reply, "text_matches_stop_command", side_effect=flags):
+            text, used = auto_reply._fallback_message(["[10:00:00] 可疑內容", "[10:00:01] 正常"], self.PHRASE)
+        self.assertNotIn("可疑", text)
+        self.assertIn("正常", text)                                              # 只換掉有問題的那一則
+        self.assertEqual(used, 2)
+
+    def test_layer_three_a_merged_text_the_matcher_flags_is_replaced_as_a_whole(self):
+        def flags(text, phrase):
+            return text.startswith("📝[備援]") and "｜" in text                    # 只有合併後的整段才被抓到
+        with mock.patch.object(auto_reply, "text_matches_stop_command", side_effect=flags):
+            text, used = auto_reply._fallback_message(["[10:00:00] a", "[10:00:01] b"], self.PHRASE)
+        self.assertNotIn("[10:00:00] a", text)
+        self.assertIn("省略", text)
+        self.assertEqual(used, 2)
+
+    def test_the_main_loop_calls_the_flush_before_each_detection_pass(self):
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "auto_reply.py")
+        with open(path, encoding="utf-8") as f:
+            source = f.read()
+        loop = source[source.index("def main("):]
+        self.assertIn("flush_fallback_notices(config)", loop)
+        self.assertLess(loop.index("flush_fallback_notices(config)"), loop.index("check_for_incoming_messages(config)"))
+
+    def test_a_group_chat_as_the_fallback_target_turns_the_fallback_off(self):
+        auto_reply.set_group_targets(["Notify Bot"])
+        self.addCleanup(auto_reply.set_group_targets, [])
+        auto_reply._WARNED_ONCE.discard("fallback_group")
+        self.addCleanup(auto_reply._WARNED_ONCE.discard, "fallback_group")
+        with mock.patch.object(auto_reply.notifier, "configure"), mock.patch.object(auto_reply.logging, "warning") as warn:
+            auto_reply.configure_notifier({"notify_fallback_chat": "Notify Bot"})
+            auto_reply.configure_notifier({"notify_fallback_chat": "Notify Bot"})
+        self.assertIsNone(auto_reply.notifier.fallback_sink)
+        self.assertEqual(auto_reply._FALLBACK["chat"], "")
+        warn.assert_called_once()                                                # 警告只印一次
+
+    def test_notices_trimmed_away_during_a_send_do_not_remove_unsent_ones(self):
+        for n in range(auto_reply.FALLBACK_MAX_PENDING):
+            auto_reply.queue_fallback_notice(f"[10:00:00] n{n}")
+
+        sent_texts = []
+
+        def send_and_meanwhile_add_more(hwnd, text):
+            sent_texts.append(text)
+            for k in range(3):
+                auto_reply.queue_fallback_notice(f"[10:01:00] new{k}")       # 背景執行緒在送出期間新增，從前面裁掉最舊的
+            return True
+
+        with mock.patch.object(auto_reply, "find_target_chat_window", return_value=[(CHAT, "Notify Bot", "Qt", True)]), \
+             mock.patch.object(auto_reply.win32gui, "IsIconic", return_value=False), \
+             mock.patch.object(auto_reply, "activate_window"), \
+             mock.patch.object(auto_reply.win32gui, "GetForegroundWindow", return_value=CHAT), \
+             mock.patch.object(auto_reply.win32gui, "GetWindowText", return_value="Notify Bot"), \
+             mock.patch.object(auto_reply, "send_text_via_input", side_effect=send_and_meanwhile_add_more), \
+             mock.patch.object(auto_reply, "_minimize_if_configured"):
+            auto_reply.flush_fallback_notices({"stop_command": self.PHRASE})
+        left = auto_reply._FALLBACK["pending"]
+        self.assertEqual([x for x in left if x.startswith("[10:01:00]")], [f"[10:01:00] new{k}" for k in range(3)])   # 新增的沒被誤刪
+        old_left = [x for x in left if x.startswith("[10:00:00]")]
+        sent_count = sent_texts[0].count(" ｜ ") + 1                             # 從實際送出的訊息算出送了幾則 (不能用剩下幾則反推)
+        self.assertGreater(sent_count, 3)
+        # 送出的是 n0..n(sent_count-1)，所以沒送的 n(sent_count)..n199 一則都不能少 (位置刪除會多刪掉被前面裁掉的那幾則)
+        self.assertEqual(old_left, [f"[10:00:00] n{k}" for k in range(sent_count, auto_reply.FALLBACK_MAX_PENDING)])
+
+    def test_a_notice_that_still_looks_like_the_stop_command_is_replaced_entirely(self):
+        with mock.patch.object(auto_reply, "text_matches_stop_command", return_value=True):
+            text, used = auto_reply._fallback_message(["[10:00:00] 隨便"], self.PHRASE)
+        self.assertNotIn("隨便", text)
+        self.assertEqual(used, 1)
+
+    def test_a_long_backlog_is_split_across_messages(self):
+        lines = [f"[10:00:{n % 60:02d}] " + "字" * 100 for n in range(30)]
+        text, used = auto_reply._fallback_message(lines, self.PHRASE)
+        self.assertLessEqual(len(text), auto_reply.FALLBACK_MAX_CHARS + 20)
+        self.assertTrue(0 < used < 30)
+
+    def test_one_oversized_line_is_still_sent_truncated(self):
+        text, used = auto_reply._fallback_message(["字" * 5000], self.PHRASE)
+        self.assertEqual(used, 1)
+        self.assertLessEqual(len(text), auto_reply.FALLBACK_MAX_CHARS + 20)
+
+    # --- 送進聊天室 ---
+    def test_nothing_pending_means_nothing_is_sent(self):
+        send, put_back, _, _ = self.flush()
+        send.assert_not_called()
+        put_back.assert_not_called()
+
+    def test_pending_notices_are_sent_and_then_cleared(self):
+        auto_reply.queue_fallback_notice("[10:00:00] a")
+        auto_reply.queue_fallback_notice("[10:00:01] b")
+        send, put_back, _, busy = self.flush()
+        send.assert_called_once()
+        self.assertIn("[10:00:00] a", self.sent_text)
+        self.assertEqual(auto_reply._FALLBACK["pending"], [])
+        put_back.assert_called_once()
+        self.assertEqual(busy, [True])                                         # 送出期間產生的通知不再排進備援
+        self.assertFalse(auto_reply.notifier.fallback_busy)
+
+    def test_a_failed_send_keeps_the_notices_and_waits_for_the_next_interval(self):
+        auto_reply.queue_fallback_notice("[10:00:00] a")
+        self.flush(sent=False)
+        self.assertEqual(auto_reply._FALLBACK["pending"], ["[10:00:00] a"])
+        send, _, _, _ = self.flush(sent=True)
+        send.assert_not_called()                                               # 間隔內不重試
+        self.clock[0] += auto_reply.FALLBACK_MIN_INTERVAL
+        send, _, _, _ = self.flush(sent=True)
+        send.assert_not_called()                                               # 失敗之後間隔拉長：一般間隔過了也還不重試
+        self.clock[0] += auto_reply.FALLBACK_FAILURE_INTERVAL - auto_reply.FALLBACK_MIN_INTERVAL
+        send, _, _, _ = self.flush(sent=True)
+        send.assert_called_once()
+        self.assertEqual(auto_reply._FALLBACK["pending"], [])
+        self.assertEqual(auto_reply._FALLBACK["failures"], 0)                  # 成功就歸零
+
+    def test_only_the_notices_that_were_sent_are_removed(self):
+        for n in range(30):
+            auto_reply.queue_fallback_notice(f"[10:00:{n:02d}] " + "字" * 100)
+        self.flush()
+        left = len(auto_reply._FALLBACK["pending"])
+        self.assertTrue(0 < left < 30)
+
+    def test_a_closed_chat_window_sends_nothing_and_does_not_start_the_interval(self):
+        auto_reply.queue_fallback_notice("a")
+        send, put_back, _, _ = self.flush(window=False)
+        send.assert_not_called()
+        put_back.assert_not_called()
+        self.assertEqual(auto_reply._FALLBACK["last"], 0.0)                    # 之後視窗一開就能馬上送
+        self.assertEqual(auto_reply._FALLBACK["pending"], ["a"])
+
+    def test_it_never_sends_when_another_window_is_in_front(self):
+        auto_reply.queue_fallback_notice("a")
+        send, put_back, _, _ = self.flush(foreground=CHAT + 1)
+        send.assert_not_called()
+        put_back.assert_called_once()                                          # 但視窗照常放回去
+        self.assertEqual(auto_reply._FALLBACK["pending"], ["a"])
+
+    def test_it_never_sends_when_the_window_title_is_not_the_chat(self):
+        auto_reply.queue_fallback_notice("a")
+        send, _, _, _ = self.flush(title="某個好友")
+        send.assert_not_called()
+
+    def test_a_minimised_window_is_restored_first(self):
+        auto_reply.queue_fallback_notice("a")
+        _, _, show, _ = self.flush(iconic=True)
+        show.assert_called_once_with(CHAT, auto_reply.win32con.SW_RESTORE)
+
+    def test_an_exception_while_sending_still_puts_the_window_back_and_clears_busy(self):
+        auto_reply.queue_fallback_notice("a")
+        _, put_back, _, _ = self.flush(send_error=RuntimeError("boom"))
+        put_back.assert_called_once()
+        self.assertFalse(auto_reply.notifier.fallback_busy)
+        self.assertEqual(auto_reply._FALLBACK["pending"], ["a"])
+
+    # --- 第二輪審查的修正 ---
+    def test_a_closed_window_is_only_looked_for_every_30_seconds(self):
+        auto_reply.queue_fallback_notice("a")
+        with mock.patch.object(auto_reply, "find_target_chat_window", return_value=[]) as find:
+            auto_reply.flush_fallback_notices({})
+            auto_reply.flush_fallback_notices({})                              # 找視窗要掃行程與視窗列表，不必每輪都做
+            self.assertEqual(find.call_count, 1)
+            self.clock[0] += auto_reply.FALLBACK_WINDOW_RECHECK
+            auto_reply.flush_fallback_notices({})
+            self.assertEqual(find.call_count, 2)
+
+    def test_finding_the_window_resets_the_recheck_timer(self):
+        auto_reply.queue_fallback_notice("a")
+        with mock.patch.object(auto_reply, "find_target_chat_window", return_value=[]):
+            auto_reply.flush_fallback_notices({})
+        self.assertGreater(auto_reply._FALLBACK["window_checked"], 0)
+        self.clock[0] += auto_reply.FALLBACK_WINDOW_RECHECK
+        self.flush()
+        self.assertEqual(auto_reply._FALLBACK["window_checked"], 0.0)
+
+    def test_after_a_failure_the_retry_is_slower_and_the_text_loses_its_emoji(self):
+        auto_reply.queue_fallback_notice("[10:00:00] ⚠️ 警告 📨 內容")
+        self.flush(sent=False)
+        self.assertIn("📝", self.sent_text)                                    # 第一次照原樣送
+        self.assertEqual(auto_reply._FALLBACK["failures"], 1)
+        self.clock[0] += auto_reply.FALLBACK_FAILURE_INTERVAL
+        self.flush(sent=False)
+        self.assertEqual(auto_reply._FALLBACK["failures"], 2)
+        for emoji in ("📝", "⚠", "📨", "️"):
+            self.assertNotIn(emoji, self.sent_text)                            # 讀回比對失敗時改送沒有表情符號的版本
+        self.assertIn("警告", self.sent_text)
+        self.assertLess(auto_reply._FALLBACK["last"], self.clock[0] + auto_reply.FALLBACK_FAILURE_INTERVAL)
+
+    def test_a_successful_send_goes_back_to_the_normal_text(self):
+        auto_reply.queue_fallback_notice("[10:00:00] 📨 a")
+        self.flush(sent=False)
+        self.clock[0] += auto_reply.FALLBACK_FAILURE_INTERVAL
+        self.flush(sent=True)
+        self.assertEqual(auto_reply._FALLBACK["failures"], 0)
+        auto_reply.queue_fallback_notice("[10:05:00] 📨 b")
+        self.clock[0] += auto_reply.FALLBACK_MIN_INTERVAL
+        self.flush(sent=True)
+        self.assertIn("📝", self.sent_text)
+
+    def test_emoji_between_the_characters_of_the_stop_phrase_cannot_rebuild_it(self):
+        sneaky = "停止😀指令" if False else "結束😀長輩圖機器人"
+        text, _ = auto_reply._fallback_message([f"[10:00:00] {sneaky}"], self.PHRASE, plain=True)
+        self.assertFalse(auto_reply.text_matches_stop_command(text, self.PHRASE))
+        self.assertNotIn(self.PHRASE, text)
+
+    def test_a_short_stop_phrase_that_overlaps_the_placeholder_wording_never_survives(self):
+        # 停止指令剛好是「停止指令」(4 字，合法)：括號裡的「停止指令」與「省略」說明文字本身都會中
+        for phrase in ("停止指令", "備援", "字樣"):
+            text, used = auto_reply._fallback_message(["[10:00:00] 內容含停止指令與備援字樣", "[10:01:00] 另一則"], phrase)
+            self.assertFalse(auto_reply.text_matches_stop_command(text, phrase), (phrase, text))
+            self.assertTrue(text.strip())
+            self.assertEqual(used, 2)
+
+    def test_the_replacement_text_itself_is_checked_against_the_phrase(self):
+        # 停止指令剛好是「停止指令」：括號裡的「停止指令」會中，要改用不含它的替代文字，而且其餘內容保留 (不是整則被省略)
+        text, _ = auto_reply._fallback_message(["[10:00:00] 內容含停止指令字樣"], "停止指令")
+        self.assertIn("內容含（已省略）字樣", text)
+
+    def test_the_omitted_wording_itself_is_checked_against_the_phrase(self):
+        def flags(text, phrase):
+            if text.startswith("📝[備援]"):
+                return False                                                   # 讓最後的整段檢查「失明」，單獨驗證省略說明文字這一層
+            return phrase in text or "可疑" in text
+        with mock.patch.object(auto_reply, "text_matches_stop_command", side_effect=flags):
+            text, _ = auto_reply._fallback_message(["[10:00:00] 可疑內容"], "省略")      # 「省略」同時出現在預設的省略說明裡
+        self.assertNotIn("省略", text)
+        self.assertNotIn("可疑", text)
+
+    def test_the_shared_state_is_read_while_holding_the_lock(self):
+        auto_reply.queue_fallback_notice("a")
+        events = []
+
+        class Spy:
+            def __enter__(self_inner):
+                events.append("lock")
+
+            def __exit__(self_inner, *exc):
+                return False
+
+        with mock.patch.object(auto_reply, "_FALLBACK_LOCK", Spy()), \
+             mock.patch.object(auto_reply, "find_target_chat_window", side_effect=lambda c: events.append("find") or []):
+            auto_reply.flush_fallback_notices({})
+        self.assertEqual(events[:2], ["lock", "find"])                         # 先在鎖裡讀 chat 與待送清單，才去找視窗
+
+    def test_the_exit_flush_ignores_the_intervals_but_not_the_window_checks(self):
+        auto_reply.queue_fallback_notice("[10:00:00] 🔴 長輩圖機器人已停止")
+        auto_reply._FALLBACK["last"] = self.clock[0]                           # 剛送過：一般情況要等 5 分鐘
+        auto_reply._FALLBACK["window_checked"] = self.clock[0]
+        with mock.patch.object(auto_reply, "find_target_chat_window", return_value=[(CHAT, "Notify Bot", "Qt", True)]), \
+             mock.patch.object(auto_reply.win32gui, "IsIconic", return_value=False), \
+             mock.patch.object(auto_reply, "activate_window"), \
+             mock.patch.object(auto_reply.win32gui, "GetForegroundWindow", return_value=CHAT), \
+             mock.patch.object(auto_reply.win32gui, "GetWindowText", return_value="Notify Bot"), \
+             mock.patch.object(auto_reply, "send_text_via_input", return_value=True) as send, \
+             mock.patch.object(auto_reply, "_minimize_if_configured"):
+            auto_reply.flush_fallback_notices_at_exit({})
+        send.assert_called_once()
+        self.assertEqual(auto_reply._FALLBACK["pending"], [])
+
+    def test_the_exit_flush_never_raises(self):
+        auto_reply.queue_fallback_notice("a")
+        with mock.patch.object(auto_reply, "find_target_chat_window", side_effect=RuntimeError("boom")):
+            auto_reply.flush_fallback_notices_at_exit({})
+
+    def test_both_exit_paths_flush_the_fallback(self):
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "auto_reply.py")
+        with open(path, encoding="utf-8") as f:
+            source = f.read()
+        tail = source[source.index("except KeyboardInterrupt:"):]
+        self.assertGreaterEqual(tail.count("flush_fallback_notices_at_exit(config)"), 2)       # Ctrl+C 與遠端停止
+
+    def test_nothing_is_sent_when_the_pending_list_empties_before_the_copy(self):
+        # 檢查與複製要在同一個鎖裡：清空後不能送出只有標頭的空訊息
+        text, used = auto_reply._fallback_message([], self.PHRASE)
+        self.assertEqual(used, 0)
+        auto_reply._FALLBACK["pending"].clear()
+        send, _, _, _ = self.flush()
+        send.assert_not_called()
+
+    def test_the_exception_line_never_carries_an_alert_tag(self):
+        # 帶警告標籤的行會再被推播/備援，非同步送出時 fallback_busy 可能已清掉，會變成自己送自己
+        auto_reply.queue_fallback_notice("a")
+        self.flush(send_error=RuntimeError("boom"))
+        lines = [str(c.args[0]).strip() for c in self.log.call_args_list if c.args]
+        crash_lines = [x for x in lines if "boom" in x]
+        self.assertTrue(crash_lines)
+        self.assertFalse(any(x.startswith(auto_reply.notifier.ALERT_TAGS) for x in crash_lines))
+
+    def test_a_group_chat_is_never_used_as_the_fallback(self):
+        auto_reply.queue_fallback_notice("a")
+        auto_reply.set_group_targets(["Notify Bot"])
+        self.addCleanup(auto_reply.set_group_targets, [])
+        send, _, _, _ = self.flush()
+        send.assert_not_called()
+
+    def test_the_setting_is_validated_and_in_the_example_config(self):
+        import json
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "config.example.json"), encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["notify_fallback_chat"], "Notify Bot")
+        self.assertEqual(auto_reply.DEFAULT_CONFIG["notify_fallback_chat"], "Notify Bot")
+
+
 class TestChannelLabel(_Base):
     """紀錄裡的快取頻道代號 (LINE 自己產生的雜湊) 光看分不出是誰，每一行都要一起帶出聊天室名稱"""
     BOUND = "b1acf4e0" + "0" * 32
