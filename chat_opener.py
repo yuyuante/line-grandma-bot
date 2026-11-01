@@ -14,6 +14,7 @@
 import re
 import time
 
+import image_kind
 import ocr_engine
 
 SEARCH_RESULT_WAIT = 1.5        # 寫入搜尋文字後等結果出現的秒數
@@ -22,7 +23,8 @@ ALL_TAB_INDEX = 0              # 「全部」永遠是第一個分頁；官方�
 
 
 def _norm(text):
-    return re.sub(r"\s+", "", text or "").casefold()
+    """忽略空白與大小寫；OCR 常把繁體字讀成簡體 (理財 -> 理财)，所以兩邊都先轉成繁體再比"""
+    return re.sub(r"\s+", "", image_kind.normalize_text(text or "")).casefold()
 
 
 def find_result_rows(boxes, name, min_y):
@@ -31,7 +33,11 @@ def find_result_rows(boxes, name, min_y):
     min_y 以上 (搜尋欄所在的區域，要用搜尋欄的「底部」) 的文字一律忽略，避免把搜尋欄裡剛貼上的那串字當成結果。
     """
     wanted = _norm(name)
-    rows = [(x, y) for text, (x, y) in boxes if _norm(text) == wanted and y > min_y]
+    if not wanted:
+        return []
+    # 群組的搜尋結果會在名稱後面接成員數，例如「理財幼幼班_Z (142)」，視窗標題則只有名稱；其餘一律要完全相等
+    pattern = re.compile(re.escape(wanted) + r"(?:[(（]\d+[)）])?")
+    rows = [(x, y) for text, (x, y) in boxes if pattern.fullmatch(_norm(text)) and y > min_y]
     return sorted(rows, key=lambda p: p[1])
 
 

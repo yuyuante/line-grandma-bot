@@ -98,9 +98,21 @@ class TestFindResultRows(unittest.TestCase):
         boxes = [("Notify Bot", (500, 150)),                    # 搜尋欄裡剛貼上的字：在 min_y 以上，不算
                  ("Notify Bot", (267, 225)), ("notify  bot", (267, 396)),
                  ("Notify Bot 通知群", (267, 300)),               # 包含但不是完全相同：不算
-                 ("Notify Bot(3)", (267, 340)),                   # 群組帶人數：不算
+                 ("Notify Bot2", (267, 340)),                     # 名稱多一截：不算
                  ("Notify", (267, 360))]
         self.assertEqual(chat_opener.find_result_rows(boxes, "Notify Bot", min_y=200), [(267, 225), (267, 396)])
+
+    def test_group_rows_may_carry_the_member_count_but_nothing_else(self):
+        # 真機：群組的搜尋結果是「理財幼幼班_Z (142)」，視窗標題只有名稱
+        boxes = [("理財幼幼班_Z (142)", (300, 250)), ("理財幼幼班_Z（9）", (300, 300)), ("理財幼幼班_Z(7)", (300, 350)),
+                 ("理財幼幼班_Z (x)", (300, 400)), ("理財幼幼班_Z (142) 群", (300, 450)), ("理財幼幼班_Z ()", (300, 500)),
+                 ("舊理財幼幼班_Z (142)", (300, 550))]
+        self.assertEqual(chat_opener.find_result_rows(boxes, "理財幼幼班_Z", min_y=200), [(300, 250), (300, 300), (300, 350)])
+
+    def test_ocr_reading_traditional_as_simplified_still_matches(self):
+        # 真機：OCR 把「理財幼幼班_Z (142)」讀成「理财幼幼班_Z (142)」
+        boxes = [("理财幼幼班_Z (142)", (300, 250)), ("理财幼幼班_Z", (300, 120))]
+        self.assertEqual(chat_opener.find_result_rows(boxes, "理財幼幼班_Z", min_y=200), [(300, 250)])
 
     def test_sorted_top_down_and_empty(self):
         boxes = [("Mom", (1, 400)), ("Mom", (1, 250))]
