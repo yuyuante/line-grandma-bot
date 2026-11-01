@@ -372,7 +372,7 @@ class TestSendFlow(_Base):
         self.slot = "morning"
 
     def run_flow(self, *, recognize=((True, MID_AUTUMN, "中秋節快樂"),), choose=None, attach=True, config=None,
-                 triggered=True, slots=None, find_results=None, opener=False):
+                 triggered=True, slots=None, find_results=None, opener=False, title="小明"):
         mocks = {}
         minimized = []
         patches = {
@@ -390,7 +390,7 @@ class TestSendFlow(_Base):
             "countdown": mock.patch.object(auto_reply, "countdown_sleep"),
             "iconic": mock.patch.object(auto_reply.win32gui, "IsIconic", return_value=False),
             "fg": mock.patch.object(auto_reply.win32gui, "GetForegroundWindow", return_value=CHAT),
-            "title": mock.patch.object(auto_reply.win32gui, "GetWindowText", return_value="小明"),
+            "title": mock.patch.object(auto_reply.win32gui, "GetWindowText", return_value=title),
             "activate": mock.patch.object(auto_reply, "activate_window"),
             "focus": mock.patch.object(auto_reply, "focus_chat_input", return_value=True),
             "self": mock.patch.object(auto_reply, "is_last_message_from_self_in_chat", return_value=False),
@@ -442,6 +442,41 @@ class TestSendFlow(_Base):
         self.assertEqual(self.run_flow(config={"max_replies_per_day": 1})[0], "SKIPPED_DAILY_LIMIT")
         for _ in range(5):
             self.assertEqual(self.run_flow(config={"max_replies_per_day": 0})[0], "SENT_CONFIRMED")
+
+    def test_a_group_uses_its_own_daily_limit_which_defaults_to_one(self):
+        auto_reply.set_group_targets(["小明"])
+        self.addCleanup(auto_reply.set_group_targets, [])
+        self.assertEqual(self.run_flow(config={"max_replies_per_day": 3})[0], "SENT_CONFIRMED")
+        result, m, _ = self.run_flow(config={"max_replies_per_day": 3})                       # 1:1 的上限 3 對群組不適用
+        self.assertEqual(result, "SKIPPED_DAILY_LIMIT")
+        m["recognize"].assert_not_called()
+        self.assertEqual(self.run_flow(config={"group_max_replies_per_day": 2})[0], "SENT_CONFIRMED")
+        self.assertEqual(self.run_flow(config={"group_max_replies_per_day": 0})[0], "SENT_CONFIRMED")   # 0 = 不限
+
+    def test_one_to_one_chat_keeps_its_own_limit_even_when_a_group_exists(self):
+        auto_reply.set_group_targets(["別的群組"])
+        self.addCleanup(auto_reply.set_group_targets, [])
+        for _ in range(3):
+            self.assertEqual(self.run_flow()[0], "SENT_CONFIRMED")
+        self.assertEqual(self.run_flow()[0], "SKIPPED_DAILY_LIMIT")
+
+    def test_group_window_title_with_member_count_may_send_but_a_one_to_one_one_may_not(self):
+        result, m, _ = self.run_flow(title="小明 (477)")                                       # 1:1 前景標題帶括號 = 群組冒充，擋下
+        self.assertEqual(result, "NOT_SENT")
+        m["attach"].assert_not_called()
+        auto_reply.set_group_targets(["小明"])
+        self.addCleanup(auto_reply.set_group_targets, [])
+        result, m, _ = self.run_flow(title="小明 (477)")
+        self.assertEqual(result, "SENT_CONFIRMED")
+        m["attach"].assert_called_once()
+
+    def test_group_send_is_refused_when_the_foreground_title_is_another_chat(self):
+        auto_reply.set_group_targets(["小明"])
+        self.addCleanup(auto_reply.set_group_targets, [])
+        for title in ("別的群組 (12)", "小明2 (477)", "小明 (x)"):
+            result, m, _ = self.run_flow(title=title)
+            self.assertEqual(result, "NOT_SENT", title)
+            m["attach"].assert_not_called()
 
     def test_skipped_and_failed_replies_do_not_count(self):
         result, m, _ = self.run_flow(recognize=[(False, None, "")])                           # 不是長輩圖 / 辨識不出來
@@ -589,7 +624,7 @@ class TestStartup(_Base):
 class TestDetectionReopensTheWindow(_Base):
     """偵測階段：頻道已綁定、但好友的獨立視窗不見了，不再直接丟掉事件，先試著把視窗開回來"""
 
-    def run_detection(self, window_open, opener_result, config_extra=None):
+    def run_detection(self, window_open, opener_result, config_extra=None, group=False, photo=True, last_reply_ago=None, windows=()):
         cache = os.path.join(self.tmp.name, "cache")
         fake_hash = "888803ef1234567890abcdef1234567890abcdef"
         chat_m = os.path.join(cache, fake_hash, "m")
@@ -615,14 +650,22 @@ class TestDetectionReopensTheWindow(_Base):
             with mock.patch.object(auto_reply, "get_active_line_cache_dir", return_value=cache), \
                  mock.patch.object(auto_reply, "find_target_chat_window", side_effect=lambda t: window if state["open"] else []), \
                  mock.patch.object(auto_reply, "is_valid_image_or_eimg", return_value=True), \
+                 mock.patch.object(auto_reply, "is_likely_photo", return_value=photo), \
+                 mock.patch.object(auto_reply, "get_all_line_windows", return_value=list(windows)), \
                  mock.patch.object(auto_reply, "open_missing_chat_window", side_effect=open_it) as opener, \
                  mock.patch.object(auto_reply, "send_grandma_image", side_effect=lambda t, c, **kw: sent.append(t) or "SENT_CONFIRMED"), \
                  mock.patch.object(auto_reply, "check_circuit_breaker", return_value=True):
                 auto_reply.last_global_reply_time = 0.0
                 auto_reply.last_reply_times.pop("小明", None)
+                if last_reply_ago is not None:
+                    auto_reply.last_reply_times["小明"] = now - last_reply_ago
                 auto_reply.PROCESSED_CACHE_FILES.clear()
                 auto_reply.last_seen_cache_mtime = now - 1.0
-                auto_reply.check_for_incoming_messages(cfg)
+                auto_reply.set_group_targets(["小明"] if group else [])
+                try:
+                    auto_reply.check_for_incoming_messages(cfg)
+                finally:
+                    auto_reply.set_group_targets([])
         return sent, opener
 
     def test_missing_window_is_reopened_and_the_reply_goes_ahead(self):
@@ -635,6 +678,38 @@ class TestDetectionReopensTheWindow(_Base):
         self.assertEqual(sent, [])                                                          # 維持原本的安全略過
         self.assertIn("桌面無該好友專屬視窗", NL.join(str(c.args[0]) for c in self.log.call_args_list))
         opener.assert_called_once()
+
+    def test_group_replies_to_a_photo_but_not_to_a_sticker(self):
+        sent, _ = self.run_detection(window_open=True, opener_result=True, group=True, photo=True)
+        self.assertEqual(sent, ["小明"])
+        sent, _ = self.run_detection(window_open=True, opener_result=True, group=True, photo=False)
+        self.assertEqual(sent, [])                                                          # 群組只回照片
+        self.assertIn("群組只回照片", NL.join(str(c.args[0]) for c in self.log.call_args_list))
+        sent, _ = self.run_detection(window_open=True, opener_result=True, group=False, photo=False)
+        self.assertEqual(sent, ["小明"])                                                    # 1:1 照舊：貼圖也回
+
+    def test_group_cooldown_is_much_longer_than_the_normal_one(self):
+        sent, _ = self.run_detection(window_open=True, opener_result=True, group=True, last_reply_ago=120)
+        self.assertEqual(sent, [])                                                          # 2 分鐘前才回過：群組還在冷卻
+        sent, _ = self.run_detection(window_open=True, opener_result=True, group=True, last_reply_ago=601)
+        self.assertEqual(sent, ["小明"])
+        sent, _ = self.run_detection(window_open=True, opener_result=True, group=False, last_reply_ago=120)
+        self.assertEqual(sent, ["小明"])                                                    # 1:1 用 cooldown_seconds，不受群組冷卻影響
+        sent, _ = self.run_detection(window_open=True, opener_result=True, group=True, last_reply_ago=120,
+                                     config_extra={"group_cooldown_seconds": 60})
+        self.assertEqual(sent, ["小明"])
+
+    def test_group_member_count_in_the_title_never_triggers_the_unread_path(self):
+        titled = [(CHAT, "小明 (477)", "Qt", True)]
+        auto_reply.LAST_PROCESSED_UNREAD["小明"] = 476                                       # 成員數 477 看起來像「未讀數增加」
+        self.addCleanup(auto_reply.LAST_PROCESSED_UNREAD.pop, "小明", None)
+        self.run_detection(window_open=True, opener_result=True, group=False, windows=titled)
+        self.assertIn("未讀數增加", NL.join(str(c.args[0]) for c in self.log.call_args_list))      # 1:1：照舊用未讀數觸發
+        self.log.reset_mock()
+        auto_reply.LAST_PROCESSED_UNREAD["小明"] = 476
+        sent, _ = self.run_detection(window_open=True, opener_result=True, group=True, windows=titled)
+        self.assertEqual(sent, ["小明"])                                                    # 照樣由快取新圖偵測觸發
+        self.assertNotIn("未讀數增加", NL.join(str(c.args[0]) for c in self.log.call_args_list))   # 但不是靠成員數
 
     def test_present_window_does_not_trigger_the_opener(self):
         sent, opener = self.run_detection(window_open=True, opener_result=True)

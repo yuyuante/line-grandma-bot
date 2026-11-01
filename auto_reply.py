@@ -47,7 +47,7 @@ from crawl_images import (crawl_grandma_images, clean_expired_images, retire_ima
                           download_and_validate_image, get_existing_md5s, build_candidate_urls,
                           build_candidates, normalize_sources)
 
-VERSION = "2.8.2"
+VERSION = "2.9.0"
 
 # 0. 全系統單一執行個體鎖 (Windows Named Mutex)，防止重複啟動繞過斷路器
 _app_mutex_handle = None
@@ -195,6 +195,9 @@ DEFAULT_CONFIG = {
     "image_sources": [],                # 圖庫來源 (網址範本、編號範圍、選填時段類別，見 crawl_images.py)；空白 = 預設的 Formosa 貼圖酷每日問候攝影與插畫
     "require_grandma_image": True,      # 對方傳來的圖要先辨識為長輩圖才回覆；貼圖、生活照、無法辨識的一律不理會
     "auto_neutral_images": False,       # 【開發中，預設關閉】沒有符合目前時段的圖時，用 OCR 讀得到字、但沒有問候語與節慶字樣的圖代替。實測 OCR 常讀不出藝術字的問候語，開啟會把早安圖誤判成無時段
+    "group_targets": [],                # 要回覆的群組名單 (名稱同 targets 的寫法，不含人數)；群組另有更保守的規則，只能手動綁定快取頻道 (--bind-view)
+    "group_max_replies_per_day": 1,     # 每個群組每天最多回覆幾次 (0 = 不限次數)
+    "group_cooldown_seconds": 600,      # 同一個群組兩次回覆之間至少間隔幾秒 (多人連續傳圖時只回一次)
     "auto_open_chat_window": True,      # 好友的獨立聊天視窗不見時，自動從 LINE 主視窗的搜尋欄開回來 (關閉則找不到視窗就略過該則訊息)
     "notify_log": False,                # 把啟動、回覆、停止與警告/錯誤推播到 LINE 官方帳號 (需 ~/.line-notify.env，見 notifier.py)
     "notify_monthly_cap": 150           # 每月最多推播則數 (官方帳號免費方案上限 200，留一些給手動測試)
@@ -229,6 +232,20 @@ def load_config():
                 sanitized["targets"] = []
         else:
             sanitized["targets"] = []
+
+        groups = []
+        if isinstance(cfg.get("group_targets"), list):
+            groups = [str(t).strip() for t in cfg["group_targets"] if str(t).strip()]
+        sanitized["group_targets"] = groups
+        for k, minimum in (("group_max_replies_per_day", 0), ("group_cooldown_seconds", 5)):
+            if k in cfg:
+                try:
+                    sanitized[k] = max(minimum, int(cfg[k]))
+                except Exception:
+                    pass
+        known = {t.lower() for t in sanitized["targets"]}
+        sanitized["targets"] = sanitized["targets"] + [g for g in groups if g.lower() not in known]    # 群組也是監控對象，其餘流程共用
+        set_group_targets(groups)
 
         if cfg.get("trigger_mode") in ("photo_and_sticker", "photo_only", "all"):
             sanitized["trigger_mode"] = cfg["trigger_mode"]
@@ -1258,11 +1275,51 @@ def verify_is_not_group_window_uia(hwnd):
 
 GROUP_NAME_PATTERNS = r"(?i)\b(group|family|team|project|club)\b|群組|聊天室|成員|專案|公務|同學|家族"
 
+GROUP_TARGETS = set()                      # config.json 的 group_targets (小寫)；只有這些名稱走群組規則，其餘一律維持 1:1 的嚴格規則
+_GROUP_COUNT_SUFFIX = r"(?:\s*[\(\uFF08]\d+[\)\uFF09])?"      # 群組視窗標題後面的成員數，例如「名稱 (477)」
+
+
+def set_group_targets(names):
+    global GROUP_TARGETS
+    GROUP_TARGETS = {str(n).strip().lower() for n in names if str(n).strip()}
+
+
+def is_group_target(name):
+    return bool(name) and name.strip().lower() in GROUP_TARGETS
+
+
+def title_matches_target(title, name):
+    """視窗標題是否就是這個對象：1:1 要完全相符；群組允許名稱後面接成員數 (人數不是未讀數，不可拿來當觸發依據)"""
+    t = (title or "").strip()
+    if is_group_target(name):
+        return re.fullmatch(re.escape(name.strip()) + _GROUP_COUNT_SUFFIX, t, flags=re.IGNORECASE) is not None
+    return t.lower() == (name or "").strip().lower()
+
+
+def find_group_chat_window(target_name):
+    """尋找群組的獨立聊天視窗：標題必須是「名稱」或「名稱 (成員數)」，且桌面上只能有一個；絕不匹配 LINE 主視窗"""
+    main_hwnd = find_line_main_window()
+    found = []
+    for hwnd, title, cls, vis in get_all_line_windows():
+        if not vis or (cls != "ChatWnd" and "QWindowIcon" not in cls):
+            continue
+        if hwnd == main_hwnd or title.strip() == 'LINE':
+            continue
+        if title_matches_target(title, target_name):
+            found.append((hwnd, title, cls, vis))
+    if len(found) > 1:
+        log_v(f"[致命安全攔截] 偵測到桌面上存在 {len(found)} 個符合群組「{target_name}」的視窗 (重名或重複開啟衝突)，為防誤傳，嚴格拒絕發送！")
+        return []
+    return found
+
+
 def find_target_chat_window(target_name):
-    """尋找標題精確相符或帶括號未讀數的獨立 1:1 聊天視窗 (絕不匹配 LINE 主視窗或群組視窗)"""
+    """尋找標題精確相符或帶括號未讀數的獨立 1:1 聊天視窗 (絕不匹配 LINE 主視窗或群組視窗)；名稱列在 group_targets 時改找群組視窗"""
     if target_name.strip().lower() in ("line", "line main window", "line主視窗"):
         log_v("[安全拒絕] target 不得設定為系統主視窗關鍵字 'LINE'！")
         return []
+    if is_group_target(target_name):
+        return find_group_chat_window(target_name)
 
     main_hwnd = find_line_main_window()
     windows = get_all_line_windows()
@@ -1380,7 +1437,8 @@ def focus_chat_input(hwnd, target_name=None):
 
         # 標題括號清除輪詢：LINE 視窗啟動後，未讀括號 (如 "TargetUser (1)") 通常需 0.2~1.5 秒由 Qt 重繪清除。
         # 輪詢等待最多 2.0 秒，若標題括號清除則確立為合法 1:1 視窗；若 2 秒後仍帶有括號 (如 "Family (4)")，100% 判定為群組成員數視窗並拒絕點擊！
-        deadline = time.time() + 2.0
+        is_group = bool(target_name) and is_group_target(target_name)       # 群組標題本來就帶成員數，不等也不當成「群組冒充 1:1」
+        deadline = time.time() + (0 if is_group else 2.0)
         fg_title = win32gui.GetWindowText(hwnd).strip()
         while time.time() < deadline:
             if not re.search(r"[\(\uFF08]\d+\+?[\)\uFF09]", fg_title):
@@ -1388,15 +1446,15 @@ def focus_chat_input(hwnd, target_name=None):
             time.sleep(0.15)
             fg_title = win32gui.GetWindowText(hwnd).strip()
 
-        if re.search(r"[\(\uFF08]\d+\+?[\)\uFF09]", fg_title):
+        if not is_group and re.search(r"[\(\uFF08]\d+\+?[\)\uFF09]", fg_title):
             log_v(f"[致命安全攔截] 視窗置於前景 2 秒後標題仍帶有括號「{fg_title}」，判定為群組成員數視窗，嚴禁點擊輸入框！")
             return False
 
-        if re.search(GROUP_NAME_PATTERNS, fg_title):
+        if not is_group and re.search(GROUP_NAME_PATTERNS, fg_title):
             log_v(f"[致命安全攔截] 視窗標題「{fg_title}」含有群組特徵關鍵字，判定為群組視窗，嚴禁點擊輸入框！")
             return False
 
-        if target_name and fg_title.lower() != target_name.lower():
+        if target_name and not title_matches_target(fg_title, target_name):
             log_v(f"[致命安全攔截] 前景視窗標題「{fg_title}」與目標對象「{target_name}」不符，嚴禁點擊輸入框！")
             return False
 
@@ -3091,7 +3149,10 @@ def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_f
     """執行長輩圖發送"""
     global last_global_reply_time
     # 每日上限：每個聊天室一天最多回覆 max_replies_per_day 次 (本機午夜重置，只計實際送出的)
-    max_per_day = config.get("max_replies_per_day", reply_budget.DEFAULT_MAX_PER_DAY)
+    if is_group_target(target_name):
+        max_per_day = config.get("group_max_replies_per_day", DEFAULT_CONFIG["group_max_replies_per_day"])
+    else:
+        max_per_day = config.get("max_replies_per_day", reply_budget.DEFAULT_MAX_PER_DAY)
     if not reply_budget.can_reply(REPLY_COUNTS_PATH, target_name, max_per_day):
         log_v(f"[每日上限]「{target_name}」今天已回覆 {reply_budget.count_today(REPLY_COUNTS_PATH, target_name)} 次 (上限 {max_per_day} 次)，不再回覆。")
         return "SKIPPED_DAILY_LIMIT"
@@ -3176,12 +3237,12 @@ def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_f
 
     fg_title = win32gui.GetWindowText(fg_hwnd)
     # 嚴格群組排除：任何帶有成員數或未讀括號的視窗，在前景時均視為群組（因 1:1 視窗置於前景後未讀數已自動清除，完全不帶括號）
-    if re.search(r"[\(\uFF08]\d+\+?[\)\uFF09]", fg_title):
+    if not is_group_target(target_name) and re.search(r"[\(\uFF08]\d+\+?[\)\uFF09]", fg_title):
         log_v(f"[致命安全攔截] 目前前景視窗「{fg_title}」帶有成員數或未讀括號，判定為群組視窗，嚴格拒絕發送！")
         _minimize_if_configured(chat_hwnd, config)
         return "NOT_SENT"
 
-    if fg_title.strip().lower() != target_name.lower():
+    if not title_matches_target(fg_title, target_name):
         log_v(f"[致命安全攔截] 目前前景視窗為「{fg_title}」，非 1:1 目標對象「{target_name}」，嚴格終止發送！")
         _minimize_if_configured(chat_hwnd, config)
         return "NOT_SENT"
@@ -3363,6 +3424,8 @@ def check_for_incoming_messages(config):
     for target in targets:
         if target_to_reply:
             break
+        if is_group_target(target):
+            continue                                   # 群組標題的數字是成員數，不是未讀數：只走下面的快取新圖偵測
         last_time = last_reply_times.get(target, 0)
         # 不論是否在冷卻期或觸發模式，持續觀察視窗未讀標記並動態校準基準線
         for hwnd, title, cls, vis in windows:
@@ -3631,7 +3694,11 @@ def check_for_incoming_messages(config):
                         matched = find_target_chat_window(cand_target)
                         if not matched and open_missing_chat_window(cand_target, config):
                             matched = find_target_chat_window(cand_target)
-                        if matched:
+                        if matched and is_group_target(cand_target) and not is_likely_photo(cand_path):
+                            PROCESSED_CACHE_FILES.add((cand_path, cand_m))
+                            max_processed_m = max(max_processed_m, cand_m)
+                            log_v(f"[群組略過]「{cand_target}」的新圖不是照片 (疑似貼圖)，群組只回照片。")
+                        elif matched:
                             # 電腦版獨立視窗標題正常為好友名稱 (不帶括號未讀數)，視窗上線即刻確認
                             chosen_candidate = cand_path
                             chosen_target = cand_target
@@ -3672,16 +3739,17 @@ def check_for_incoming_messages(config):
         # 快取掃描命中合格新媒體，在此統籌觸發發送！
         if chosen_target and chosen_candidate:
             last_sent_to_cand = LAST_SENT_TIME_BY_TARGET.get(chosen_target, 0)
+            eff_cooldown = config.get("group_cooldown_seconds", DEFAULT_CONFIG["group_cooldown_seconds"]) if is_group_target(chosen_target) else cooldown
             if current_time - last_sent_to_cand < 5:
                 last_reply_times[chosen_target] = current_time
                 log_v(f"[防自循環保護]「{chosen_target}」在發送後 5 秒內偵測到本機寫入快取，安全略過。")
-            elif current_time - last_reply_times.get(chosen_target, 0) >= cooldown:
+            elif current_time - last_reply_times.get(chosen_target, 0) >= eff_cooldown:
                 target_to_reply = chosen_target
                 new_image_found = chosen_candidate
                 log_v(f"\n[即時偵測] 鎖定快取頻道「{extract_chat_hash_from_path(new_image_found)[:8]}...」對應好友「{target_to_reply}」收到新貼圖/照片！(檔案: {os.path.basename(new_image_found)})")
             else:
-                remain = int(cooldown - (current_time - last_reply_times.get(chosen_target, 0)))
-                log_v(f"[冷卻中]「{chosen_target}」距上次回覆未滿 {int(cooldown)} 秒 (剩餘 {remain} 秒)，本次新圖不回覆。")
+                remain = int(eff_cooldown - (current_time - last_reply_times.get(chosen_target, 0)))
+                log_v(f"[冷卻中]「{chosen_target}」距上次回覆未滿 {int(eff_cooldown)} 秒 (剩餘 {remain} 秒)，本次新圖不回覆。")
 
     # 3. 執行發送前的斷路器 (Circuit Breaker) 與發送
     if target_to_reply:
@@ -3821,7 +3889,7 @@ def bind_channel_by_viewing(name, targets, seconds=30):
                 ch = extract_chat_hash_from_path(p)
                 if ch:
                     changed.add(ch)
-                    if foreground_window_title().strip().lower() != name.strip().lower():
+                    if not title_matches_target(foreground_window_title(), name):
                         unverified = True
         before = cur
     if unverified:
@@ -3838,6 +3906,8 @@ def init_unread_baselines(specific_targets=None):
             name = m.group(1).strip()
             if specific_targets is not None and not any(name.lower() == t.lower() for t in specific_targets):
                 continue
+            if is_group_target(name):
+                continue                                # 群組標題的數字是成員數
             count = parse_unread_count(m.group(2))
             LAST_PROCESSED_UNREAD[name] = max(LAST_PROCESSED_UNREAD.get(name, 0), count)
             log_v(f"[基準線初始化]「{name}」初始未讀數記為 {count}，避免啟動誤觸發。")

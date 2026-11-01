@@ -1,6 +1,6 @@
 # LINE 長輩圖智慧自動回覆機器人 (line-grandma-bot)
 
-[![Version](https://img.shields.io/badge/version-2.8.2-blue.svg)](auto_reply.py)
+[![Version](https://img.shields.io/badge/version-2.9.0-blue.svg)](auto_reply.py)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D6.svg)](https://microsoft.com)
 [![Python](https://img.shields.io/badge/python-3.10%2B-green.svg)](https://python.org)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey.svg)](LICENSE)
@@ -49,7 +49,7 @@ line-grandma-bot/
 ├── image_kind.py        # 由圖上文字判斷性質：節日、時段問候、平安叮嚀、祝福鼓勵、心靈雞湯；競選圖一律不回
 ├── image_library.py     # 圖庫性質索引、挑圖規則、沒庫存時立即上網抓圖
 ├── reply_budget.py      # 每個聊天室每天的回覆次數上限
-├── auto_reply.py        # 核心自動回覆常駐程式 (v2.8.2)
+├── auto_reply.py        # 核心自動回覆常駐程式 (v2.9.0)
 ├── crawl_images.py      # 台塑貼圖酷長輩圖抓取與過期清理模組
 ├── config.example.json  # 設定檔範本
 ├── config.json          # 個人實際設定檔 (已列入 .gitignore 保護隱私)
@@ -142,6 +142,9 @@ copy config.example.json config.json
 | `stop_command` | `"結束長輩圖機器人"` | 停止指令的文字。你在 `stop_command_chats` 內的聊天室自己發了含此文字的訊息，程式立即結束。比對時忽略空白與標點，OCR 認錯一字也算（例如「結束長輩圖機器八」）。 |
 | `stop_command_chats` | `[]` | 接受你下停止指令的聊天室名單，名稱需與 LINE 顯示名稱完全相符（例如官方帳號 `Notify Bot`）；空白代表停用此功能。只認「你自己發」的訊息，對方傳來的不算；聊天室需開成獨立視窗並保持展開（不能最小化）。 |
 | `auto_neutral_images` | `false` | **已被新的挑圖規則取代，不影響回覆**，只剩舊的 `--fill-pool` / `--tag-image` 時段標記還會參考。 |
+| `group_targets` | `[]` | 要回覆的**群組**名單，名稱寫法同 `targets`（不含人數，例如 `理財幼幼班_Z`）。群組有更保守的專屬規則（見下方），快取頻道只能手動綁定：`python auto_reply.py --bind-view "群組名稱"`，30 秒內在該群組的獨立視窗點開一張**真正的照片**（不能是貼圖）。 |
+| `group_max_replies_per_day` | `1` | 每個群組每天最多回覆幾次（本機午夜重置；`0` = 不限次數）。 |
+| `group_cooldown_seconds` | `600` | 同一個群組兩次回覆之間至少間隔幾秒，避免多人連續傳圖時一直回。 |
 | `auto_open_chat_window` | `true` | 找不到某位對象的獨立聊天視窗時，自動從 LINE 主視窗搜尋並雙擊開啟（名稱必須完全相符；必要時暫時拉寬主視窗、切到「全部」分頁，做完還原）。設 `false` 就維持手動開視窗。 |
 | `notify_log` | `false` | 把啟動、回覆、停止與警告/錯誤推播到 LINE 官方帳號（例如 `Notify Bot`），在聊天室裡看程式的狀況。需要先建立憑證檔，見下方「Notify Bot 推播」。修改後即時生效。 |
 | `notify_monthly_cap` | `150` | 每月最多推播則數。官方帳號免費方案每月上限 200 則（整個帳號共用），預設留 50 則給手動測試。達到上限後只記在本機，下個月恢復。 |
@@ -221,6 +224,15 @@ python auto_reply.py --unbind "媽媽"
 ---
 
 ## 📝 版本異動紀錄 (Changelog)
+
+### [v2.9.0] - 2026-11-01
+#### 支援群組
+- **新增 `group_targets`**：群組另列一份名單，不動 1:1 的嚴格規則（1:1 視窗標題的括號數字是未讀數、前景有括號就判定為群組而排除，這些都沒改）。群組也會併進監控名單，其餘流程共用。
+- **群組視窗標題**可以是「名稱」或「名稱 (成員數)」，其餘一律不算；桌面上同名視窗不只一個就拒絕。群組標題的數字是**成員數，不是未讀數**：群組不走「未讀數增加」觸發、也不記未讀基準線，只靠已綁定頻道的快取新圖偵測。
+- **更保守的回覆規則**：只回**照片**（貼圖略過，記一行「群組略過」）；每個群組每天最多 1 次（`group_max_replies_per_day`）；兩次回覆至少間隔 10 分鐘（`group_cooldown_seconds`）。長輩圖辨識、競選圖略過、最後一則在右側不回等原有保護照舊。
+- **綁定**：群組一律手動綁定（`--bind-view`），不做自動綁定（自動綁定的「一對一核驗」會排除群組，群組裡誰都能傳圖，無法確定頻道歸屬）；觀看綁定的前景視窗檢查接受「名稱 (成員數)」。
+- **送圖前的前景核對**：群組允許標題帶成員數，但仍要求標題符合群組名稱；1:1 維持「前景標題帶括號就拒絕發送」。
+- **已知限制**：群組分不出是誰傳的圖；群組的成員數若剛好也出現在別的視窗標題，不會被混淆（比對的是整個標題）。
 
 ### [v2.8.2] - 2026-11-01
 - **自動開視窗支援群組**：群組在搜尋結果裡的名稱後面會接成員數（例如「理財幼幼班_Z (142)」），原本「必須完全相符」會把它擋掉。現在接受「名稱」或「名稱 (人數)」，其餘（多一截字、括號裡不是數字、前面多字）仍一律不點；開出來的視窗標題仍必須剛好等於名稱。
