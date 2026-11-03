@@ -26,3 +26,7 @@ images/*
 
 # 程式自己寫的紀錄檔 (logs/auto_reply_日期.log)，只留在本機
 logs/
+
+# Claude Code 的 commit 前審查關卡紀錄 (.claude/hooks/review_gate.py)，只留在本機
+.claude/review-state.json
+.claude/review-state.tmp

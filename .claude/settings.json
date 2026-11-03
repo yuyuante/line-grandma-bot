@@ -1,0 +1,41 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "if": "Bash(git *)",
+            "command": "python -X utf8 \"$CLAUDE_PROJECT_DIR/.claude/hooks/review_gate.py\" gate",
+            "timeout": 15,
+            "statusMessage": "檢查 commit 前的審查..."
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Skill",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python -X utf8 \"$CLAUDE_PROJECT_DIR/.claude/hooks/review_gate.py\" record",
+            "timeout": 15
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "if": "Bash(git *)",
+            "command": "python -X utf8 \"$CLAUDE_PROJECT_DIR/.claude/hooks/review_gate.py\" clear",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}

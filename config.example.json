@@ -24,6 +24,7 @@
   "image_sources": [],
   "require_grandma_image": true,
   "reply_to_text": true,
+  "reply_to_sticker_text": true,
   "birthday_reply": "謝謝",
   "text_reply_max_chars": 30,
   "log_to_file": true,

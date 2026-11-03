@@ -4179,6 +4179,24 @@ class TestLineGrandmaBotCore(unittest.TestCase):
         self.assertEqual(auto_reply._window_hwnd(wins, "別人"), 3)
         self.assertIsNone(auto_reply._window_hwnd(wins, "不存在"))
 
+    def test_reply_to_sticker_text_follows_reply_to_text_when_it_is_not_written_in_the_config(self):
+        path = os.path.join(self.temp_dir.name, "sticker_cfg.json")
+
+        def load(extra):
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(dict({"targets": ["a"]}, **extra), f)
+            with mock.patch.object(auto_reply, "CONFIG_PATH", path):
+                return auto_reply.load_config()["reply_to_sticker_text"]
+
+        self.assertTrue(auto_reply.DEFAULT_CONFIG["reply_to_sticker_text"])         # 預設開
+        self.assertTrue(load({}))                                                    # 設定檔都沒寫：開
+        self.assertFalse(load({"reply_to_text": False}))                             # 審查：原本為了「不想被打擾」關掉文字回覆的人，貼圖不會又把視窗帶到前景
+        self.assertTrue(load({"reply_to_text": False, "reply_to_sticker_text": True}))   # 明確寫了就照寫的
+        self.assertFalse(load({"reply_to_sticker_text": False}))
+        self.assertTrue(load({"reply_to_sticker_text": True}))
+        self.assertTrue(load({"reply_to_sticker_text": "no"}))                       # 型別錯誤 (不是布林)：視同沒寫，跟著 reply_to_text (預設開)
+        self.assertFalse(load({"reply_to_text": False, "reply_to_sticker_text": 0}))
+
     def test_load_config_sanitizes_notify_fallback_chat(self):
         path = os.path.join(self.temp_dir.name, "fallback_cfg.json")
 

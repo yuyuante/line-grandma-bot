@@ -149,6 +149,270 @@ class TestRecognizeScreenshot(_Base):
         self.assertEqual(self.ocr_calls, [])
 
 
+class TestStickerText(_Base):
+    """一對一：最底部是貼圖、上面寫著短問候或祝福 (例如真機的「早安安」貼圖) 也回；其他貼圖照舊略過。
+    貼圖不會寫進聊天室的快取目錄，所以是在「視窗列表有變化」的文字觸發流程裡讀 (recognize_incoming_sticker)"""
+
+    def run_sticker(self, texts, bottom=((True, "crop"),), max_chars=30, ocr_error=None, front=True):
+        """texts：依序給每次 OCR 讀到的字；bottom：依序給每次偵測到的 (狀態, 是否有裁切圖)"""
+        from PIL import Image
+        reads = iter(texts)
+        states = iter(bottom)
+        self.ocr_inputs = []
+        self.order = []
+        self.naps = []
+
+        def fake_ocr(image):
+            self.ocr_inputs.append(image.size)
+            self.order.append("ocr")
+            if ocr_error:
+                raise ocr_error
+            return next(reads, "")
+
+        def fake_bottom(hwnd):
+            self.order.append("detect")
+            state, has_crop = next(states, bottom[-1])
+            return state, (Image.new("RGB", (300, 200), (255, 255, 255)) if has_crop else None)
+
+        with mock.patch.object(auto_reply.win32gui, "IsWindow", return_value=True), \
+             mock.patch.object(auto_reply.win32gui, "IsIconic", return_value=False), \
+             mock.patch.object(auto_reply.win32gui, "IsWindowVisible", return_value=True), \
+             mock.patch.object(auto_reply.win32gui, "GetForegroundWindow", return_value=CHAT if front else CHAT + 1), \
+             mock.patch.object(auto_reply, "_wait_until_chat_settled", side_effect=lambda h: self.order.append("settle") or True), \
+             mock.patch.object(auto_reply, "_bottom_sticker", side_effect=fake_bottom), \
+             mock.patch.object(auto_reply.time, "sleep", side_effect=self.naps.append), \
+             mock.patch.object(auto_reply, "ocr_text", side_effect=fake_ocr):
+            return auto_reply.recognize_incoming_sticker(CHAT, max_chars)
+
+    def logged(self):
+        return NL.join(str(c.args[0]) for c in self.log.call_args_list)
+
+    def test_a_sticker_that_says_good_morning_is_recognised(self):
+        state, kind, text = self.run_sticker(["早安安"])
+        self.assertEqual((state, text), (True, "早安安"))
+        self.assertEqual(kind, ik.classify_message("早安安"))
+        self.assertIn("貼圖文字識別", self.logged())
+        self.assertEqual(self.ocr_inputs, [(300, 200)])                             # 原圖就讀對：不再讀第二次
+
+    def test_a_sticker_that_read_nothing_is_not_doubled_on_the_first_look_only_on_the_second(self):
+        # 審查：沒字的貼圖原本會「讀原圖、放大讀、等 1.5 秒、再讀原圖、再放大讀」共四次；第一輪不放大，放大留給第二輪
+        state, _, text = self.run_sticker(["", "", "早安安"])
+        self.assertEqual((state, text), (True, "早安安"))
+        self.assertEqual(self.ocr_inputs, [(300, 200), (300, 200), (600, 400)])
+        self.run_sticker(["", "", ""])
+        self.assertEqual(self.ocr_inputs, [(300, 200), (300, 200), (600, 400)])                  # 沒字：共三次，不是四次
+
+    def test_a_short_text_is_doubled_at_once_on_the_first_look(self):
+        state, _, text = self.run_sticker(["", ])                                               # 對照：讀到短字 (非問候) 才在第一輪放大
+        self.assertEqual(state, False)
+        self.run_sticker(["OK", "早安安"])
+        self.assertEqual(self.ocr_inputs, [(300, 200), (600, 400)])
+
+    def test_a_short_non_greeting_gets_the_doubled_read_too_but_a_long_text_does_not(self):
+        self.run_sticker(["OK啦", "OK啦"])
+        self.assertEqual(len(self.ocr_inputs), 2)                                   # 短字：可能是小字，再讀一次
+        long_text = "早安" + "你好" * 20
+        self.run_sticker([long_text, long_text])
+        self.assertEqual(len(self.ocr_inputs), 1)                                   # 審查：已經太長就不必再讀 (省一次 OCR)
+
+    def test_other_stickers_are_not_replied_to(self):
+        self.assertEqual(self.run_sticker(["OK啦", "OK啦"]), (False, None, "OK啦"))
+        self.assertEqual(self.run_sticker(["哈哈哈", "哈哈哈"])[0], False)
+
+    def test_the_same_limits_as_text_messages_apply(self):
+        long_text = "早安" + "你好" * 20
+        self.assertEqual(self.run_sticker([long_text])[0], False)                    # 超過 30 字
+        self.assertEqual(self.run_sticker(["早安安安"], max_chars=3)[0], False)       # 上限來自 text_reply_max_chars
+        self.assertEqual(self.run_sticker(["生日", "生日"])[0], False)                # 只是提到生日、沒有祝賀語
+        state, kind, _ = self.run_sticker(["生日快樂"])
+        self.assertTrue(state)
+        self.assertTrue(ik.is_birthday(kind))                                        # 生日祝賀：之後只回「謝謝」
+
+    def test_the_time_next_to_the_sticker_is_cleaned_out_of_the_text(self):
+        self.assertEqual(self.run_sticker(["早安安 上午 6:20"])[0::2], (True, "早安安"))
+        self.assertEqual(self.run_sticker(["早安安 上午6:20"])[0::2], (True, "早安安"))
+
+    def test_text_recognition_settles_by_default_and_skips_it_when_told_the_screen_was_just_settled(self):
+        from PIL import Image
+        crop = Image.new("RGB", (500, 60), (255, 255, 255))
+        for settle, expected in ((True, 1), (False, 0), (None, 0)):
+            calls = []
+            kwargs = {} if settle is None else {"settle": settle}
+            if settle is None:
+                kwargs = {"settle": False}
+            with mock.patch.object(auto_reply.win32gui, "IsWindow", return_value=True), \
+                 mock.patch.object(auto_reply.win32gui, "IsIconic", return_value=False), \
+                 mock.patch.object(auto_reply.win32gui, "IsWindowVisible", return_value=True), \
+                 mock.patch.object(auto_reply.win32gui, "GetForegroundWindow", return_value=CHAT), \
+                 mock.patch.object(auto_reply, "_wait_until_chat_settled", side_effect=lambda h: calls.append(1)), \
+                 mock.patch.object(auto_reply, "_incoming_text_crop", return_value=crop), \
+                 mock.patch.object(auto_reply, "ocr_text", return_value="早安"):
+                auto_reply.recognize_incoming_text(CHAT, 30, **kwargs)
+            self.assertEqual(len(calls), expected, settle)
+        calls = []
+        with mock.patch.object(auto_reply.win32gui, "IsWindow", return_value=True), \
+             mock.patch.object(auto_reply.win32gui, "IsIconic", return_value=False), \
+             mock.patch.object(auto_reply.win32gui, "IsWindowVisible", return_value=True), \
+             mock.patch.object(auto_reply.win32gui, "GetForegroundWindow", return_value=CHAT), \
+             mock.patch.object(auto_reply, "_wait_until_chat_settled", side_effect=lambda h: calls.append(1)), \
+             mock.patch.object(auto_reply, "_incoming_text_crop", return_value=crop), \
+             mock.patch.object(auto_reply, "ocr_text", return_value="早安"):
+            auto_reply.recognize_incoming_text(CHAT, 30)                                 # 不傳旗標：預設要等 (原本的行為)
+        self.assertEqual(len(calls), 1)
+
+    def test_garbled_time_leftovers_do_not_break_a_greeting(self):
+        state, kind, _ = self.run_sticker(["早安安 F午6:20"])
+        self.assertTrue(state)
+        self.assertEqual(kind, ik.classify_message("早安安"))
+
+    def test_an_ocr_failure_means_ask_again_later_not_not_a_greeting(self):
+        self.assertEqual(self.run_sticker(["早安安"], ocr_error=RuntimeError("down")), (None, None, ""))
+
+    def test_nothing_is_read_while_the_window_is_not_in_front(self):
+        self.assertEqual(self.run_sticker(["早安安"], front=False), (None, None, ""))
+        self.assertEqual(self.ocr_inputs, [])
+
+    def test_the_screen_is_settled_and_the_sticker_detected_before_it_is_read(self):
+        self.run_sticker(["早安安"])
+        self.assertEqual(self.order, ["settle", "detect", "ocr"])
+
+    def test_it_never_falls_back_to_reading_a_text_bubble(self):
+        # 審查：最底部已經不是貼圖 (或暫時判斷不出) 時回傳「稍後再說」，不能中途改讀文字氣泡、紀錄卻寫貼圖
+        for bottom in (((False, False),), ((None, False),)):
+            self.assertEqual(self.run_sticker(["早安"], bottom=bottom), (None, None, ""))
+            self.assertEqual(self.ocr_inputs, [])
+
+    def test_a_sticker_with_no_text_at_all_is_looked_at_again_once_in_case_it_was_still_loading(self):
+        # 審查：列表一變就讀，貼圖圖片可能還沒載入、讀不到任何字；基準線又會前進，所以要再看一次
+        state, _, text = self.run_sticker(["", "", "早安安"])
+        self.assertEqual((state, text), (True, "早安安"))
+        self.assertEqual(self.naps, [auto_reply.STICKER_LOAD_RETRY_DELAY])
+        self.assertEqual(self.order.count("detect"), 2)                              # 第二次是重新截圖偵測，不是沿用舊的
+
+    def test_the_second_look_happens_only_once_and_only_when_nothing_was_read(self):
+        self.assertEqual(self.run_sticker(["", "", "", ""])[0], False)
+        self.assertEqual(self.order.count("detect"), 2)                              # 讀兩次還是沒字就放棄
+        self.run_sticker(["OK啦", "OK啦"])
+        self.assertEqual(self.order.count("detect"), 1)                              # 有讀到字 (只是不是問候)：不再看第二次
+        self.assertEqual(self.naps, [])
+
+    def test_if_the_sticker_is_gone_on_the_second_look_it_asks_again_later(self):
+        self.assertEqual(self.run_sticker(["", ""], bottom=((True, True), (False, False)))[0], None)
+
+    def photo_loading(self, rows, wait=auto_reply.STICKER_LOAD_WAIT_SECONDS):
+        """rows：依序給每次偵測 (_incoming_media_info) 的「有沒有另存新檔那一列」；None 代表抓不到"""
+        from PIL import Image
+        crop = Image.new("RGB", (300, 200), (255, 255, 255))
+        seq = iter(rows)
+        naps = []
+        calls = {"n": 0}
+
+        def info(h):
+            calls["n"] += 1
+            r = next(seq, rows[-1])
+            return None if r is None else (crop, 150, r)
+
+        with mock.patch.object(auto_reply, "last_left_message_is_media", return_value=True), \
+             mock.patch.object(auto_reply, "_incoming_media_info", side_effect=info), \
+             mock.patch.object(auto_reply.time, "sleep", side_effect=lambda seconds: (naps.append(seconds), self.clock.__setitem__(0, self.clock[0] + seconds))):
+            state, got = auto_reply._bottom_sticker(CHAT, wait_seconds=wait)       # sleep 要推進假時鐘，否則等待迴圈永遠等不到截止時間
+        return state, got, naps, calls["n"]
+
+    def test_a_photo_that_finishes_loading_while_waiting_is_a_photo_not_a_sticker(self):
+        # 審查：載入中的照片也沒有「另存新檔」那一列，不等就會被當成貼圖、讀字、甚至回覆
+        state, got, naps, calls = self.photo_loading([False, False, True])
+        self.assertEqual((state, got), (False, None))
+        self.assertEqual(naps, [auto_reply.IMAGE_LOAD_POLL_SECONDS] * 2)
+
+    def test_a_real_sticker_waits_for_the_full_time_and_is_still_a_sticker(self):
+        self.clock[0] = 1000.0
+        state, got, naps, calls = self.photo_loading([False])
+        self.assertTrue(state)
+        self.assertIsNotNone(got)
+        self.assertGreaterEqual(sum(naps), auto_reply.STICKER_LOAD_WAIT_SECONDS)
+
+    def test_no_waiting_when_not_asked_to(self):
+        state, _, naps, calls = self.photo_loading([False], wait=0.0)
+        self.assertTrue(state)
+        self.assertEqual((naps, calls), ([], 1))
+
+    def test_a_row_that_is_already_there_needs_no_waiting(self):
+        state, _, naps, _ = self.photo_loading([True])
+        self.assertFalse(state)
+        self.assertEqual(naps, [])
+
+    def test_the_picture_disappearing_while_waiting_means_ask_again_later(self):
+        state, got, _, _ = self.photo_loading([False, None])
+        self.assertEqual((state, got), (None, None))
+        # 突變只靠外層的例外處理也會得到同樣的 None：要確認「不是靠例外」，所以這一輪不能留下任何紀錄
+        self.log.reset_mock()
+        self.photo_loading([False, None])
+        self.assertNotIn("貼圖偵測", self.logged())
+
+    def test_a_detection_error_leaves_a_log_line_and_asks_again_later(self):
+        with mock.patch.object(auto_reply, "last_left_message_is_media", side_effect=RuntimeError("dpi")):
+            self.assertEqual(auto_reply._bottom_sticker(CHAT), (None, None))
+        self.assertIn("dpi", self.logged())
+        self.log.reset_mock()
+        with mock.patch.object(auto_reply, "_wait_until_chat_settled", side_effect=RuntimeError("grab")), \
+             mock.patch.object(auto_reply.win32gui, "IsWindow", return_value=True), \
+             mock.patch.object(auto_reply.win32gui, "IsIconic", return_value=False), \
+             mock.patch.object(auto_reply.win32gui, "IsWindowVisible", return_value=True), \
+             mock.patch.object(auto_reply.win32gui, "GetForegroundWindow", return_value=CHAT):
+            self.assertEqual(auto_reply.recognize_incoming_sticker(CHAT), (None, None, ""))
+        self.assertIn("grab", self.logged())
+
+    def test_the_peek_waits_for_the_thumbnail_but_the_later_looks_do_not(self):
+        seen = []
+        with mock.patch.object(auto_reply, "find_target_chat_window", return_value=[(CHAT, "小明", "Qt", True)]), \
+             mock.patch.object(auto_reply.win32gui, "IsIconic", return_value=False), \
+             mock.patch.object(auto_reply.win32gui, "GetForegroundWindow", return_value=CHAT), \
+             mock.patch.object(auto_reply, "activate_window"), \
+             mock.patch.object(auto_reply, "_wait_until_chat_settled"), \
+             mock.patch.object(auto_reply, "is_last_message_from_self_in_chat", return_value=False), \
+             mock.patch.object(auto_reply, "_bottom_sticker", side_effect=lambda h, wait_seconds=0.0: seen.append(wait_seconds) or (False, None)), \
+             mock.patch.object(auto_reply, "recognize_incoming_text", return_value=(True, MORNING, "早安")), \
+             mock.patch.object(auto_reply, "_minimize_if_configured"):
+            auto_reply._peek_incoming_text("小明", {})
+        self.assertEqual(seen, [auto_reply.STICKER_LOAD_WAIT_SECONDS])
+
+    def test_bottom_sticker_detection(self):
+        from PIL import Image
+        crop = Image.new("RGB", (300, 200), (255, 255, 255))
+        cases = ((True, (crop, 150, False), True),       # 不是文字氣泡、沒有「另存新檔」那一列：貼圖
+                 (True, (crop, 150, True), False),       # 有那一列：照片
+                 (False, (crop, 150, False), False),     # 文字氣泡
+                 (None, (crop, 150, False), None),       # 判斷不出：不是「不是貼圖」
+                 (True, None, None))                     # 抓不到圖片資訊：同上
+        for media, info, expected in cases:
+            with mock.patch.object(auto_reply, "last_left_message_is_media", return_value=media), \
+                 mock.patch.object(auto_reply, "_incoming_media_info", return_value=info):
+                state, got = auto_reply._bottom_sticker(CHAT)
+                self.assertEqual(state, expected, (media, info))
+                self.assertEqual(got is not None, expected is True)                  # 只有確定是貼圖才附裁切圖
+        with mock.patch.object(auto_reply, "last_left_message_is_media", side_effect=RuntimeError("boom")):
+            self.assertEqual(auto_reply._bottom_sticker(CHAT), (None, None))         # 任何錯誤都是「暫時判斷不出」，不能當成不是貼圖
+
+    def test_sticker_text_is_allowed_only_for_one_to_one_chats_with_the_option_on_and_not_in_photo_only_mode(self):
+        self.assertTrue(auto_reply._sticker_text_allowed({}, "小明"))
+        self.assertFalse(auto_reply._sticker_text_allowed({"reply_to_sticker_text": False}, "小明"))
+        self.assertFalse(auto_reply._sticker_text_allowed({"trigger_mode": "photo_only"}, "小明"))    # 「只回照片」
+        self.assertTrue(auto_reply._sticker_text_allowed({"trigger_mode": "all"}, "小明"))
+        auto_reply.set_group_targets(["小明"])
+        self.addCleanup(auto_reply.set_group_targets, [])
+        self.assertFalse(auto_reply._sticker_text_allowed({}, "小明"))
+
+    def test_text_and_sticker_share_one_greeting_reader(self):
+        from PIL import Image
+        crop = Image.new("RGB", (300, 60), (255, 255, 255))
+        reads = iter(["", "早安"])
+        with mock.patch.object(auto_reply, "ocr_text", side_effect=lambda i: next(reads, "")):
+            self.assertEqual(auto_reply._read_greeting(crop, 30, retry_when_empty=True), (ik.classify_message("早安"), "早安"))
+        reads = iter(["", "早安"])
+        with mock.patch.object(auto_reply, "ocr_text", side_effect=lambda i: next(reads, "")):
+            self.assertEqual(auto_reply._read_greeting(crop, 30)[0], None)             # 文字：沒字不再讀第二次 (原本的行為)
+
+
 class TestRecognizeIncomingText(_Base):
     def run_text(self, ocr, front=True, crop="ok", max_chars=30, iconic=False):
         from PIL import Image
@@ -510,9 +774,15 @@ class TestSendFlow(_Base):
     def run_flow(self, *, recognize=((True, MID_AUTUMN, "中秋節快樂"),), choose=None, attach=True, config=None,
                  triggered=True, slots=None, find_results=None, opener=False, title="小明",
                  text_trigger=False, text_result=(True, MORNING, "早安"), media_result=True, target="小明", self_last=False,
-                 send_text=True, peek=(True, MORNING, "早安")):
+                 send_text=True, peek=(True, MORNING, "早安"), sticker=False):
         mocks = {}
         minimized = []
+
+        def fake_peek(target_name, config, info=None):
+            if info is not None and sticker is True:
+                info["sticker"] = True                  # 真的「看一眼」會回報最底部是貼圖
+            return peek
+
         patches = {
             "recognize": mock.patch.object(auto_reply, "recognize_incoming_image", side_effect=list(recognize)),
             "choose": mock.patch.object(auto_reply, "choose_reply_image", side_effect=choose if choose is not None else [self.image]),
@@ -535,7 +805,9 @@ class TestSendFlow(_Base):
             "self": mock.patch.object(auto_reply, "is_last_message_from_self_in_chat", return_value=self_last),
             "media": mock.patch.object(auto_reply, "_media_type_with_retry", return_value=media_result),
             "recognize_text": mock.patch.object(auto_reply, "recognize_incoming_text", return_value=text_result),
-            "peek": mock.patch.object(auto_reply, "_peek_incoming_text", return_value=peek),
+            "peek": mock.patch.object(auto_reply, "_peek_incoming_text", side_effect=fake_peek),
+            "sticker": mock.patch.object(auto_reply, "_bottom_sticker", return_value=(sticker, None)),
+            "recognize_sticker": mock.patch.object(auto_reply, "recognize_incoming_sticker", return_value=text_result),
             "cache_dir": mock.patch.object(auto_reply, "get_active_line_cache_dir", return_value="cache"),
             "cache_files": mock.patch.object(auto_reply, "get_all_cache_files", return_value={}),
             "chat_map": mock.patch.object(auto_reply, "load_chat_dirs_map", return_value={}),
@@ -663,7 +935,7 @@ class TestSendFlow(_Base):
         self.assertEqual(minimized, [CHAT])
 
     def test_birthday_text_still_gets_thanks_when_text_replies_are_off_but_other_text_does_not(self):
-        result, m, _ = self.text_flow(text_result=(True, BIRTHDAY, "生日快樂"), config={"reply_to_text": False})
+        result, m, _ = self.text_flow(text_result=(True, BIRTHDAY, "生日快樂"), peek=(True, BIRTHDAY, "生日快樂"), config={"reply_to_text": False})
         self.assert_thanks_only(result, m)
         result, m, _ = self.text_flow(text_result=(True, MORNING, "早安"), config={"reply_to_text": False})
         self.assertEqual(result, "SKIPPED_TEXT")
@@ -671,7 +943,7 @@ class TestSendFlow(_Base):
         m["send_text"].assert_not_called()
 
     def test_text_flow_is_not_entered_when_both_text_replies_and_birthday_thanks_are_off(self):
-        result, m, _ = self.text_flow(config={"reply_to_text": False, "birthday_reply": ""}, recognize=[(False, None, "")])
+        result, m, _ = self.text_flow(config={"reply_to_text": False, "birthday_reply": "", "reply_to_sticker_text": False}, recognize=[(False, None, "")])
         self.assertEqual(result, "SKIPPED_NOT_GRANDMA")
         m["recognize_text"].assert_not_called()
 
@@ -764,7 +1036,7 @@ class TestSendFlow(_Base):
         self.assertEqual(m["chat_map"].return_value, {})
 
     def test_switch_off_and_requirements_keep_the_old_behaviour(self):
-        result, m, _ = self.text_flow(config={"reply_to_text": False, "birthday_reply": ""}, recognize=[(False, None, "")])
+        result, m, _ = self.text_flow(config={"reply_to_text": False, "birthday_reply": "", "reply_to_sticker_text": False}, recognize=[(False, None, "")])
         self.assertEqual(result, "SKIPPED_NOT_GRANDMA")                                        # 關掉：沒有觸發檔 = 不是長輩圖
         m["recognize_text"].assert_not_called()
         result, m, _ = self.text_flow(config={"require_grandma_image": False})
@@ -809,6 +1081,118 @@ class TestSendFlow(_Base):
         result, m, _ = self.run_flow(config={"require_grandma_image": False}, recognize=[(False, None, "")])
         self.assertEqual(result, "SENT_CONFIRMED")                                          # 1:1：關掉識別就是舊行為，什麼都回
         m["recognize"].assert_not_called()
+
+    def sticker_flow(self, **kw):
+        """最底部是貼圖的文字觸發流程 (視窗列表有變化)：看一眼通過、最後一則是媒體、而且是貼圖"""
+        kw.setdefault("sticker", True)
+        kw.setdefault("media_result", True)
+        kw.setdefault("text_result", (True, MORNING, "早安安"))
+        kw.setdefault("peek", (True, MORNING, "早安安"))
+        return self.text_flow(**kw)
+
+    def test_a_sticker_good_morning_gets_the_matching_image(self):
+        result, m, _ = self.sticker_flow()
+        self.assertEqual(result, "SENT_CONFIRMED")
+        self.assertEqual(m["choose"].call_args.args[1], MORNING)
+        m["attach"].assert_called_once_with(CHAT, self.image)
+        m["recognize_sticker"].assert_called_once()                                              # 讀的是貼圖，不是文字氣泡
+        m["recognize_text"].assert_not_called()
+        self.assertIn("貼圖識別", NL.join(str(c.args[0]) for c in self.log.call_args_list))
+
+    def test_the_sticker_text_uses_the_text_length_limit_from_the_config(self):
+        _, m, _ = self.sticker_flow(config={"text_reply_max_chars": 9})
+        self.assertEqual(m["recognize_sticker"].call_args.args[1], 9)
+
+    def test_with_the_option_off_a_sticker_is_skipped_like_any_picture(self):
+        result, m, _ = self.sticker_flow(config={"reply_to_sticker_text": False})
+        self.assertEqual(result, "SKIPPED_TEXT")
+        m["recognize_sticker"].assert_not_called()
+        m["recognize_text"].assert_not_called()
+        m["attach"].assert_not_called()
+        self.assertIn("圖片或貼圖，不是文字", NL.join(str(c.args[0]) for c in self.log.call_args_list))
+
+    def test_photo_only_mode_never_replies_to_a_sticker(self):
+        result, m, _ = self.sticker_flow(config={"trigger_mode": "photo_only"})
+        self.assertEqual(result, "SKIPPED_TEXT")
+        m["recognize_sticker"].assert_not_called()
+        m["attach"].assert_not_called()
+
+    def test_a_photo_at_the_bottom_is_still_left_to_the_cache_path(self):
+        result, m, _ = self.sticker_flow(sticker=False)                                         # 最底部是媒體，但不是貼圖 (是照片)
+        self.assertEqual(result, "SKIPPED_TEXT")
+        m["recognize_sticker"].assert_not_called()
+        m["attach"].assert_not_called()
+
+    def test_when_it_cannot_tell_a_sticker_from_a_photo_it_retries_instead_of_skipping_for_good(self):
+        # 審查：暫時性的失敗不能被當成「不是貼圖」而永久略過 (SKIPPED_TEXT 會讓基準線前進)
+        result, m, _ = self.sticker_flow(sticker=None)
+        self.assertEqual(result, "NOT_SENT")
+        m["attach"].assert_not_called()
+        self.assertIn("貼圖待確認", NL.join(str(c.args[0]) for c in self.log.call_args_list))
+
+    def test_a_sticker_without_a_greeting_is_skipped_with_its_own_log_line(self):
+        result, m, _ = self.sticker_flow(peek=(False, None, "OK啦"))
+        self.assertEqual(result, "SKIPPED_TEXT")
+        m["attach"].assert_not_called()
+        logged = NL.join(str(c.args[0]) for c in self.log.call_args_list)
+        self.assertNotIn("最後一則文字不是短問候", logged)
+
+    def test_a_sticker_that_cannot_be_read_yet_is_retried_later(self):
+        result, m, _ = self.sticker_flow(text_result=(None, None, ""))
+        self.assertEqual(result, "NOT_SENT")
+        m["attach"].assert_not_called()
+        self.assertIn("貼圖", NL.join(str(c.args[0]) for c in self.log.call_args_list))
+
+    def test_a_sticker_without_a_greeting_after_the_wait_is_skipped_as_a_sticker(self):
+        result, m, _ = self.sticker_flow(text_result=(False, None, "OK啦"))
+        self.assertEqual(result, "SKIPPED_TEXT")
+        m["attach"].assert_not_called()
+        logged = NL.join(str(c.args[0]) for c in self.log.call_args_list)
+        self.assertIn("貼圖略過", logged)
+        self.assertNotIn("最後一則文字不是短問候", logged)
+
+    def test_a_sticker_still_gets_a_reply_when_text_replies_are_switched_off(self):
+        # reply_to_text 管文字訊息，reply_to_sticker_text 管貼圖：各自獨立
+        result, m, _ = self.sticker_flow(config={"reply_to_text": False, "birthday_reply": "", "reply_to_sticker_text": True})
+        self.assertEqual(result, "SENT_CONFIRMED")
+        m["attach"].assert_called_once()
+        m["recognize_sticker"].assert_called_once()
+        m["recognize"].assert_not_called()                                                        # 不是一般圖片的辨識 (沒有快取檔可辨識)
+
+    def test_a_plain_text_greeting_is_dropped_before_the_wait_when_only_the_sticker_option_is_on(self):
+        # 審查：只開貼圖設定時，文字問候不能先通過「看一眼」、睡上最多 900 秒才略過 (主迴圈單執行緒，會卡住其他好友)
+        result, m, _ = self.text_flow(config={"reply_to_text": False, "birthday_reply": "", "reply_to_sticker_text": True},
+                                      peek=(True, MORNING, "早安"))
+        self.assertEqual(result, "SKIPPED_TEXT")
+        m["countdown"].assert_not_called()                                                        # 沒有睡
+        m["get_images"].assert_not_called()                                                       # 也沒有去補圖庫
+        m["attach"].assert_not_called()
+        self.assertIn("reply_to_text 已關閉", NL.join(str(c.args[0]) for c in self.log.call_args_list))
+
+    def test_a_text_birthday_wish_still_gets_thanks_when_only_the_sticker_option_is_on(self):
+        wish = ik.classify_message("生日快樂")
+        result, m, _ = self.text_flow(config={"reply_to_text": False, "birthday_reply": "謝謝", "reply_to_sticker_text": True},
+                                      peek=(True, wish, "生日快樂"), text_result=(True, wish, "生日快樂"))
+        self.assertEqual(result, "SENT_CONFIRMED")
+        m["send_text"].assert_called_once()
+        m["attach"].assert_not_called()
+
+    def test_a_sticker_birthday_wish_only_gets_a_thank_you(self):
+        wish = ik.classify_message("生日快樂")
+        result, m, _ = self.sticker_flow(text_result=(True, wish, "生日快樂"), peek=(True, wish, "生日快樂"), config={"birthday_reply": "謝謝"})
+        self.assertEqual(result, "SENT_CONFIRMED")
+        m["send_text"].assert_called_once()
+        m["choose"].assert_not_called()
+        m["attach"].assert_not_called()
+
+    def test_a_group_never_enters_the_sticker_flow(self):
+        auto_reply.set_group_targets(["小明"])
+        self.addCleanup(auto_reply.set_group_targets, [])
+        result, m, _ = self.sticker_flow(recognize=[(False, None, "")])
+        self.assertEqual(result, "SKIPPED_NOT_GRANDMA")
+        m["recognize_sticker"].assert_not_called()
+        m["recognize_text"].assert_not_called()
+        m["attach"].assert_not_called()
 
     def test_group_window_title_with_member_count_may_send_but_a_one_to_one_one_may_not(self):
         result, m, _ = self.run_flow(title="小明 (477)")                                       # 1:1 前景標題帶括號 = 群組冒充，擋下
@@ -1114,7 +1498,7 @@ class TestPeekIncomingText(_Base):
              mock.patch.object(auto_reply, "recognize_incoming_text", recognize), \
              mock.patch.object(auto_reply, "_minimize_if_configured") as minimize:
             try:
-                result = auto_reply._peek_incoming_text("小明", {"text_reply_max_chars": 12})
+                result = auto_reply._peek_incoming_text("小明", {"text_reply_max_chars": 12, "reply_to_sticker_text": False})
             except RuntimeError:
                 result = "raised"
         return result, recognize, minimize, show
@@ -1122,8 +1506,68 @@ class TestPeekIncomingText(_Base):
     def test_a_greeting_is_recognised_and_the_window_is_put_back(self):
         result, recognize, minimize, _ = self.peek()
         self.assertEqual(result, (True, MORNING, "早安"))
-        recognize.assert_called_once_with(CHAT, 12)                                             # 字數上限來自設定
+        recognize.assert_called_once_with(CHAT, 12, settle=True)                                # 字數上限來自設定；沒有貼圖偵測時由文字辨識自己等畫面穩定
         minimize.assert_called_once()
+
+    def peek_sticker(self, cfg, group=False, bottom=(True, None), sticker_result=(True, MORNING, "早安安")):
+        auto_reply.set_group_targets(["小明"] if group else [])
+        self.addCleanup(auto_reply.set_group_targets, [])
+        info = {}
+        with mock.patch.object(auto_reply, "find_target_chat_window", return_value=[(CHAT, "小明", "Qt", True)]), \
+             mock.patch.object(auto_reply.win32gui, "IsIconic", return_value=False), \
+             mock.patch.object(auto_reply.win32gui, "GetForegroundWindow", return_value=CHAT), \
+             mock.patch.object(auto_reply, "activate_window"), \
+             mock.patch.object(auto_reply, "_wait_until_chat_settled"), \
+             mock.patch.object(auto_reply, "is_last_message_from_self_in_chat", return_value=False), \
+             mock.patch.object(auto_reply, "_bottom_sticker", return_value=bottom), \
+             mock.patch.object(auto_reply, "recognize_incoming_sticker", return_value=sticker_result) as sticker, \
+             mock.patch.object(auto_reply, "recognize_incoming_text", return_value=(True, MORNING, "早安")) as text, \
+             mock.patch.object(auto_reply, "_minimize_if_configured"):
+            result = auto_reply._peek_incoming_text("小明", dict(cfg), info)
+        return result, info, sticker, text
+
+    def test_a_bottom_sticker_is_read_as_a_sticker_and_reported_to_the_caller(self):
+        result, info, sticker, text = self.peek_sticker({})
+        self.assertEqual(result, (True, MORNING, "早安安"))
+        self.assertEqual(info, {"sticker": True})
+        sticker.assert_called_once()
+        text.assert_not_called()
+
+    def test_the_screen_is_settled_before_the_peek_decides_whether_it_is_a_sticker(self):
+        # 視窗剛被帶到前景，LINE 還在重排；立刻偵測會把還沒畫好的畫面當成「不是貼圖」或判斷不出
+        order = []
+        with mock.patch.object(auto_reply, "find_target_chat_window", return_value=[(CHAT, "小明", "Qt", True)]), \
+             mock.patch.object(auto_reply.win32gui, "IsIconic", return_value=False), \
+             mock.patch.object(auto_reply.win32gui, "GetForegroundWindow", return_value=CHAT), \
+             mock.patch.object(auto_reply, "activate_window"), \
+             mock.patch.object(auto_reply, "_wait_until_chat_settled", side_effect=lambda h: order.append("settle") or True), \
+             mock.patch.object(auto_reply, "is_last_message_from_self_in_chat", return_value=False), \
+             mock.patch.object(auto_reply, "_bottom_sticker", side_effect=lambda h, wait_seconds=0.0: order.append("detect") or (False, None)), \
+             mock.patch.object(auto_reply, "recognize_incoming_text", side_effect=lambda *a, **k: order.append(("text", k.get("settle"))) or (True, MORNING, "早安")), \
+             mock.patch.object(auto_reply, "_minimize_if_configured"):
+            auto_reply._peek_incoming_text("小明", {})
+        # 先等穩定再偵測；偵測完讀文字時不必再等一次 (settle=False)，一般文字問候不多付一次等待
+        self.assertEqual(order, ["settle", "detect", ("text", False)])
+
+    def test_a_bottom_text_message_is_read_as_text(self):
+        result, info, sticker, text = self.peek_sticker({}, bottom=(False, None))
+        self.assertEqual(result, (True, MORNING, "早安"))
+        self.assertEqual(info, {})
+        sticker.assert_not_called()
+        text.assert_called_once()
+
+    def test_when_it_cannot_tell_if_it_is_a_sticker_it_asks_again_later(self):
+        result, info, sticker, text = self.peek_sticker({}, bottom=(None, None))
+        self.assertEqual(result, (None, None, ""))                                        # 稍後重試，不是「不是貼圖」
+        sticker.assert_not_called()
+        text.assert_not_called()
+
+    def test_stickers_are_never_looked_for_when_the_option_is_off_in_a_group_or_in_photo_only_mode(self):
+        for cfg, group in (({"reply_to_sticker_text": False}, False), ({}, True), ({"trigger_mode": "photo_only"}, False)):
+            _, info, sticker, text = self.peek_sticker(cfg, group=group, bottom=(True, None))
+            sticker.assert_not_called()
+            text.assert_called_once()
+            self.assertEqual(info, {}, (cfg, group))
 
     def test_other_text_is_a_no(self):
         self.assertEqual(self.peek(recognized=(False, None, "今天吃什麼"))[0][0], False)
@@ -2042,8 +2486,20 @@ class TestTextWindowWatchInTheLoop(_Base):
         sent, _, _ = self.run_watch(last_reply_ago=40)
         self.assertEqual(len(sent), 1)
 
-    def test_switch_off_means_no_watching(self):
+    def test_photo_only_mode_does_not_watch_the_list_for_stickers(self):
+        # 審查：photo_only (只回照片) 時只開貼圖設定也不用看訊息列表，否則每次列表變化都白跑一次
+        sent, watch, _ = self.run_watch(extra={"trigger_mode": "photo_only", "reply_to_text": False, "birthday_reply": "", "reply_to_sticker_text": True})
+        self.assertEqual(sent, [])
+        watch.assert_not_called()
+
+    def test_the_sticker_option_alone_keeps_the_watching_on(self):
+        # 貼圖不會寫進快取，只能靠這條「視窗列表有變化」的流程偵測：只開 reply_to_sticker_text 也要看
         sent, watch, _ = self.run_watch(extra={"reply_to_text": False, "birthday_reply": ""})
+        self.assertEqual(len(sent), 1)
+        watch.assert_called()
+
+    def test_switch_off_means_no_watching(self):
+        sent, watch, _ = self.run_watch(extra={"reply_to_text": False, "birthday_reply": "", "reply_to_sticker_text": False})
         self.assertEqual(sent, [])
         watch.assert_not_called()
 
@@ -2102,12 +2558,20 @@ class TestTextTrigger(_Base):
         self.assertEqual(self.run_detection(title="小明"), [])                                  # 沒有未讀數
 
     def test_switch_off_keeps_the_old_silence_and_advances_the_baseline(self):
-        self.assertEqual(self.run_detection(config_extra={"reply_to_text": False, "birthday_reply": ""}), [])
+        self.assertEqual(self.run_detection(config_extra={"reply_to_text": False, "birthday_reply": "", "reply_to_sticker_text": False}), [])
         self.assertEqual(auto_reply.LAST_PROCESSED_UNREAD["小明"], 2)                           # 同一則文字不會一直被看
+
+    def test_photo_only_mode_with_only_the_sticker_option_never_triggers_a_text_check(self):
+        extra = {"trigger_mode": "photo_only", "reply_to_text": False, "birthday_reply": "", "reply_to_sticker_text": True}
+        self.assertEqual(self.run_detection(config_extra=extra), [])
+
+    def test_the_sticker_option_alone_is_enough_to_trigger_a_text_check(self):
+        self.assertEqual(len(self.run_detection(config_extra={"reply_to_text": False, "birthday_reply": ""})), 1)
+        self.assertEqual(self.run_detection(config_extra={"reply_to_text": False, "birthday_reply": "", "reply_to_sticker_text": False}), [])
 
     def test_birthday_thanks_alone_is_enough_to_trigger_a_text_check(self):
         self.assertEqual(len(self.run_detection(config_extra={"reply_to_text": False, "birthday_reply": "謝謝"})), 1)
-        self.assertEqual(self.run_detection(config_extra={"reply_to_text": False, "birthday_reply": ""}), [])
+        self.assertEqual(self.run_detection(config_extra={"reply_to_text": False, "birthday_reply": "", "reply_to_sticker_text": False}), [])
 
     def test_without_grandma_recognition_there_is_no_kind_to_match_so_no_text_trigger(self):
         self.assertEqual(self.run_detection(config_extra={"require_grandma_image": False}), [])

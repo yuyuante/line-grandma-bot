@@ -48,7 +48,7 @@ from crawl_images import (crawl_grandma_images, clean_expired_images, retire_ima
                           download_and_validate_image, get_existing_md5s, build_candidate_urls,
                           build_candidates, normalize_sources)
 
-VERSION = "2.13.1"
+VERSION = "2.14.0"
 
 # 0. 全系統單一執行個體鎖 (Windows Named Mutex)，防止重複啟動繞過斷路器
 _app_mutex_handle = None
@@ -253,7 +253,7 @@ STOP_COMMAND_MIN_LEN = 4        # stop_command 去除空白與標點後的最少
 DEFAULT_CONFIG = {
     "targets": [],
     "images_dir": "images",
-    "trigger_mode": "photo_and_sticker", # "photo_and_sticker" (照片與貼圖皆回)、"photo_only" (只回照片) 或 "all" (文字、貼圖與照片皆回)
+    "trigger_mode": "photo_and_sticker", # "photo_and_sticker" (照片與貼圖都會觸發偵測；貼圖要寫著問候字才回，見 reply_to_sticker_text)、"photo_only" (只回照片) 或 "all" (文字、貼圖與照片都會觸發偵測)
     "min_delay_seconds": 5,             # 隨機延遲下限 (秒)
     "max_delay_seconds": 900,           # 隨機延遲上限 (秒，最長 15 分鐘)
     "cooldown_seconds": 30,             # 防洗版冷卻時間 (秒)
@@ -273,6 +273,7 @@ DEFAULT_CONFIG = {
     "image_sources": [],                # 圖庫來源 (網址範本、編號範圍、選填時段類別，見 crawl_images.py)；空白 = 預設的 Formosa 貼圖酷每日問候攝影與插畫
     "require_grandma_image": True,      # 對方傳來的圖要先辨識為長輩圖才回覆；貼圖、生活照、無法辨識的一律不理會
     "reply_to_text": True,              # 對方傳來的「短文字訊息」(例如早安、中秋節快樂) 屬於本專案處理的性質時，也回同性質但不同張的圖 (只限一對一；讀文字要把聊天視窗帶到前景)
+    "reply_to_sticker_text": True,      # 對方傳來的「貼圖」上若寫著短問候或祝福 (例如早安安)，OCR 讀出來也回同性質但不同張的圖；其他貼圖照舊略過 (只限一對一；群組一律不回貼圖)。設定檔「沒寫」這一項時 load_config 會讓它跟著 reply_to_text (關掉文字回覆的人不會被貼圖打擾)；明確寫了就照寫的
     "birthday_reply": "謝謝",           # 一對一收到「生日快樂」的圖或短文字時，只回這句話 (不回圖)；空字串 = 不特別處理，照一般節日圖回覆。群組不適用
     "text_reply_max_chars": 30,         # 文字訊息超過這麼多字 (去掉空白與標點) 就當作一般聊天，不回圖
     "auto_neutral_images": False,       # 【開發中，預設關閉】沒有符合目前時段的圖時，用 OCR 讀得到字、但沒有問候語與節慶字樣的圖代替。實測 OCR 常讀不出藝術字的問候語，開啟會把早安圖誤判成無時段
@@ -500,9 +501,12 @@ def load_config():
                 except Exception:
                     pass
         for k in ("replace_after_send", "collect_incoming_images", "auto_crawl_images", "close_window_after_send", "time_aware_images",
-                  "require_grandma_image", "auto_neutral_images", "auto_open_chat_window", "reply_to_text", "log_to_file"):
+                  "require_grandma_image", "auto_neutral_images", "auto_open_chat_window", "reply_to_text", "reply_to_sticker_text", "log_to_file"):
             if k in cfg and isinstance(cfg[k], bool):
                 sanitized[k] = cfg[k]
+        if not isinstance(cfg.get("reply_to_sticker_text"), bool):
+            # 設定檔沒寫 (或型別錯誤) 時，貼圖跟著文字回覆：原本為了「不想被打擾」把 reply_to_text 關掉的人，升級後視窗不會又被帶到前景
+            sanitized["reply_to_sticker_text"] = sanitized.get("reply_to_text", True)
         if isinstance(cfg.get("birthday_reply"), str):
             sanitized["birthday_reply"] = cfg["birthday_reply"].strip()[:BIRTHDAY_REPLY_MAX_CHARS]
         if isinstance(cfg.get("stop_command"), str) and cfg["stop_command"].strip():
@@ -926,10 +930,46 @@ def _incoming_media_info(chat_hwnd):
 IMAGE_LOAD_WAIT_SECONDS = 8.0   # 圖片縮圖還在載入時 (灰色佔位方塊) 最多等幾秒；等不到變大才當成貼圖或文字
 IMAGE_LOAD_POLL_SECONDS = 1.0
 
+def _read_greeting(crop, max_chars, retry_when_empty=False):
+    """
+    讀裁切圖上的字再分類，回傳 (性質 或 None, 文字)。文字訊息與貼圖共用。
+    先讀原圖 (真機與模擬實測原圖最準，多種前處理反而更差)；讀不出性質時，只有「讀到短字」(可能是小字) 才放大 2 倍再讀一次，
+    已經太長或根本沒字就不必 (retry_when_empty 為 True 時，沒字也再讀：貼圖的字可能小到原圖讀不到)。OCR 丟例外就讓它往上丟。
+    """
+    text = image_library.clean_text(ocr_text(crop))
+    kind = image_kind.classify_message(text, max_chars)
+    length = image_kind.message_length(text)
+    if kind is None and (0 < length <= max_chars or (retry_when_empty and length == 0)):
+        bigger = image_library.clean_text(ocr_text(crop.resize((crop.width * 2, crop.height * 2), Image.LANCZOS)))
+        retry_kind = image_kind.classify_message(bigger, max_chars)
+        if retry_kind is not None:
+            return retry_kind, bigger
+    return kind, text
+
+
+def _recognize_sticker_text(crop, max_chars=image_kind.TEXT_MESSAGE_MAX_CHARS, retry_when_empty=True):
+    """
+    貼圖：讀裁切圖上的字，是短問候或祝福 (例如貼圖上寫著「早安安」) 才算，回傳 (狀態, 性質, 文字)：True、False、
+    None (OCR 暫時不能用：稍後再辨識，不當成「不是問候」)。比照文字訊息的規則 (image_kind.classify_message)：max_chars 字內、
+    競選字不算、生日要有祝賀語才算，所以一般貼圖 (沒字、寫「OK啦」「哈哈哈」之類) 一律不回。
+    裁切圖會連旁邊的時間 (「上午 6:20」) 一起框進來，clean_text 會去掉讀得出的時間；讀歪的時間殘渣不含問候關鍵字，不影響分類。
+    """
+    try:
+        kind, text = _read_greeting(crop, max_chars, retry_when_empty=retry_when_empty)
+    except Exception:
+        return None, None, ""
+    if kind is not None:
+        log_v(f" -> [貼圖文字識別] 貼圖上的字「{text}」，性質：{kind.label}。")
+        return True, kind, text
+    return False, None, text
+
+
 def _recognize_chat_screenshot(chat_hwnd):
     """
     用聊天室截圖辨識最底部左側那張圖，回傳 (狀態, 性質, 文字)：
     狀態 True (辨識得出性質)、False (貼圖，或辨識不出來)、None (暫時無法判斷：截不到圖、OCR 暫時不能用)。
+    這條是「快取出現新圖」的路徑，只會有照片：貼圖不會寫進聊天室的快取目錄 (LINE 把貼圖存在 Data\\Sticker，依貼圖編號存，
+    與聊天室無關；真機實測 2026-11-02)，所以貼圖上的問候字是在文字觸發流程裡讀的 (見 recognize_incoming_text 的 allow_sticker_text)。
     只看一件事：圖片正下方有沒有「儲存｜另存新檔｜分享」那一列連結。照片一定有，貼圖沒有。
     不能看縮圖寬度：真機實測貼圖旁邊的時間戳記會把量到的「內容寬度」撐到 327 (舊規則當成照片)，
     而直幅或小張的照片只有 183 (舊規則當成貼圖)。
@@ -969,8 +1009,7 @@ def recognize_incoming_image(triggered_file, chat_hwnd=None):
         kind, text = _recognize_file(triggered_file)
         return kind is not None, kind, text
     try:
-        if (chat_hwnd is not None and win32gui.IsWindow(chat_hwnd) and not win32gui.IsIconic(chat_hwnd)
-                and win32gui.IsWindowVisible(chat_hwnd) and win32gui.GetForegroundWindow() == chat_hwnd):
+        if _chat_in_front(chat_hwnd):
             return _recognize_chat_screenshot(chat_hwnd)
     except Exception:
         pass
@@ -1037,28 +1076,122 @@ def _incoming_text_crop(chat_hwnd):
         return None
     return shot.crop((left, max(0, top - pad), right, min(shot.height, bottom + pad + 1)))
 
-def recognize_incoming_text(chat_hwnd, max_chars=image_kind.TEXT_MESSAGE_MAX_CHARS):
+def _sticker_text_allowed(config, target_name):
+    """
+    貼圖上寫著短問候或祝福也回：只限一對一 (群組一律只回長輩圖照片)，reply_to_sticker_text 要開著，
+    而且 trigger_mode 不是 photo_only (只回照片)。
+    """
+    return (bool(config.get("reply_to_sticker_text", True)) and not is_group_target(target_name)
+            and config.get("trigger_mode", "photo_and_sticker") != "photo_only")
+
+
+def _text_trigger_enabled(config, target_name):
+    """這位好友的文字、生日「謝謝」、貼圖三種觸發至少開一種 (都關著就不用看他的文字訊息)。"""
+    return bool(config.get("reply_to_text", True) or birthday_reply_text(config) or _sticker_text_allowed(config, target_name))
+
+
+def _chat_in_front(chat_hwnd):
+    """聊天視窗存在、可見、沒最小化、而且在前景 (讀螢幕上的字之前的共同前提)。"""
+    return bool(chat_hwnd is not None and win32gui.IsWindow(chat_hwnd) and not win32gui.IsIconic(chat_hwnd)
+                and win32gui.IsWindowVisible(chat_hwnd) and win32gui.GetForegroundWindow() == chat_hwnd)
+
+
+STICKER_LOAD_RETRY_DELAY = 1.5      # 貼圖讀到一個字都沒有時，可能圖還在載入：等這麼久再截圖讀一次 (只再讀一次)
+STICKER_LOAD_WAIT_SECONDS = 4.0     # 判斷「是貼圖還是還在載入的照片」時，最多等這麼久看「另存新檔」那一列有沒有出現 (照片載入完成才有)
+
+
+def _bottom_sticker(chat_hwnd, wait_seconds=0.0):
+    """
+    最底部左側 (對方) 那一則是不是貼圖，回傳 (狀態, 裁切圖)：True (是貼圖，附裁切圖)、False (不是)、None (暫時判斷不出，稍後再說)。
+    貼圖的條件：不是文字氣泡 (last_left_message_is_media 為 True)，而且圖片正下方沒有「儲存｜另存新檔｜分享」那一列連結 (照片才有)。
+    照片還在載入時 (灰色小方塊) 也沒有那一列，會被誤當成貼圖，所以 wait_seconds 大於 0 時，沒看到那一列會每秒重看、最多等這麼久，
+    等到那一列出現就是照片 (交給快取路徑，不能在這裡回覆)。貼圖永遠不會有那一列，所以只有真的貼圖會等滿。
+    暫時性的失敗 (截不到圖、判斷不出、例外) 回傳 None，不能當成「不是貼圖」而永久略過；例外會留一行紀錄。
+    """
+    try:
+        media = last_left_message_is_media(chat_hwnd)
+        if media is None:
+            return None, None
+        if media is False:
+            return False, None
+        info = _incoming_media_info(chat_hwnd)
+        if info is None:
+            return None, None
+        deadline = time.time() + wait_seconds
+        while not info[2] and time.time() < deadline:
+            time.sleep(IMAGE_LOAD_POLL_SECONDS)
+            info = _incoming_media_info(chat_hwnd)
+            if info is None:
+                return None, None               # 等的時候圖片不見了 (被新訊息推走)：稍後再說
+        if info[2]:
+            return False, None                  # 有「另存新檔」那一列：照片，交給快取路徑
+        return True, info[0]
+    except Exception as e:
+        log_v(f" -> [貼圖偵測] 暫時判斷不出最底部是不是貼圖：{e}")
+        return None, None
+
+
+_TIME_RESIDUE = re.compile(r"""[上下午時0-9:：\sA-Za-z.,;'"|!?_\-]""")
+
+
+def _nothing_readable(text):
+    """
+    OCR 讀到的字去掉「讀歪的時間殘渣」(上、下、午、數字、冒號、英文字母與符號) 之後還剩不剩東西。
+    貼圖的裁切圖一定把旁邊的「上午 6:20」框進來，clean_text 只去得掉讀對的時間；讀歪的 (例如「E午620」) 會留下來，
+    所以光看「字串是不是空的」，沒字或還沒載入的貼圖幾乎都不會被判成沒字。
+    """
+    return not _TIME_RESIDUE.sub("", text or "")
+
+
+def recognize_incoming_sticker(chat_hwnd, max_chars=image_kind.TEXT_MESSAGE_MAX_CHARS, first_crop=None):
+    """
+    讀最底部那張貼圖上的字，回傳 (狀態, 性質, 文字)，同 recognize_incoming_text。只在視窗是前景時截圖。
+    first_crop 是呼叫端剛偵測到的貼圖裁切圖 (「看一眼」剛等過畫面穩定、偵測過，不必再來一次)，給了就直接拿來讀第一次。
+    一次取得貼圖的裁切圖就用同一張讀 (不會中途變成讀文字氣泡)；最底部已經不是貼圖，或暫時判斷不出，回傳 None (稍後再說)。
+    第一次讀不出問候、而且「去掉時間殘渣後沒有任何字」時，貼圖可能還在載入：等 STICKER_LOAD_RETRY_DELAY 秒、重新等畫面穩定、
+    重新截圖偵測，再讀一次 (這次沒字也放大 2 倍讀)。其餘情形 (讀到字但不是問候) 就是一般貼圖，不再讀第二次。
+    貼圖不會寫進聊天室的快取目錄，所以是靠「視窗列表有變化」的文字觸發流程偵測的。
+    """
+    try:
+        if not _chat_in_front(chat_hwnd):
+            return None, None, ""
+        crop = first_crop
+        if crop is None:
+            _wait_until_chat_settled(chat_hwnd)
+            state, crop = _bottom_sticker(chat_hwnd)
+            if state is not True:
+                return None, None, ""
+        # 第一步：沒字不放大 (放大留給等一下重新截圖的第二步，免得同一個沒字的貼圖連讀四次)
+        first = _recognize_sticker_text(crop, max_chars, retry_when_empty=False)
+        if first[0] is not False or not _nothing_readable(first[2]):
+            return first
+        # 第二步：什麼都沒讀到，等一下重新截圖再讀一次
+        time.sleep(STICKER_LOAD_RETRY_DELAY)
+        _wait_until_chat_settled(chat_hwnd)
+        state, crop = _bottom_sticker(chat_hwnd)
+        if state is not True:
+            return None, None, ""
+        return _recognize_sticker_text(crop, max_chars, retry_when_empty=True)
+    except Exception as e:
+        log_v(f" -> [貼圖偵測] 讀取貼圖時發生例外：{e}")
+        return None, None, ""
+
+
+def recognize_incoming_text(chat_hwnd, max_chars=image_kind.TEXT_MESSAGE_MAX_CHARS, settle=True):
     """
     讀對方傳來的最後一則文字訊息，回傳 (狀態, 性質, 文字)：True (短訊息且辨識得出性質)、
     False (太長、不是問候或祝福、競選相關、讀不到字)、None (暫時無法判斷：視窗不在前景、截圖失敗、OCR 暫時不能用)。
     只在視窗是前景時截圖 (視窗被別的視窗蓋住時截到的是別人的畫面)。
     """
     try:
-        if not (chat_hwnd is not None and win32gui.IsWindow(chat_hwnd) and not win32gui.IsIconic(chat_hwnd)
-                and win32gui.IsWindowVisible(chat_hwnd) and win32gui.GetForegroundWindow() == chat_hwnd):
+        if not _chat_in_front(chat_hwnd):
             return None, None, ""
-        _wait_until_chat_settled(chat_hwnd)              # 視窗剛還原後 LINE 還在重排，立刻讀會讀錯
+        if settle:
+            _wait_until_chat_settled(chat_hwnd)          # 視窗剛還原後 LINE 還在重排，立刻讀會讀錯 (呼叫端剛等過就傳 settle=False)
         crop = _incoming_text_crop(chat_hwnd)
         if crop is None:
             return None, None, ""
-        text = image_library.clean_text(ocr_text(crop))
-        kind = image_kind.classify_message(text, max_chars)
-        if kind is None and 0 < image_kind.message_length(text) <= max_chars:
-            # 小字：放大一倍再讀一次 (只有短訊息才值得再讀；已經太長或根本沒字就不必)
-            bigger = image_library.clean_text(ocr_text(crop.resize((crop.width * 2, crop.height * 2), Image.LANCZOS)))
-            retry_kind = image_kind.classify_message(bigger, max_chars)
-            if retry_kind is not None:
-                text, kind = bigger, retry_kind
+        kind, text = _read_greeting(crop, max_chars)
     except Exception:
         return None, None, ""
     return kind is not None, kind, text
@@ -3817,11 +3950,12 @@ def choose_reply_image(target_name, incoming_kind, incoming_text, config):
         library = image_library.scan_library(abs_dir, KIND_INDEX, log=log_v)     # 抓的過程中留下的庫存，下一個池子可能用得到
     return None
 
-def _peek_incoming_text(target_name, config):
+def _peek_incoming_text(target_name, config, info=None):
     """
-    文字觸發時，在「隨機等待」之前先把視窗帶到前景看一眼最後一則文字是不是短問候或祝福，看完馬上縮回去。
+    文字觸發時，在「隨機等待」之前先把視窗帶到前景看一眼最後一則是不是短問候或祝福 (文字，或一對一的貼圖)，看完馬上縮回去。
     不是就不用睡 5~900 秒 (主迴圈是單執行緒，睡著時其他好友都被擋住)，也不必往下走。
     回傳 (狀態, 性質, 文字)，同 recognize_incoming_text：True / False / None (暫時看不到，稍後重試)。
+    info 是字典時，最底部是貼圖就寫入 info["sticker"] = True，呼叫端要靠它判斷接下來該不該回 (文字與貼圖各有各的開關)。
     """
     matched = find_target_chat_window(target_name)
     if not matched:
@@ -3837,7 +3971,19 @@ def _peek_incoming_text(target_name, config):
             return None, None, ""
         if is_last_message_from_self_in_chat(hwnd):
             return False, None, ""                      # 最底部是自己發的：沒有新訊息要回
-        return recognize_incoming_text(hwnd, config.get("text_reply_max_chars", image_kind.TEXT_MESSAGE_MAX_CHARS))
+        max_chars = config.get("text_reply_max_chars", image_kind.TEXT_MESSAGE_MAX_CHARS)
+        settled = False
+        if _sticker_text_allowed(config, target_name):
+            _wait_until_chat_settled(hwnd)
+            settled = True
+            sticker_state, sticker_crop = _bottom_sticker(hwnd, wait_seconds=STICKER_LOAD_WAIT_SECONDS)
+            if sticker_state is None:
+                return None, None, ""                   # 暫時看不清楚 (不是「不是貼圖」)：稍後重試
+            if sticker_state:
+                if info is not None:
+                    info["sticker"] = True
+                return recognize_incoming_sticker(hwnd, max_chars, first_crop=sticker_crop)    # 剛偵測過的裁切圖直接拿去讀，不再等一次、偵測一次
+        return recognize_incoming_text(hwnd, max_chars, settle=not settled)
     finally:
         _minimize_if_configured(hwnd, config)
 
@@ -3861,7 +4007,11 @@ def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_f
     reply_text = None                               # 要回的是一句文字 (生日快樂 -> 謝謝)，不是圖
     thanks_text = birthday_reply_text(config, target_name)
     thanks_enabled = bool(thanks_text)
-    if text_trigger and (config.get("reply_to_text", True) or thanks_enabled) and config.get("require_grandma_image", True) and not is_group_target(target_name):
+    # 貼圖上寫著短問候或祝福也回：只限一對一 (群組一律只回長輩圖照片)；字數上限與文字訊息共用 text_reply_max_chars
+    sticker_text_ok = _sticker_text_allowed(config, target_name)
+    text_max_chars = config.get("text_reply_max_chars", image_kind.TEXT_MESSAGE_MAX_CHARS)
+    incoming_is_sticker = False
+    if text_trigger and (config.get("reply_to_text", True) or thanks_enabled or sticker_text_ok) and config.get("require_grandma_image", True) and not is_group_target(target_name):
         deferred_text = deferred_identify = True      # 文字訊息：讀字要視窗在前景，等視窗帶到前景再辨識 (群組不適用)
     elif config.get("require_grandma_image", True) or is_group_target(target_name):     # 群組一律要先辨識出是長輩圖才回 (貼圖、生活照、辨識不出的不理會)
         early = find_target_chat_window(target_name)
@@ -3877,12 +4027,21 @@ def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_f
         incoming_kind = image_kind.ImageKind("greeting")     # 關閉識別：不管對方傳什麼，一律照現在時段回問候圖 (舊行為)
 
     if deferred_text:
-        peek_state, _peek_kind, _peek_text = _peek_incoming_text(target_name, config)
+        peek_info = {}
+        peek_state, _peek_kind, _peek_text = _peek_incoming_text(target_name, config, peek_info)
         if peek_state is None:
             log_v(f"[文字識別待確認]「{target_name}」暫時看不到最後一則文字，本次不處理，稍後重試。")
             return "NOT_SENT"
         if not peek_state:
-            log_v(f"[文字訊息略過]「{target_name}」最後一則文字不是短問候或祝福 (太長、不是問候、競選相關或讀不到字)，不回覆。")
+            if peek_info.get("sticker"):
+                log_v(f"[貼圖略過]「{target_name}」傳來的貼圖上沒有短問候或祝福 (沒字、字不是問候、太長或競選相關)，不回覆。")
+            else:
+                log_v(f"[文字訊息略過]「{target_name}」最後一則文字不是短問候或祝福 (太長、不是問候、競選相關或讀不到字)，不回覆。")
+            return "SKIPPED_TEXT"
+        if (not peek_info.get("sticker") and not config.get("reply_to_text", True)
+                and not (thanks_enabled and image_kind.is_birthday(_peek_kind) and image_kind.is_birthday_wish(_peek_text))):
+            # 文字回覆關著、而且不是會回「謝謝」的生日祝賀：之後一定是略過，不要先睡 5~900 秒才略過 (只開貼圖設定時文字問候會走到這裡)
+            log_v(f"[文字訊息略過]「{target_name}」傳來的文字不是生日祝福，而且 reply_to_text 已關閉，不回覆。")
             return "SKIPPED_TEXT"
 
     # 借花獻佛：僅精確收納本次觸發該回覆的圖片，絕不掃描其他聊天室快取
@@ -3978,10 +4137,19 @@ def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_f
             _minimize_if_configured(chat_hwnd, config)
             return "NOT_SENT"
         if deferred_text and is_media:
-            # 被「文字」觸發，但最底部其實是圖片或貼圖：那是圖片快取路徑的事，這裡不當文字處理
-            log_v(f"[文字訊息略過]「{target_name}」最後一則訊息是圖片或貼圖，不是文字。")
-            _minimize_if_configured(chat_hwnd, config)
-            return "SKIPPED_TEXT"
+            sticker_state = _bottom_sticker(chat_hwnd)[0] if sticker_text_ok else False
+            if sticker_state is None:
+                # 貼圖設定開著，但暫時分不出是貼圖還是照片：不能當成「不是貼圖」而永久略過
+                log_v(f"[貼圖待確認]「{target_name}」暫時分不出最後一則是貼圖還是照片，本次不發送，稍後重試。")
+                _minimize_if_configured(chat_hwnd, config)
+                return "NOT_SENT"
+            if sticker_state:
+                incoming_is_sticker = True          # 貼圖：下面讀貼圖上的字，是問候才回 (貼圖不走快取路徑，只能在這裡處理)
+            else:
+                # 被「文字」觸發，但最底部其實是圖片 (或貼圖而且 reply_to_sticker_text 關著)：圖片是快取路徑的事，這裡不當文字處理
+                log_v(f"[文字訊息略過]「{target_name}」最後一則訊息是圖片或貼圖，不是文字。")
+                _minimize_if_configured(chat_hwnd, config)
+                return "SKIPPED_TEXT"
         if not is_media and not deferred_text:
             log_v(f"[文字訊息略過]「{target_name}」最後一則訊息為文字，不需回應。")
             _minimize_if_configured(chat_hwnd, config)
@@ -3989,20 +4157,29 @@ def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_f
 
     # 延後的識別：視窗此時已在前景，用截圖辨識對方那張圖的性質 (Fail-Closed)，再挑回覆圖
     if deferred_text:
-        state, incoming_kind, incoming_text = recognize_incoming_text(chat_hwnd, config.get("text_reply_max_chars", image_kind.TEXT_MESSAGE_MAX_CHARS))
+        if incoming_is_sticker:
+            state, incoming_kind, incoming_text = recognize_incoming_sticker(chat_hwnd, text_max_chars)
+        else:
+            state, incoming_kind, incoming_text = recognize_incoming_text(chat_hwnd, text_max_chars)
         if state is None:
-            log_v(f"[文字識別待確認]「{target_name}」暫時無法讀取對方傳來的文字，本次不發送，稍後重試。")
+            log_v(f"[文字識別待確認]「{target_name}」暫時無法讀取對方傳來的{'貼圖' if incoming_is_sticker else '文字'}，本次不發送，稍後重試。")
             _minimize_if_configured(chat_hwnd, config)
             return "NOT_SENT"
         if not state:
-            log_v(f"[文字訊息略過]「{target_name}」最後一則文字不是短問候或祝福 (太長、不是問候、競選相關或讀不到字)，不回覆。")
+            if incoming_is_sticker:
+                log_v(f"[貼圖略過]「{target_name}」傳來的貼圖上沒有短問候或祝福 (沒字、字不是問候、太長或競選相關)，不回覆。")
+            else:
+                log_v(f"[文字訊息略過]「{target_name}」最後一則文字不是短問候或祝福 (太長、不是問候、競選相關或讀不到字)，不回覆。")
             _minimize_if_configured(chat_hwnd, config)
             return "SKIPPED_TEXT"
-        log_v(f" -> [文字識別]「{target_name}」傳來的文字通過識別，性質：{incoming_kind.label}。")
+        if incoming_is_sticker:
+            log_v(f" -> [貼圖識別]「{target_name}」傳來的貼圖寫著問候或祝福，性質：{incoming_kind.label}。")
+        else:
+            log_v(f" -> [文字識別]「{target_name}」傳來的文字通過識別，性質：{incoming_kind.label}。")
         if thanks_enabled and image_kind.is_birthday(incoming_kind) and image_kind.is_birthday_wish(incoming_text):
             reply_text = thanks_text
             log_v(f" -> 對方傳來的是生日祝福，只回一句「{reply_text}」，不回圖。")
-        elif not config.get("reply_to_text", True):
+        elif not config.get("reply_to_text", True) and not incoming_is_sticker:
             log_v(f"[文字訊息略過]「{target_name}」傳來的文字不是生日祝福，而且 reply_to_text 已關閉，不回覆。")
             _minimize_if_configured(chat_hwnd, config)
             return "SKIPPED_TEXT"
@@ -4246,7 +4423,7 @@ def check_for_incoming_messages(config):
                                 log_v(f" -> [文字訊息觸發]「{target}」未讀數增加 (all 模式)，準備自動回覆！")
                                 target_to_reply = target
                                 break
-                        elif (config.get("reply_to_text", True) or birthday_reply_text(config)) and config.get("require_grandma_image", True):
+                        elif _text_trigger_enabled(config, target) and config.get("require_grandma_image", True):
                             # 文字訊息沒有快取檔，只能靠未讀數增加；內容要等視窗帶到前景才讀得到，是不是問候由送出流程判斷
                             if current_time - last_time >= cooldown and current_time - LAST_SENT_TIME_BY_TARGET.get(target, 0) >= 5:
                                 log_v(f" -> [文字訊息觸發]「{target}」未讀數增加且沒有新的圖片或貼圖，準備讀取最後一則文字！")
@@ -4271,10 +4448,12 @@ def check_for_incoming_messages(config):
             break
 
     # 1b. 文字訊息：視窗展開、放在背景時看訊息列表有沒有變化 (標題沒有未讀數的 LINE 版本只能這樣偵測)
-    if not target_to_reply and (config.get("reply_to_text", True) or birthday_reply_text(config)) and config.get("require_grandma_image", True):
+    if not target_to_reply and config.get("require_grandma_image", True):
         for target in targets:
             if is_group_target(target):
                 continue
+            if not _text_trigger_enabled(config, target):
+                continue                               # 這位好友的文字、生日「謝謝」、貼圖都不回：不用看他的訊息列表
             try:
                 changed = text_window_changed(windows, target, config)
             except Exception as e:
@@ -4953,7 +5132,7 @@ def main():
     banner_print(f"程式版本 (version)       : v{VERSION}")
     banner_print(f"監控對象名單 (targets)   : {config.get('targets', [])}")
     t_mode = config.get('trigger_mode', 'photo_and_sticker')
-    mode_desc = "照片與貼圖皆回" if t_mode == "photo_and_sticker" else ("只回照片" if t_mode == "photo_only" else "文字照片貼圖皆回")
+    mode_desc = "照片與貼圖都會觸發偵測，貼圖要有問候字才回" if t_mode == "photo_and_sticker" else ("只回照片" if t_mode == "photo_only" else "文字照片貼圖都會觸發偵測")
     banner_print(f"觸發模式 (trigger_mode)  : {t_mode} ({mode_desc})")
     banner_print(f"隨機延遲範圍 (delay)     : {config.get('min_delay_seconds', 5)} ~ {config.get('max_delay_seconds', 900)} 秒")
     banner_print(f"每位聯絡人記憶輪數       : {config.get('history_rounds', 100)} 輪 (不重複發送或回送對方發過的圖)")
@@ -4963,6 +5142,7 @@ def main():
     banner_print(f"防洗版冷卻 (cooldown)    : {config.get('cooldown_seconds', 30)} 秒")
     banner_print(f"紀錄檔 (log_to_file)     : {'開 (logs/，保留 ' + str(config.get('log_keep_days', 7)) + ' 天)' if config.get('log_to_file', True) else '關'}")
     banner_print(f"文字訊息回圖 (reply_to_text): {'開 (一對一、' + str(config.get('text_reply_max_chars', 30)) + ' 字內)' if config.get('reply_to_text', True) else '關'}")
+    banner_print(f"貼圖問候字 (reply_to_sticker_text): {'開 (一對一；貼圖上的字是問候或祝福才回，其餘貼圖略過)' if config.get('reply_to_sticker_text', True) else '關 (貼圖一律略過)'}")
     banner_print(f"回覆後安全最小化         : {config.get('close_window_after_send', True)}")
     stop_chats = config.get("stop_command_chats", [])
     banner_print(f"停止指令                 : {'在 ' + '、'.join(stop_chats) + ' 聊天室自己發「' + config.get('stop_command', '') + '」' if stop_chats else '未啟用'}")
