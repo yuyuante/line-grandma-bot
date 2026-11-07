@@ -50,7 +50,7 @@ from crawl_images import (crawl_grandma_images, clean_expired_images, retire_ima
                           download_and_validate_image, get_existing_md5s, build_candidate_urls,
                           build_candidates, normalize_sources)
 
-VERSION = "2.15.0"
+VERSION = "2.16.0"
 
 # 0. 全系統單一執行個體鎖 (Windows Named Mutex)，防止重複啟動繞過斷路器
 _app_mutex_handle = None
@@ -3494,6 +3494,60 @@ _STOP_SEEN_SIG = {}             # {聊天室: 視窗展開時最後一次記下�
 class StopRequested(BaseException):
     """收到遠端停止指令。繼承 BaseException，避免被監聽迴圈的 except Exception 吞掉"""
 
+
+class AutoStopReached(StopRequested):
+    """已回覆到啟動時指定的則數：走跟遠端停止一樣的收尾流程，結束後讓電腦睡眠"""
+
+_AUTO_STOP = {"limit": 0, "replies": 0}      # limit 0 = 不啟用；replies = 這次執行已實際送出的回覆數 (圖片與文字都算)
+DEFAULT_STOP_AFTER = 1
+SLEEP_GRACE_SECONDS = 3.0                    # 睡眠前多等一下，讓最後的通知與備援訊息送完
+
+def resolve_stop_after(arg_value, interactive, ask=input):
+    """
+    啟動時要在回覆幾則後自動關閉並讓電腦睡眠。命令列給了數字就用它 (0 = 不啟用)；沒給且有主控台就詢問 (直接 Enter = 1)；
+    沒有主控台 (不顯示視窗的啟動) 沒給就不啟用。輸入不是非負整數時重問。
+    """
+    if arg_value is not None:
+        return max(0, arg_value)
+    if not interactive:
+        return 0
+    while True:
+        try:
+            text = ask(f"回覆幾則圖片或訊息後自動關閉機器人並讓電腦睡眠？(Enter = {DEFAULT_STOP_AFTER}，0 = 不自動關閉): ").strip()
+        except EOFError:
+            return 0
+        except KeyboardInterrupt:
+            print("
+已取消，程式未啟動。")
+            sys.exit(0)
+        if not text:
+            return DEFAULT_STOP_AFTER
+        try:
+            if int(text) >= 0:
+                return int(text)
+        except ValueError:                           # 含 "²" 這類 isdigit() 為真但 int() 轉不了的字元
+            pass
+        print("請輸入 0 或正整數。")
+
+def note_reply_for_auto_stop():
+    with _state_lock:
+        _AUTO_STOP["replies"] += 1
+
+def check_auto_stop():
+    """主迴圈每輪呼叫：回覆數到了指定則數就丟出 AutoStopReached (此時上一則回覆已完整收尾，視窗也處理完了)"""
+    limit = _AUTO_STOP["limit"]
+    if limit and _AUTO_STOP["replies"] >= limit:
+        raise AutoStopReached(f"已回覆 {_AUTO_STOP['replies']} 則，依啟動時的設定自動關閉並讓電腦睡眠")
+
+def suspend_computer():
+    """讓電腦進入睡眠 (不是休眠)。成功時這個呼叫會在喚醒後才回來；失敗只記一行，不影響結束"""
+    try:
+        import ctypes
+        if not ctypes.windll.powrprof.SetSuspendState(False, False, False):
+            log_v("[自動關閉] 讓電腦睡眠失敗 (系統回報不成功)。")
+    except Exception as e:
+        log_v(f"[自動關閉] 讓電腦睡眠失敗: {e}")
+
 def text_matches_stop_command(text, phrase):
     """去除空白與標點後，訊息含指令全文，或整句與指令高度相似 (容許 OCR 認錯一字) 即成立"""
     t = re.sub(r"[\W_]+", "", text or "")
@@ -3970,6 +4024,7 @@ def _record_reply(target_name):
     """記下一次實際送出的回覆：冷卻、斷路器用的記帳，加上每日上限的計數"""
     record_reply_sent(target_name)
     reply_budget.record_reply(REPLY_COUNTS_PATH, target_name)
+    note_reply_for_auto_stop()
 
 def _forbidden_md5s(target_name, config):
     """百輪內不能再送給該對象的圖的 MD5 集合 (曾送出的加上對方曾傳來的)"""
@@ -5174,6 +5229,7 @@ def main():
     parser.add_argument("--tag-image", nargs=2, metavar=("FILE", "SLOT"), help="手動標記圖片時段：morning、noon、evening 或 neutral (無時段字樣，任何時段皆可用)")
     parser.add_argument("--fill-pool", nargs="?", const=30, type=int, metavar="TOTAL", help="把圖庫補到指定張數 (預設 30)：已標記 neutral 的圖先計入，其餘名額由早安、午安、晚安平均分配")
     parser.add_argument("--crawl", type=int, metavar="COUNT", help="立刻上網抓取指定數量的長輩圖儲存備用 (例如: --crawl 20)")
+    parser.add_argument("--stop-after", type=int, metavar="N", help="回覆 N 則圖片或訊息後自動關閉機器人並讓電腦睡眠 (0 = 不啟用；沒給時在主控台詢問，直接 Enter = 1，沒有主控台就不啟用)")
     parser.add_argument("--list-images", action="store_true", help="列出目前讀取到的長輩圖清單")
     parser.add_argument("--clear-history", action="store_true", help="清空已發送長輩圖的歷史記錄")
     parser.add_argument("--scan-windows", action="store_true", help="掃描並印出目前桌面所有的 LINE 視窗資訊")
@@ -5418,11 +5474,14 @@ def main():
         log_v(f"手動測試結果: {result}")
         return
 
+    _AUTO_STOP["limit"] = resolve_stop_after(args.stop_after, sys.stdin is not None and sys.stdin.isatty())
     configure_file_log(config)        # 先打開檔案紀錄，橫幅也要寫進去
     banner_print("=" * 65)
     banner_print(f"  LINE 電腦版 - 長輩圖智慧自動回覆程式 v{VERSION} (常駐背景)")
     banner_print("=" * 65)
     banner_print(f"程式版本 (version)       : v{VERSION}")
+    if _AUTO_STOP["limit"]:
+        banner_print(f"自動關閉                 : 回覆 {_AUTO_STOP['limit']} 則後關閉機器人並讓電腦睡眠")
     banner_print(f"監控對象名單 (targets)   : {config.get('targets', [])}")
     t_mode = config.get('trigger_mode', 'photo_and_sticker')
     mode_desc = "照片與貼圖都會觸發偵測，貼圖要有問候字才回" if t_mode == "photo_and_sticker" else ("只回照片" if t_mode == "photo_only" else "文字照片貼圖都會觸發偵測")
@@ -5470,6 +5529,7 @@ def main():
 
     try:
         while True:
+            check_auto_stop()
             try:
                 config = load_config()
                 configure_notifier(config)
@@ -5521,6 +5581,9 @@ def main():
         notifier.notify(f"🔴 長輩圖機器人已停止：{e}")
         notifier.flush()
         flush_fallback_notices_at_exit(config)
+        if isinstance(e, AutoStopReached):
+            time.sleep(SLEEP_GRACE_SECONDS)
+            suspend_computer()
         sys.exit(STOP_EXIT_CODE)
 
 if __name__ == "__main__":

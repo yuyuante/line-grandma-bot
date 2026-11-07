@@ -1,6 +1,6 @@
 # LINE 長輩圖智慧自動回覆機器人 (line-grandma-bot)
 
-[![Version](https://img.shields.io/badge/version-2.15.0-blue.svg)](auto_reply.py)
+[![Version](https://img.shields.io/badge/version-2.16.0-blue.svg)](auto_reply.py)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D6.svg)](https://microsoft.com)
 [![Python](https://img.shields.io/badge/python-3.10%2B-green.svg)](https://python.org)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey.svg)](LICENSE)
@@ -50,7 +50,7 @@ line-grandma-bot/
 ├── image_library.py     # 圖庫性質索引、挑圖規則、沒庫存時立即上網抓圖
 ├── reply_budget.py      # 每個聊天室每天的回覆次數上限
 ├── view_binder.py       # 自動開窗、點照片、確認快取頻道後綁定 (--bind-view 的自動版)
-├── auto_reply.py        # 核心自動回覆常駐程式 (v2.15.0)
+├── auto_reply.py        # 核心自動回覆常駐程式 (v2.16.0)
 ├── crawl_images.py      # 台塑貼圖酷長輩圖抓取與過期清理模組
 ├── config.example.json  # 設定檔範本
 ├── config.json          # 個人實際設定檔 (已列入 .gitignore 保護隱私)
@@ -318,6 +318,14 @@ python auto_reply.py --unbind "媽媽"
 ---
 
 ## 📝 版本異動紀錄 (Changelog)
+
+### [v2.16.0] - 2026-11-07
+#### 回覆指定則數後自動關閉並讓電腦睡眠
+- **新增**：啟動時可選擇「回覆幾則圖片或訊息後自動關閉機器人，並讓電腦進入睡眠」。用 `run_auto_reply.bat` 啟動時主控台會詢問，直接 Enter = **1 則**，輸入 `0` = 不自動關閉；也可用命令列 `python auto_reply.py --stop-after N` 直接指定（`0` = 不啟用，不再詢問）。
+- **計算方式**：這次執行實際送出的回覆都算（一對一與群組、圖片與文字）；沒送出的（略過、重試中）不算。
+- **收尾**：到達則數後走跟遠端停止指令一樣的流程（寫入「已停止」通知、送出備援訊息），再等 3 秒讓電腦進入睡眠（是睡眠，不是休眠），結束碼 3，批次檔視窗會自動關閉。
+- **不顯示視窗的啟動**（`run_auto_reply_hidden.vbs`）沒有主控台可以詢問，固定帶 `--stop-after 0`（不啟用）；要啟用請改寫成 `--stop-after N`。
+- **沒有指定時**（沒帶參數又沒有主控台）一律不啟用，機器人照舊常駐。
 
 ### [v2.15.0] - 2026-11-04
 #### 未綁定的好友與群組：偵測到新圖時，自動開窗、點圖、綁定，綁完把視窗放回去
