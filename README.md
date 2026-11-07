@@ -58,6 +58,7 @@ line-grandma-bot/
 ├── chat_dirs.json       # LINE 聊天室快取雜湊對應檔 (已列入 .gitignore)
 ├── circuit_breaker.json # 斷路器與時間窗持久化狀態檔 (已列入 .gitignore)
 ├── run_auto_reply.bat   # Windows 一鍵啟動批次檔
+├── run_auto_reply_hidden.vbs  # 不顯示視窗的啟動方式 (雙擊即在背景常駐；要停就用遠端停止指令，或在工作管理員結束 python.exe)
 ├── requirements.txt     # Python 相依套件清單
 ├── LICENSE              # MIT 開源授權協議
 ├── README.md            # 本專案說明文件
@@ -236,7 +237,7 @@ copy config.example.json config.json
 
 ## 💻 常用執行指令
 
-### 一鍵啟動（最推薦）
+### 一鍵啟動（最推薦） 想完全不顯示視窗，改雙擊 **`run_auto_reply_hidden.vbs`**（紀錄照樣寫在 `logs/`；停止請用遠端停止指令，或在工作管理員結束執行 `auto_reply.py` 的 python.exe）。
 直接雙擊執行目錄下的 **`run_auto_reply.bat`** 即可在背景常駐監聽。
 
 ### 命令列常用指令
