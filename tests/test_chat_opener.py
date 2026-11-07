@@ -215,8 +215,8 @@ class TestOpenChatWindow(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(ui.events, [])                                                  # 不碰主視窗
 
-    def test_happy_path_in_the_current_tab_never_switches_tabs(self):
-        ui = FakeUi()
+    def test_happy_path_when_already_on_the_all_tab_never_switches_tabs(self):
+        ui = FakeUi(tab=0)
         ok, _ = run(ui, [ECHO, RESULT_LOW, RESULT_TOP, ("別人", (200, 300))])
         self.assertTrue(ok)
         self.assertEqual(ui.events, [
@@ -224,6 +224,20 @@ class TestOpenChatWindow(unittest.TestCase):
             ("set_search_text", "Notify Bot"), ("screenshot",),
             ("double_click", 100 + 267, 50 + 225),                                       # 最上面那一列；搜尋欄裡的回聲文字不算
             ("clear_search",)])                                                          # 最後一定清掉搜尋欄
+
+    def test_always_searches_in_the_all_tab_and_restores_the_users_tab(self):
+        # 真機：主視窗停在別的分頁 (第 8 個) 時，在那個分頁找得到列、雙擊卻不開視窗；所以不論當前分頁找不找得到，一律先切到「全部」
+        ui = FakeUi(tab=8)
+        ok, _ = run(ui, [ECHO, RESULT_TOP])
+        self.assertTrue(ok)
+        self.assertEqual(ui.events, [
+            ("bring_to_front", MAIN),
+            ("ensure_wide",), ("select_tab", 0),
+            ("set_search_text", ""), ("set_search_text", "Notify Bot"), ("screenshot",),     # 切分頁後先清搜尋欄再打名稱
+            ("double_click", 100 + 267, 50 + 225),
+            ("clear_search",), ("bring_to_front", MAIN),
+            ("ensure_wide",), ("select_tab", 8)])
+        self.assertEqual(ui.tab, 8)                                                      # 使用者原本的分頁還原
 
     def test_the_echo_of_the_search_text_is_never_double_clicked(self):
         # 真機實測的錯誤：搜尋欄自己的字被當成結果，雙擊到搜尋欄
@@ -233,18 +247,12 @@ class TestOpenChatWindow(unittest.TestCase):
         self.assertNotIn("double_click", ui.names())
         self.assertTrue(any("完全相符" in l for l in logs))
 
-    def test_not_found_in_the_current_tab_switches_to_all_then_restores_the_users_tab(self):
+    def test_a_row_that_only_exists_in_another_tab_is_never_used(self):
+        # 其他分頁的畫面 (截圖) 有符合的列，但我們在「全部」搜尋，看的是「全部」的畫面
         ui = FakeUi(tab=1)
-        ok, logs = run(ui, {1: [ECHO], 0: [ECHO, RESULT_TOP]})
-        self.assertTrue(ok)
-        self.assertEqual(ui.events, [
-            ("bring_to_front", MAIN),
-            ("set_search_text", "Notify Bot"), ("screenshot",),
-            ("ensure_wide",), ("select_tab", 0),
-            ("set_search_text", ""), ("set_search_text", "Notify Bot"), ("screenshot",),
-            ("double_click", 100 + 267, 50 + 225),
-            ("clear_search",), ("bring_to_front", MAIN),                                  # 使用者原本的分頁要切回去 (先把主視窗帶回前景)
-            ("ensure_wide",), ("select_tab", 1)])
+        ok, _ = run(ui, {1: [ECHO, RESULT_TOP], 0: [ECHO]})
+        self.assertFalse(ok)
+        self.assertNotIn("double_click", ui.names())
         self.assertEqual(ui.tab, 1)
 
     def test_not_found_while_already_on_the_all_tab_gives_up_without_switching(self):
@@ -261,15 +269,27 @@ class TestOpenChatWindow(unittest.TestCase):
 
     def test_tab_switch_failure_gives_up_and_does_not_click(self):
         ui = FakeUi(tab=1, can_select=False)
-        ok, logs = run(ui, {1: [ECHO], 0: [ECHO, RESULT_TOP]})
+        ok, logs = run(ui, {0: [ECHO, RESULT_TOP]})
         self.assertFalse(ok)
         self.assertNotIn("double_click", ui.names())
         self.assertEqual(ui.names().count("select_tab"), 2)                               # 切換 + 還原：點擊可能已經切過去、只是驗證失敗，所以一定要切回去
         self.assertTrue(any("全部" in l for l in logs))
 
+    def test_a_failed_restore_of_the_users_tab_is_logged(self):
+        ui = FakeUi(tab=1)
+        real = ui.select_tab
+
+        def flaky(hwnd, index):                               # 切到「全部」成功，切回原本的分頁失敗
+            ok = real(hwnd, index)
+            return ok if index == 0 else False
+        ui.select_tab = flaky
+        ok, logs = run(ui, [ECHO, RESULT_TOP])
+        self.assertTrue(ok)                                   # 開窗本身成功
+        self.assertTrue(any("切回原本" in l for l in logs))
+
     def test_a_tab_switch_that_moved_the_tab_but_failed_verification_is_still_undone(self):
         ui = FakeUi(tab=1, can_select=False, moves_even_when_failing=True)
-        ok, _ = run(ui, {1: [ECHO], 0: [ECHO, RESULT_TOP]})
+        ok, _ = run(ui, {0: [ECHO, RESULT_TOP]})
         self.assertFalse(ok)
         self.assertEqual(ui.tab, 1)                                                       # 使用者原本的分頁被還原
         self.assertEqual(ui.events[-1], ("select_tab", 1))
@@ -284,7 +304,7 @@ class TestOpenChatWindow(unittest.TestCase):
     def test_narrow_window_is_widened_only_for_the_tab_switch_and_shrunk_right_after(self):
         # 真機：寬版面下雙擊好友不會彈出獨立視窗，搜尋與雙擊一定要在原本的寬度做
         ui = FakeUi(narrow=True, tab=1)
-        ok, _ = run(ui, {1: [ECHO], 0: [ECHO, RESULT_TOP]})
+        ok, _ = run(ui, {0: [ECHO, RESULT_TOP]})
         self.assertTrue(ok)
         names = ui.names()
         first = names.index("ensure_wide")
@@ -295,13 +315,13 @@ class TestOpenChatWindow(unittest.TestCase):
 
     def test_the_window_is_shrunk_back_even_when_the_tab_switch_fails(self):
         ui = FakeUi(narrow=True, tab=1, can_select=False)
-        ok, _ = run(ui, {1: [ECHO], 0: [ECHO, RESULT_TOP]})
+        ok, _ = run(ui, {0: [ECHO, RESULT_TOP]})
         self.assertFalse(ok)
         self.assertEqual(ui.names().count("ensure_wide"), ui.names().count("restore_rect"))
         self.assertNotIn("double_click", ui.names())
 
-    def test_found_in_the_current_tab_never_resizes_the_window(self):
-        ui = FakeUi(narrow=True)
+    def test_found_on_the_all_tab_never_resizes_the_window(self):
+        ui = FakeUi(narrow=True, tab=0)
         ok, _ = run(ui, [ECHO, RESULT_TOP])
         self.assertTrue(ok)
         self.assertNotIn("ensure_wide", ui.names())
@@ -337,7 +357,7 @@ class TestOpenChatWindow(unittest.TestCase):
         self.assertEqual(ui.names()[-1], "clear_search")
 
     def test_window_that_never_appears_is_a_failure_and_the_search_is_cleared(self):
-        ui = FakeUi(window_appears=False)
+        ui = FakeUi(window_appears=False, tab=0)
         ok, logs = run(ui, [RESULT_TOP])
         self.assertFalse(ok)
         self.assertIn("double_click", ui.names())
@@ -366,10 +386,10 @@ class TestOpenChatWindow(unittest.TestCase):
 
     def test_focus_lost_after_switching_to_all_means_no_click(self):
         ui = FakeUi(tab=1)
-        states = iter([True, True, True, False, False, False])                           # 切到「全部」並重新搜尋後被搶走
+        states = iter([True, False, False, False])                                       # 切到「全部」並寫完搜尋字後被搶走
 
         ui.is_front = lambda hwnd: next(states)
-        ok, _ = run(ui, {1: [ECHO], 0: [ECHO, RESULT_TOP]})
+        ok, _ = run(ui, {0: [ECHO, RESULT_TOP]})
         self.assertFalse(ok)
         self.assertNotIn("double_click", ui.names())
 
@@ -381,7 +401,7 @@ class TestOpenChatWindow(unittest.TestCase):
 
         ui.clear_search = boom
         ui.restore_rect = boom
-        ok, _ = run(ui, {1: [ECHO], 0: [ECHO, RESULT_TOP]})
+        ok, _ = run(ui, {0: [ECHO, RESULT_TOP]})
         self.assertTrue(ok)
 
 

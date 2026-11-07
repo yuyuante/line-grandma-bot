@@ -113,7 +113,7 @@ def _switch_tab(ui, main, index):
 def open_chat_window(name, ui, read_boxes=ocr_engine.read_boxes, log=lambda msg: None, sleep=time.sleep, allow_member_count=False):
     """
     開啟名稱為 name 的好友的獨立聊天視窗，成功 (視窗已存在或已開好) 回傳 True，任何一步沒把握回傳 False。
-    先在目前的分頁搜尋 (最不打擾)；找不到才切到「全部」分頁再搜，結束後把使用者原本的分頁切回去。
+    一律先切到「全部」分頁再搜尋 (已經在「全部」就不動)，結束後把使用者原本的分頁切回去。
     ui 提供：find_chat_window(name)、main_window()、bring_to_front(hwnd)、is_front(hwnd)、search_box_rect(hwnd) -> (左, 上, 右, 下)、
     set_search_text(text)、clear_search()、selected_tab(hwnd) -> 索引或 None、select_tab(hwnd, index) -> 是否成功、
     ensure_wide(hwnd) -> 原本的位置 (沒有改動回傳 None)、restore_rect(hwnd, rect)、double_click(x, y)、screenshot(hwnd) -> (PIL 圖, (左, 上))。
@@ -136,6 +136,15 @@ def open_chat_window(name, ui, read_boxes=ocr_engine.read_boxes, log=lambda msg:
         if box is None:
             log("[開啟聊天視窗] 找不到主視窗的搜尋欄，放棄。")
             return False
+        current = ui.selected_tab(main)
+        if current is not None and current != ALL_TAB_INDEX:
+            # 一律在「全部」分頁搜尋：搜尋只找目前的分頁，而且在別的分頁 (真機：停在第 8 個分頁) 找得到列也可能雙擊不開視窗
+            original_tab = current                          # 先記下：點擊可能已經切過去、只是事後驗證失敗，結束時一律切回使用者原本的分頁
+            if not _switch_tab(ui, main, ALL_TAB_INDEX):
+                log("[開啟聊天視窗] 無法切到「全部」分頁，放棄。")
+                return False
+            box = ui.search_box_rect(main) or box
+            ui.set_search_text("")                          # 切分頁後先清掉搜尋欄 (萬一殘留同樣的字，LINE 不會重新搜尋)
         ui.set_search_text(name)
         sleep(SEARCH_RESULT_WAIT)
         if not ui.is_front(main):
@@ -143,26 +152,8 @@ def open_chat_window(name, ui, read_boxes=ocr_engine.read_boxes, log=lambda msg:
             return False
         rows = _find_rows(ui, main, box, name, read_boxes, allow_member_count)
         if not rows:
-            current = ui.selected_tab(main)
-            if current is None or current == ALL_TAB_INDEX:
-                log(f"[開啟聊天視窗] 搜尋結果裡找不到「{name}」(名稱必須完全相符)，放棄。")
-                return False
-            log("[開啟聊天視窗] 目前的分頁找不到，改到「全部」分頁搜尋。")
-            original_tab = current                          # 先記下：點擊可能已經切過去、只是事後驗證失敗，結束時一律切回使用者原本的分頁
-            if not _switch_tab(ui, main, ALL_TAB_INDEX):
-                log("[開啟聊天視窗] 無法切到「全部」分頁，放棄。")
-                return False
-            box = ui.search_box_rect(main) or box
-            ui.set_search_text("")
-            ui.set_search_text(name)
-            sleep(SEARCH_RESULT_WAIT)
-            if not ui.is_front(main):
-                log("[開啟聊天視窗] 搜尋時主視窗不在前景，放棄。")
-                return False
-            rows = _find_rows(ui, main, box, name, read_boxes, allow_member_count)
-            if not rows:
-                log(f"[開啟聊天視窗] 「全部」分頁的搜尋結果裡也找不到「{name}」(名稱必須完全相符)，放棄。")
-                return False
+            log(f"[開啟聊天視窗] 搜尋結果裡找不到「{name}」(名稱必須完全相符)，放棄。")
+            return False
         if not ui.is_front(main):
             log("[開啟聊天視窗] 雙擊前主視窗不在前景，放棄。")
             return False
@@ -184,6 +175,7 @@ def open_chat_window(name, ui, read_boxes=ocr_engine.read_boxes, log=lambda msg:
         if original_tab is not None:
             try:
                 ui.bring_to_front(main)                     # 剛開好的聊天視窗會搶走前景，select_tab 要主視窗在前景才肯動
-                _switch_tab(ui, main, original_tab)         # 把使用者原本的分頁還原
+                if not _switch_tab(ui, main, original_tab):     # 把使用者原本的分頁還原
+                    log("[開啟聊天視窗] 沒能把主視窗的分頁切回原本的位置，目前停在「全部」。")
             except Exception:
-                pass
+                log("[開啟聊天視窗] 還原主視窗的分頁時發生例外，目前可能停在「全部」。")
