@@ -164,6 +164,43 @@ class TestFindResultRows(unittest.TestCase):
         self.assertEqual(chat_opener.find_result_rows([("翁彦臻(公羽)凱基人..上午9:20", (1, 300))], name, 0), [(1, 300)])
         self.assertEqual(chat_opener.find_result_rows([("翁彦臻(公羽)凱基人..（12）上午9:20", (1, 300))], name, 0), [])
 
+    LAST = "李月琴@全球人壽"
+
+    def test_real_search_result_where_ocr_dropped_the_last_character(self):
+        # 真機 (2026-11-04)：整列名稱被讀成「李月琴@全球人」(沒有刪節號)，時間與預覽是別的框；搜尋欄裡的回聲在 min_y 以上
+        boxes = [("李月琴@全球人", (273, 124)), ("聊天 1", (60, 200)), ("李月琴@全球人", (300, 232)),
+                 ("星期六", (420, 232)), ("明年的桌月唇也出來了,順道", (320, 262)), ("訊息 1", (60, 330)), ("Notify Bot", (267, 360))]
+        self.assertEqual(chat_opener.find_result_rows(boxes, self.LAST, min_y=151), [(300, 232)])
+
+    def test_dropped_last_character_may_be_followed_by_a_time(self):
+        self.assertEqual(chat_opener.find_result_rows([("李月琴@全球人 星期六", (1, 300))], self.LAST, 0), [(1, 300)])
+        self.assertEqual(chat_opener.find_result_rows([("李月琴@全球人昨天", (1, 300))], self.LAST, 0), [(1, 300)])
+
+    def test_dropped_last_character_is_refused_when_it_is_not_clearly_this_chat(self):
+        N = self.LAST
+        for text in ("李月琴@全球",                    # 少了兩個字
+                     "李月琴@全球人X",                  # 尾巴多了別的字
+                     "李月琴@全球人 (12)",              # 一對一不接受成員數
+                     "李月琴@球人",                    # 前綴不是名稱的開頭
+                     "李月琴@全球人壽險"):              # 多一截 (這不是少一個字)
+            self.assertEqual(chat_opener.find_result_rows([(text, (1, 300))], N, 0), [], text)
+        self.assertEqual(chat_opener.find_result_rows([("李月", (1, 300))], "李月琴", 0), [])        # 名稱太短，前綴不夠長
+
+    def test_two_dropped_character_rows_are_ambiguous(self):
+        boxes = [("李月琴@全球人", (1, 300)), ("李月琴@全球人", (1, 400))]
+        self.assertEqual(chat_opener.find_result_rows(boxes, self.LAST, 0), [])
+        # 與截斷的列合併計算：也分不出是哪一個
+        mixed = [("李月琴@全球人", (1, 300)), ("李月琴@全球..上午9:20", (1, 400))]
+        self.assertEqual(chat_opener.find_result_rows(mixed, self.LAST, 0), [])
+
+    def test_a_full_name_row_wins_over_dropped_character_rows(self):
+        boxes = [("李月琴@全球人", (1, 300)), ("李月琴@全球人壽", (1, 400)), ("李月琴@全球人", (1, 500))]
+        self.assertEqual(chat_opener.find_result_rows(boxes, self.LAST, 0), [(1, 400)])
+
+    def test_a_dropped_character_group_row_may_carry_the_member_count(self):
+        self.assertEqual(chat_opener.find_result_rows([("理財幼幼班_ (142)", (1, 300))], "理財幼幼班_Z", 0, allow_count=True), [(1, 300)])
+        self.assertEqual(chat_opener.find_result_rows([("理財幼幼班_ (142)", (1, 300))], "理財幼幼班_Z", 0), [])
+
     def test_sorted_top_down_and_empty(self):
         boxes = [("Mom", (1, 400)), ("Mom", (1, 250))]
         self.assertEqual(chat_opener.find_result_rows(boxes, "Mom", 0), [(1, 250), (1, 400)])

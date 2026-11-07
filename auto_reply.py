@@ -27,6 +27,7 @@ import threading
 from io import BytesIO
 import re
 import contextlib
+import collections
 import difflib
 
 import win32gui
@@ -38,6 +39,7 @@ from PIL import Image, ImageChops, ImageGrab, ImageOps, ImageStat
 import pyautogui
 
 import notifier
+import view_binder
 import ocr_engine
 import image_kind
 import image_library
@@ -48,7 +50,7 @@ from crawl_images import (crawl_grandma_images, clean_expired_images, retire_ima
                           download_and_validate_image, get_existing_md5s, build_candidate_urls,
                           build_candidates, normalize_sources)
 
-VERSION = "2.14.0"
+VERSION = "2.15.0"
 
 # 0. 全系統單一執行個體鎖 (Windows Named Mutex)，防止重複啟動繞過斷路器
 _app_mutex_handle = None
@@ -280,6 +282,7 @@ DEFAULT_CONFIG = {
     "group_targets": [],                # 要回覆的群組名單 (名稱同 targets 的寫法，不含人數)；群組另有更保守的規則，只能手動綁定快取頻道 (--bind-view)
     "group_max_replies_per_day": 1,     # 每個群組每天最多回覆幾次 (0 = 不限次數)
     "group_cooldown_seconds": 600,      # 同一個群組兩次回覆之間至少間隔幾秒 (多人連續傳圖時只回一次)
+    "auto_bind_by_viewing": True,       # 未綁定的好友/群組傳新圖時，自動開他的視窗、點開一張照片，確認快取頻道後綁定，再把視窗放回去 (關閉則維持手動 --bind-view)
     "auto_open_chat_window": True,      # 好友的獨立聊天視窗不見時，自動從 LINE 主視窗的搜尋欄開回來 (關閉則找不到視窗就略過該則訊息)
     "log_to_file": True,                # 程式自己寫紀錄檔：logs/auto_reply_日期.log，每天一個檔，內容與畫面相同 (不含聊天內容)
     "log_keep_days": 7,                 # 紀錄檔保留幾天，更早的自動刪除
@@ -501,7 +504,7 @@ def load_config():
                 except Exception:
                     pass
         for k in ("replace_after_send", "collect_incoming_images", "auto_crawl_images", "close_window_after_send", "time_aware_images",
-                  "require_grandma_image", "auto_neutral_images", "auto_open_chat_window", "reply_to_text", "reply_to_sticker_text", "log_to_file"):
+                  "require_grandma_image", "auto_neutral_images", "auto_open_chat_window", "auto_bind_by_viewing", "reply_to_text", "reply_to_sticker_text", "log_to_file"):
             if k in cfg and isinstance(cfg[k], bool):
                 sanitized[k] = cfg[k]
         if not isinstance(cfg.get("reply_to_sticker_text"), bool):
@@ -3265,10 +3268,10 @@ MEDIA_NOISE_MAX_HEIGHT = 12     # 非氣泡區塊低於此高度視為細線、�
 MEDIA_STICKER_MIN_HEIGHT = 40   # 連結列上方的區塊至少要有此高度才算照片
 MEDIA_ACTION_GAP_MAX = 16       # 連結列與上方照片之間的最大間距
 
-def _left_message_blocks(chat_hwnd, side="left"):
+def _left_message_blocks(chat_hwnd, side="left", max_blocks=2):
     """
     截取聊天室歷史區並找出左側 (對方) 或右側 (自己，side="right") 訊息的內容區塊。回傳
-    (shot, scale, x_start, x_end, is_content, blocks)，blocks 為由下往上最多兩個 (底, 頂) 區塊；
+    (shot, scale, x_start, x_end, is_content, blocks)，blocks 為由下往上最多 max_blocks (預設 2) 個 (底, 頂) 區塊；
     暫時無法判斷 (視窗縮小/被遮住/太窄、該側無內容) 回傳 None。
     左側取樣帶固定自 56px 起寬 160px (避開頭像)；右側取樣帶為距右緣 24px 往左 160px (氣泡靠右對齊，沒有頭像)。
     連續約 6px 無內容即分開區塊；背景色取 10 個取樣點中位數。
@@ -3331,9 +3334,9 @@ def _left_message_blocks(chat_hwnd, side="left"):
                 blocks.append((cur_bottom, cur_top))
                 cur_bottom = cur_top = None
                 gap = 0
-                if len(blocks) >= 2:
+                if len(blocks) >= max_blocks:
                     break
-    if cur_bottom is not None and len(blocks) < 2:
+    if cur_bottom is not None and len(blocks) < max_blocks:
         blocks.append((cur_bottom, cur_top))
     if not blocks:
         return None
@@ -4483,6 +4486,9 @@ def check_for_incoming_messages(config):
                             m = os.path.getmtime(p)
                             if (p, m) in PROCESSED_CACHE_FILES:
                                 continue
+                            if _in_view_bind_window(m):
+                                PROCESSED_CACHE_FILES.add((p, m))       # 自動綁定時我們自己點圖造成的寫入，不是對方傳來的新圖
+                                continue
                             if m >= last_seen_cache_mtime:
                                 # 🟡 核心防禦：在所有大小/格式過濾前，先登記所有具快取異動的未知頻道，
                                 # 防止目標好友傳貼圖/被過濾小檔時，未被算入 competing_count 導致其他好友頻道被誤綁！
@@ -4529,6 +4535,7 @@ def check_for_incoming_messages(config):
 
                 max_processed_m = last_seen_cache_mtime
                 deferred_mtimes = []
+                view_bind_wanted = False
 
                 for cand_m, cand_path in candidate_files:
                     ch = extract_chat_hash_from_path(cand_path)
@@ -4673,6 +4680,7 @@ def check_for_incoming_messages(config):
                         if ch and ch not in chat_dirs_map:
                             file_age = current_time - cand_m
                             if file_age <= AUTOBIND_TIMEOUT:
+                                view_bind_wanted = True
                                 deferred_mtimes.append(cand_m)
                                 log_v(f"[安全暫緩] 快取頻道{channel_label(ch)}暫未匹配視窗異動 (保留重試機會，暫不標記為已處理)。")
                             else:
@@ -4694,6 +4702,13 @@ def check_for_incoming_messages(config):
                     last_seen_cache_mtime = min(max_processed_m, oldest_deferred - 0.001)
                 else:
                     last_seen_cache_mtime = max_processed_m
+
+                # 未綁定的頻道傳來新圖、現有的自動綁定又認不出是誰：自己開視窗、點照片確認後綁定 (觸發的那張圖若綁定成功時還沒過期，下一輪照一般核驗仍可能回覆；來不及的就略過)
+                if view_bind_wanted and not chosen_target and config.get("auto_bind_by_viewing", True):
+                    try:
+                        auto_bind_by_viewing(config, targets, chat_dirs_map)
+                    except Exception as e:
+                        log_v(f"[警告] 自動綁定發生例外: {e}")
 
         # 快取掃描命中合格新媒體，在此統籌觸發發送！
         if chosen_target and chosen_candidate:
@@ -4858,6 +4873,167 @@ def bind_channel_by_viewing(name, targets, seconds=30):
     if len(changed) != 1:
         return False, f"觀察期間有 {len(changed)} 個頻道有快取寫入，必須剛好 1 個。請只開啟目標好友的聊天室並點開一張舊圖片後重試。"
     return bind_channel_manually(name, next(iter(changed)), targets)
+
+VIEW_BIND_RETRY_SECONDS = 600.0     # 同一個對象自動綁定失敗後，至少隔多久才再試 (避免一直開他的視窗、點他的圖)；連續失敗每次加倍
+VIEW_BIND_RETRY_MAX_SECONDS = 6 * 3600.0
+VIEW_BIND_MAX_PER_SWEEP = 3         # 一次觸發最多試幾位對象 (其餘等下次，已經開著視窗的優先)
+VIEW_BIND_SCROLL_NOTCHES = 5        # 找照片時每次滑鼠滾輪捲幾格 (約半頁到一頁)
+VIEW_BIND_QUIET_AFTER = 3.0        # 自動綁定結束後這幾秒內的快取寫入也算是我們點圖造成的
+_VIEW_BIND_LAST_TRY = {}            # {對象 (小寫): 上次嘗試時間}
+_VIEW_BIND_FAILS = {}               # {對象 (小寫): 連續失敗次數}
+_VIEW_BIND_WINDOWS = collections.deque(maxlen=5)     # [(開始, 結束)] 自動綁定期間：這段時間的快取寫入是我們自己點圖造成的，不能當成對方傳來的新圖
+
+
+def _in_view_bind_window(mtime):
+    """這個快取檔的寫入時間，是不是落在自動綁定 (點圖) 期間"""
+    return any(start <= mtime <= end for start, end in _VIEW_BIND_WINDOWS)
+
+
+VIEW_BIND_PHOTO_MIN_HEIGHT = 80     # 邏輯像素：比這矮的區塊不當成照片 (文字氣泡、貼圖、連結列)
+VIEW_BIND_PHOTO_MIN_WIDTH = 100
+VIEW_BIND_FLAT_MAX_SHARE = 0.4      # 區塊裡同一種顏色 (量化後) 的像素超過這個比例，就是純色氣泡 (灰色對方氣泡、綠色自己的氣泡)，不是照片
+
+
+def _flat_share(sample):
+    """取樣像素裡最大宗那種顏色 (每個色頻量化成 32 階) 佔的比例：文字氣泡是單一底色，照片不會有這麼大的一塊同色"""
+    counts = {}
+    for px in sample:
+        key = (px[0] >> 3, px[1] >> 3, px[2] >> 3)
+        counts[key] = counts.get(key, 0) + 1
+    return max(counts.values()) / len(sample)
+
+
+def _history_photo_centers(chat_hwnd, side="left", limit=6):
+    """
+    依截圖找出聊天室歷史區看得到的照片 (大的、不是文字氣泡灰底的區塊) 的螢幕座標中心，由下往上 (最新的在前)。
+    LINE 新版不再把訊息內容暴露給 UIA (每則訊息底下都沒有子控制項)，所以只能靠截圖。
+    貼圖也可能被當成照片挑出來，沒關係：點了沒有快取寫入就換下一張，綁定只看快取有沒有寫入。
+    """
+    found = _left_message_blocks(chat_hwnd, side=side, max_blocks=12)
+    if found is None:
+        return []
+    shot, scale, x_start, _x_end, is_content, blocks = found
+    rect = get_window_true_rect(chat_hwnd)
+    origin_x, origin_y = rect[0], rect[1] + int((rect[3] - rect[1]) * 0.18)    # 與 _left_message_blocks 的截圖範圍相同
+    scan_from, scan_to = (x_start, shot.width - int(12 * scale)) if side == "left" else (int(shot.width * 0.1), shot.width - int(12 * scale))
+    centers = []
+    for bottom, top in blocks:
+        if int((bottom - top + 1) / scale) < VIEW_BIND_PHOTO_MIN_HEIGHT:
+            continue                            # 太矮 (被截圖範圍切到時只看露出的部分夠不夠大：照片常比歷史區還高，點露出的部分就好)
+        ys = range(top, bottom + 1, 8)
+        xs = [x for x in range(scan_from, scan_to, 4) if any(is_content(shot.getpixel((x, y))) for y in ys)]
+        if not xs or int((max(xs) - min(xs) + 1) / scale) < VIEW_BIND_PHOTO_MIN_WIDTH:
+            continue
+        sample = [shot.getpixel((x, y)) for x in range(min(xs), max(xs) + 1, 6) for y in range(top, bottom + 1, 6)]
+        if _flat_share(sample) > VIEW_BIND_FLAT_MAX_SHARE:
+            continue                            # 純色的文字氣泡
+        centers.append((origin_x + (min(xs) + max(xs)) // 2, origin_y + (top + bottom) // 2))
+        if len(centers) >= limit:
+            break
+    return centers
+
+
+class _ViewBindIo:
+    """把 view_binder 要用的動作接到實際的 LINE 視窗與快取目錄"""
+
+    def __init__(self, name, config, targets):
+        self.name = name
+        self.config = config
+        self.targets = targets
+
+    def find_window(self):
+        wins = find_target_chat_window(self.name)
+        return wins[0][0] if wins else None
+
+    def open_window(self):
+        return open_missing_chat_window(self.name, self.config)
+
+    def bring_to_front(self, hwnd):
+        return activate_window(hwnd)
+
+    def foreground_matches(self):
+        return title_matches_target(foreground_window_title(), self.name)
+
+    def photo_centers(self, hwnd):
+        """視窗裡看得到的照片的中心點：對方傳的 (左側) 優先，再來是自己傳的 (右側)；各自由新到舊"""
+        try:
+            centers = _history_photo_centers(hwnd, "left")
+            if len(centers) < view_binder.MAX_CLICKS:       # 左側 (對方傳的) 不夠試才再掃右側 (自己傳的)，省一次截圖與逐點掃描
+                centers += _history_photo_centers(hwnd, "right")
+            return centers
+        except Exception:
+            return []
+
+    def scroll(self, hwnd, up):
+        """把滑鼠移到訊息列表中央捲一頁；列表中央被別的視窗蓋住就不捲"""
+        try:
+            import uiautomation as auto
+            win = auto.ControlFromHandle(hwnd)
+            view = win.ListControl(ClassName="LcListView") if win and win.Exists(0, 0) else None
+            if not view or not view.Exists(0, 0):
+                return False
+            vr = view.BoundingRectangle
+            cx, cy = (vr.left + vr.right) // 2, (vr.top + vr.bottom) // 2
+            if _root_window_at(cx, cy) != hwnd:
+                return False
+            pyautogui.moveTo(cx, cy)
+            pyautogui.scroll(120 * (VIEW_BIND_SCROLL_NOTCHES if up else -VIEW_BIND_SCROLL_NOTCHES))     # Windows 的滾輪單位：一格 = 120
+            return True
+        except Exception:
+            return False
+
+    def click(self, hwnd, x, y):
+        if _root_window_at(x, y) != hwnd:
+            return False                    # 點的位置被別的視窗蓋住：不點
+        pyautogui.click(x, y)
+        return True
+
+    def close_viewer(self):
+        pyautogui.press("esc")
+
+    def snapshot(self):
+        return get_all_cache_files()
+
+    def channel_of(self, path):
+        return extract_chat_hash_from_path(path)
+
+    def bind(self, ch):
+        return bind_channel_manually(self.name, ch, self.targets)
+
+    def finish(self, hwnd, opened_by_us):
+        if opened_by_us:
+            _minimize_if_configured(hwnd, self.config, self.name)
+
+
+def _view_bind_wait(name):
+    """這位對象自動綁定失敗後要隔多久才再試：連續失敗每次加倍，最多 VIEW_BIND_RETRY_MAX_SECONDS"""
+    return min(VIEW_BIND_RETRY_SECONDS * 2 ** _VIEW_BIND_FAILS.get(name.lower(), 0), VIEW_BIND_RETRY_MAX_SECONDS)
+
+
+def auto_bind_by_viewing(config, targets, chat_dirs_map):
+    """
+    有未綁定的快取頻道傳來新圖，但現有的自動綁定認不出是誰：依序替「還沒綁定的對象」開視窗、點一張照片、確認快取頻道後綁定
+    (一對一與群組都適用，核驗規則見 view_binder)。每位對象失敗後隔 VIEW_BIND_RETRY_SECONDS 才再試，一次最多 VIEW_BIND_MAX_PER_SWEEP 位。
+    期間自己點圖造成的快取寫入標成已處理，不會被當成對方傳來的新圖而回覆。
+    """
+    bound_names = {v.strip().lower() for v in chat_dirs_map.values() if isinstance(v, str)}
+    now = time.time()
+    pending = [t for t in targets
+               if t.strip().lower() not in bound_names and now - _VIEW_BIND_LAST_TRY.get(t.lower(), 0) >= _view_bind_wait(t)]
+    pending.sort(key=lambda t: 0 if find_target_chat_window(t) else 1)       # 視窗已經開著的優先
+    for name in pending[:VIEW_BIND_MAX_PER_SWEEP]:
+        _VIEW_BIND_LAST_TRY[name.lower()] = time.time()
+        log_v(f"[自動綁定] 有未綁定的頻道傳來新圖，嘗試開啟「{name}」的聊天視窗、點開一張照片來確認它的頻道...")
+        start = time.time() - 1.0
+        ok, msg, touched = view_binder.bind_by_opening(name, _ViewBindIo(name, config, targets), log=log_v)
+        _VIEW_BIND_WINDOWS.append((start, time.time() + VIEW_BIND_QUIET_AFTER))
+        for path, meta in touched.items():
+            PROCESSED_CACHE_FILES.add((path, meta[0]))
+        log_v(f"[自動綁定] {'成功' if ok else '未綁定'}：{msg}")
+        _VIEW_BIND_FAILS[name.lower()] = 0 if ok else _VIEW_BIND_FAILS.get(name.lower(), 0) + 1
+        if ok:
+            break
+
 
 def init_unread_baselines(specific_targets=None):
     """啟動時先掃描所有 LINE 視窗目前的未讀數作為初始基準線，避免啟動時將歷史未讀訊息誤判為新訊息"""

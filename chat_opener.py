@@ -50,6 +50,16 @@ def _truncated_match(text, wanted, tail):
             and tail.fullmatch(text[m.end():]) is not None)
 
 
+def _dropped_tail_match(text, wanted, tail):
+    """
+    text (已正規化) 是不是「name 少了最後一個字 + (成員數) + 時間」：OCR 偶爾把名稱最後一個字吃掉
+    (真機：「李月琴@全球人壽」被讀成「李月琴@全球人」，沒有刪節號)。最多只容許少一個字，露出的前綴一樣要夠長。
+    """
+    prefix = wanted[:-1]
+    return (len(prefix) >= MIN_TRUNCATED_PREFIX and text.startswith(prefix)
+            and tail.fullmatch(text[len(prefix):]) is not None)
+
+
 def find_result_rows(boxes, name, min_y, allow_count=False):
     """
     boxes: [(文字, (中心x, 中心y))]。回傳搜尋結果裡「整列文字就是 name」的位置 [(x, y)]，由上到下排序。
@@ -60,6 +70,8 @@ def find_result_rows(boxes, name, min_y, allow_count=False):
     - 名稱太長被列表截斷 (「東南里李武雄服..．（477）上午9:20」)：只有「露出的前綴夠長、確實是名稱開頭、
       整個搜尋結果裡剛好只有這一列」才採用；有兩列以上符合就分不出是哪個聊天室，一律不點。
       (雙擊後仍要等到標題符合的視窗才算成功。)
+    - OCR 把名稱最後一個字吃掉 (「李月琴@全球人壽」讀成「李月琴@全球人」，沒有刪節號)：規則同上，最多少一個字，
+      露出的前綴夠長、後面只能是 (成員數) 與時間、整個搜尋結果裡剛好只有一列 (與截斷的列合併計算)；有完整名稱的列就一律用完整的。
     """
     wanted = _norm(name)
     if not wanted:
@@ -70,7 +82,8 @@ def find_result_rows(boxes, name, min_y, allow_count=False):
     exact = sorted((pos for text, pos in below if exact_pattern.fullmatch(text)), key=lambda p: p[1])
     if exact:
         return exact
-    truncated = sorted((pos for text, pos in below if _truncated_match(text, wanted, tail)), key=lambda p: p[1])
+    truncated = sorted((pos for text, pos in below
+                        if _truncated_match(text, wanted, tail) or _dropped_tail_match(text, wanted, tail)), key=lambda p: p[1])
     return truncated if len(truncated) == 1 else []
 
 
