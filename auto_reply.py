@@ -4844,7 +4844,7 @@ def check_for_incoming_messages(config):
                 # 未綁定的頻道傳來新圖、現有的自動綁定又認不出是誰：自己開視窗、點照片確認後綁定 (觸發的那張圖若綁定成功時還沒過期，下一輪照一般核驗仍可能回覆；來不及的就略過)
                 if view_bind_wanted and not chosen_target and config.get("auto_bind_by_viewing", True):
                     try:
-                        auto_bind_by_viewing(config, targets, chat_dirs_map)
+                        auto_bind_by_viewing(config, targets, chat_dirs_map, since=min(deferred_mtimes) if deferred_mtimes else current_time)
                     except Exception as e:
                         log_v(f"[警告] 自動綁定發生例外: {e}")
 
@@ -5181,14 +5181,30 @@ def _view_bind_wait(name):
     return min(VIEW_BIND_RETRY_SECONDS * 2 ** _VIEW_BIND_FAILS.get(name.lower(), 0), VIEW_BIND_RETRY_MAX_SECONDS)
 
 
-def auto_bind_by_viewing(config, targets, chat_dirs_map):
+def _recently_active_targets(targets, since):
+    """
+    剛有新照片的對象：視窗內容在 since (新照片寫入快取的時間) 前後 AUTOBIND_TIMEOUT 秒內有變動 (_TARGET_WINDOW_STATE)。
+    視窗沒開的人沒有任何跡象說他剛傳了東西。(標題的未讀數不能當依據：主迴圈在這之前已經把它記成已處理。)
+    """
+    changed = {t: (_TARGET_WINDOW_STATE.get(t) or {}).get("changed_at", 0.0) for t in targets}
+    return [t for t, at in changed.items() if at and abs(at - since) <= AUTOBIND_TIMEOUT]
+
+
+def auto_bind_by_viewing(config, targets, chat_dirs_map, since=None):
     """
     有未綁定的快取頻道傳來新圖，但現有的自動綁定認不出是誰：依序替「還沒綁定的對象」開視窗、點一張照片、確認快取頻道後綁定
     (一對一與群組都適用，核驗規則見 view_binder)。每位對象失敗後隔 VIEW_BIND_RETRY_SECONDS 才再試，一次最多 VIEW_BIND_MAX_PER_SWEEP 位。
     期間自己點圖造成的快取寫入標成已處理，不會被當成對方傳來的新圖而回覆。
+    since (新照片寫入快取的時間) 有給時，只試剛有新照片跡象的對象 (見 _recently_active_targets)，沒有跡象的對象不去開窗搜尋。
     """
     bound_names = {v.strip().lower() for v in chat_dirs_map.values() if isinstance(v, str)}
     now = time.time()
+    if since is not None:
+        active = _recently_active_targets(targets, since)
+        if not active:
+            log_v("[自動綁定] 沒有任何對象的視窗在這張新圖前後有變動，無從判斷是誰傳的，這次不開窗搜尋。")
+            return
+        targets = active
     pending = [t for t in targets
                if t.strip().lower() not in bound_names and now - _VIEW_BIND_LAST_TRY.get(t.lower(), 0) >= _view_bind_wait(t)]
     pending.sort(key=lambda t: 0 if find_target_chat_window(t) else 1)       # 視窗已經開著的優先

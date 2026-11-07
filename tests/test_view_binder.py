@@ -329,6 +329,24 @@ class TestSweep(unittest.TestCase):
             auto_reply.auto_bind_by_viewing({}, targets, {CH_A: "已綁定"})
         self.assertEqual(tried, [])
 
+    def test_with_a_photo_time_only_targets_that_just_showed_activity_are_tried(self):
+        now = auto_reply.time.time()
+        tried = []
+        state = {"甲": {"changed_at": now - 3}, "乙": {"changed_at": now - 600}, "丙": {"changed_at": 0.0}}
+        with mock.patch.dict(auto_reply._TARGET_WINDOW_STATE, state, clear=True):
+            with mock.patch.object(auto_reply, "find_target_chat_window", return_value=[]):
+                with mock.patch.object(auto_reply.view_binder, "bind_by_opening",
+                                       side_effect=lambda n, io, log=None: (tried.append(n), (False, "no", {}))[1]):
+                    auto_reply.auto_bind_by_viewing({}, ["甲", "乙", "丙", "丁"], {}, since=now)
+        self.assertEqual(tried, ["甲"])         # 甲：視窗剛變動。乙太久以前、丙只有基準線 (0)、丁沒有視窗紀錄
+
+    def test_with_a_photo_time_and_no_sign_of_activity_nobody_is_opened(self):
+        now = auto_reply.time.time()
+        with mock.patch.dict(auto_reply._TARGET_WINDOW_STATE, {}, clear=True):
+            with mock.patch.object(auto_reply.view_binder, "bind_by_opening") as m:
+                auto_reply.auto_bind_by_viewing({}, ["甲", "乙"], {}, since=now)
+        m.assert_not_called()
+
     def test_sweep_stops_at_first_success_and_marks_touched_processed(self):
         def fake_bind(name, io, log=None):
             return True, "ok", {"p/x.eimg": (123.0, 5)}
