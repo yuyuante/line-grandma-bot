@@ -3517,8 +3517,7 @@ def resolve_stop_after(arg_value, interactive, ask=input):
         except EOFError:
             return 0
         except KeyboardInterrupt:
-            print("
-已取消，程式未啟動。")
+            print("\n已取消，程式未啟動。")
             sys.exit(0)
         if not text:
             return DEFAULT_STOP_AFTER
