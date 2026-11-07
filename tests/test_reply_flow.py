@@ -1732,10 +1732,12 @@ class TestNotifyFallback(_Base):
     def setUp(self):
         super().setUp()
         with auto_reply._FALLBACK_LOCK:
-            auto_reply._FALLBACK.update({"chat": "Notify Bot", "pending": [], "last": 0.0, "window_checked": 0.0, "failures": 0})
-        self.addCleanup(auto_reply._FALLBACK.update, {"chat": "", "pending": [], "last": 0.0, "window_checked": 0.0, "failures": 0})
+            auto_reply._FALLBACK.update({"chat": "Notify Bot", "pending": [], "last": 0.0, "window_checked": 0.0, "failures": 0, "open_tried": -1e9})
+        self.addCleanup(auto_reply._FALLBACK.update, {"chat": "", "pending": [], "last": 0.0, "window_checked": 0.0, "failures": 0, "open_tried": -1e9})
         self.addCleanup(setattr, auto_reply.notifier, "fallback_sink", None)
         self.addCleanup(setattr, auto_reply.notifier, "fallback_busy", False)
+        self.opener = mock.patch.object(auto_reply, "open_missing_chat_window", return_value=False).start()    # 預設開不起來 (不碰真的 LINE)
+        self.addCleanup(mock.patch.stopall)
 
     def flush(self, window=True, foreground=CHAT, title="Notify Bot", sent=True, iconic=False, send_error=None):
         busy_during_send = []
@@ -1969,6 +1971,70 @@ class TestNotifyFallback(_Base):
             self.clock[0] += auto_reply.FALLBACK_WINDOW_RECHECK
             auto_reply.flush_fallback_notices({})
             self.assertEqual(find.call_count, 2)
+
+    # --- 視窗沒開：自動開啟，並且留著 ---
+    def test_a_missing_window_is_opened_automatically_and_kept_open(self):
+        auto_reply.queue_fallback_notice("a")
+        self.opener.return_value = True
+        win = [(CHAT, "Notify Bot", "Qt", True)]
+        found = iter([[], win])                                               # 第一次找沒有，開了之後找得到
+        auto_reply._BOT_OPENED_HWNDS[CHAT] = (auto_reply.time.time(), "Notify Bot")     # open_missing_chat_window 會登記它
+        self.addCleanup(auto_reply._BOT_OPENED_HWNDS.clear)
+        with mock.patch.object(auto_reply, "find_target_chat_window", side_effect=lambda n: next(found)),              mock.patch.object(auto_reply.win32gui, "IsIconic", return_value=False),              mock.patch.object(auto_reply, "activate_window"),              mock.patch.object(auto_reply.win32gui, "GetForegroundWindow", return_value=CHAT),              mock.patch.object(auto_reply.win32gui, "GetWindowText", return_value="Notify Bot"),              mock.patch.object(auto_reply, "send_text_via_input", return_value=True) as send,              mock.patch.object(auto_reply, "_minimize_if_configured"):
+            auto_reply.flush_fallback_notices({"stop_command": self.PHRASE})
+        self.opener.assert_called_once()
+        send.assert_called_once()
+        self.assertNotIn(CHAT, auto_reply._BOT_OPENED_HWNDS)                  # 不登記成「用完要關」：停止指令偵測也要這個視窗
+        self.assertEqual(auto_reply._FALLBACK["pending"], [])
+
+    def test_auto_open_off_never_opens_the_window(self):
+        auto_reply.queue_fallback_notice("a")
+        with mock.patch.object(auto_reply, "find_target_chat_window", return_value=[]):
+            auto_reply.flush_fallback_notices({"auto_open_chat_window": False})
+        self.opener.assert_not_called()
+        self.assertEqual(auto_reply._FALLBACK["pending"], ["a"])             # 通知留著，之後視窗開了再送
+
+    def test_a_window_that_cannot_be_opened_keeps_the_notices_and_rechecks_later(self):
+        auto_reply.queue_fallback_notice("a")
+        with mock.patch.object(auto_reply, "find_target_chat_window", return_value=[]):
+            auto_reply.flush_fallback_notices({})
+            auto_reply.flush_fallback_notices({})                              # 還沒到重找的時間：不會再開一次
+        self.opener.assert_called_once()
+        self.assertEqual(auto_reply._FALLBACK["pending"], ["a"])
+        self.assertGreater(auto_reply._FALLBACK["window_checked"], 0)
+
+    def test_the_final_flush_at_exit_never_opens_a_window(self):
+        auto_reply.queue_fallback_notice("a")
+        with mock.patch.object(auto_reply, "find_target_chat_window", return_value=[]):
+            auto_reply.flush_fallback_notices({}, force=True)
+        self.opener.assert_not_called()
+
+    def test_a_failed_open_is_not_retried_before_the_retry_interval(self):
+        auto_reply.queue_fallback_notice("a")
+        with mock.patch.object(auto_reply, "find_target_chat_window", return_value=[]):
+            auto_reply.flush_fallback_notices({})
+            auto_reply._FALLBACK["window_checked"] = 0.0                      # 重找視窗的時間到了，但開窗的重試間隔還沒到
+            auto_reply.flush_fallback_notices({})
+        self.opener.assert_called_once()
+
+    def test_the_final_flush_at_exit_never_opens_a_window(self):
+        auto_reply.queue_fallback_notice("a")
+        with mock.patch.object(auto_reply, "find_target_chat_window", return_value=[]):
+            auto_reply.flush_fallback_notices({}, force=True)
+        self.opener.assert_not_called()
+
+    def test_a_failed_open_is_not_retried_before_the_retry_interval(self):
+        auto_reply.queue_fallback_notice("a")
+        with mock.patch.object(auto_reply, "find_target_chat_window", return_value=[]):
+            auto_reply.flush_fallback_notices({})
+            auto_reply._FALLBACK["window_checked"] = 0.0                      # 重找視窗的時間到了，但開窗的重試間隔還沒到
+            auto_reply.flush_fallback_notices({})
+        self.opener.assert_called_once()
+
+    def test_an_already_open_window_is_never_reopened(self):
+        auto_reply.queue_fallback_notice("a")
+        self.flush()
+        self.opener.assert_not_called()
 
     def test_finding_the_window_resets_the_recheck_timer(self):
         auto_reply.queue_fallback_notice("a")

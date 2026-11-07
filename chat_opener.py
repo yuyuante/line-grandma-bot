@@ -12,6 +12,7 @@
   不記錄也不輸出其他文字。
 - 成功的唯一標準是出現標題剛好等於好友名稱的視窗；做完 (不論成敗) 都把搜尋欄清掉。
 """
+import difflib
 import re
 import time
 
@@ -60,6 +61,42 @@ def _dropped_tail_match(text, wanted, tail):
             and tail.fullmatch(text[len(prefix):]) is not None)
 
 
+# 搜尋結果分成幾個小標題區塊，標題後面接該區塊的筆數：「聊天 1」「訊息 1」「好友 2」…
+_SECTION_HEADER = re.compile(r"(聊天|訊息|好友|群組|官方帳號|公開帳號)(\d+)")
+SECTION_NAME_MIN_RATIO = 0.4        # 小標題底下那一列的文字，要跟名稱至少有這麼像 (SequenceMatcher)，擋掉明顯不是這位的列
+SECTION_NAME_MIN_LEN = 6            # 名稱太短 (「媽媽」) 時，子字串搜尋容易冒出別的聊天室，不走這一招；OCR 讀歪的都是長名稱
+SECTION_ROW_SAME_LINE = 14          # 同一行的字框，中心 y 差在這個範圍內 (名稱、時間在同一行)
+
+
+def _section_row(below, wanted):
+    """
+    OCR 把名稱讀歪 (中間的字被吃掉、讀成別的字) 時的最後一招，信任 LINE 自己的搜尋：名稱已經整串打進搜尋欄，
+    「聊天」小標題的筆數剛好是 1，就是 LINE 認定恰好一個聊天室的名稱符合。取那個小標題底下第一行、最左邊的字框 (名稱；
+    同一行右邊的是時間，下一行是最後一則訊息的預覽)，而且文字要跟名稱有一定的相似度。回傳 (x, y) 或 None。
+    沒有「聊天」小標題 (這個人沒有聊天記錄)、筆數不是 1、小標題底下沒有東西，都回傳 None。
+    below: [(正規化文字, (x, y))]，已經去掉搜尋欄以上的字框。
+    """
+    if len(wanted) < SECTION_NAME_MIN_LEN:
+        return None
+    ordered = sorted(below, key=lambda b: b[1][1])
+    headers = [(i, _SECTION_HEADER.fullmatch(text)) for i, (text, _pos) in enumerate(ordered)]
+    headers = [(i, m) for i, m in headers if m]
+    chat = [(i, m) for i, m in headers if m.group(1) == "聊天"]
+    if len(chat) != 1 or int(chat[0][1].group(2)) != 1:
+        return None
+    start = chat[0][0] + 1
+    nxt = next((i for i, _m in headers if i > chat[0][0]), len(ordered))
+    section = ordered[start:nxt]
+    if not section:
+        return None
+    first_y = section[0][1][1]
+    line = [b for b in section if abs(b[1][1] - first_y) <= SECTION_ROW_SAME_LINE]
+    text, pos = min(line, key=lambda b: b[1][0])
+    if difflib.SequenceMatcher(None, text, wanted).ratio() < SECTION_NAME_MIN_RATIO:
+        return None
+    return pos
+
+
 def find_result_rows(boxes, name, min_y, allow_count=False):
     """
     boxes: [(文字, (中心x, 中心y))]。回傳搜尋結果裡「整列文字就是 name」的位置 [(x, y)]，由上到下排序。
@@ -72,6 +109,9 @@ def find_result_rows(boxes, name, min_y, allow_count=False):
       (雙擊後仍要等到標題符合的視窗才算成功。)
     - OCR 把名稱最後一個字吃掉 (「李月琴@全球人壽」讀成「李月琴@全球人」，沒有刪節號)：規則同上，最多少一個字，
       露出的前綴夠長、後面只能是 (成員數) 與時間、整個搜尋結果裡剛好只有一列 (與截斷的列合併計算)；有完整名稱的列就一律用完整的。
+    - 以上都沒有一列 (OCR 把名稱中間的字吃掉或讀成別的字，例如「翁彦臻(公羽)凱基人壽/信託咨詢」讀成「翁彦臻(公羽)凱基人/..」)：
+      信任 LINE 的搜尋，「聊天」小標題的筆數剛好是 1 時取它底下那一列 (見 _section_row)。
+      沒有這個小標題 (沒有聊天記錄的人)、筆數不是 1 的一律不點。有兩列以上的截斷符合時仍視為分不出，不走這一招。
     """
     wanted = _norm(name)
     if not wanted:
@@ -84,7 +124,12 @@ def find_result_rows(boxes, name, min_y, allow_count=False):
         return exact
     truncated = sorted((pos for text, pos in below
                         if _truncated_match(text, wanted, tail) or _dropped_tail_match(text, wanted, tail)), key=lambda p: p[1])
-    return truncated if len(truncated) == 1 else []
+    if len(truncated) == 1:
+        return truncated
+    if truncated:
+        return []                                   # 兩列以上的截斷符合：分不出是哪個聊天室
+    row = _section_row(below, wanted)
+    return [row] if row else []
 
 
 def _find_rows(ui, main, box, name, read_boxes, allow_count=False):

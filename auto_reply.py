@@ -324,6 +324,7 @@ def configure_notifier(config):
 
 FALLBACK_MIN_INTERVAL = 300.0    # 備援訊息兩次嘗試送進聊天室的最短間隔 (秒)：累積幾則合併成一則，不要一直打擾你
 FALLBACK_FAILURE_INTERVAL = 900.0   # 送不進去 (輸入框有草稿、焦點被搶走) 之後拉長到這個間隔再試，不要每 5 分鐘打擾一次
+FALLBACK_OPEN_RETRY = 300.0      # 備援聊天室自動開窗，失敗後最短隔多久才再試 (每次都要動到主視窗)
 FALLBACK_WINDOW_RECHECK = 30.0   # 聊天室視窗沒開時，多久才再找一次 (找視窗要掃行程與視窗列表，不必每輪都做)
 FALLBACK_MAX_PENDING = 200       # 最多暫存幾則 (超過丟最舊的，完整紀錄仍在 logs/ 檔案)
 FALLBACK_MAX_CHARS = 1200        # 合併後單則訊息字數上限
@@ -390,8 +391,8 @@ def _fallback_message(lines, stop_phrase, plain=False):
 def flush_fallback_notices(config, force=False):
     """
     推播額度用完後，把暫存的通知從你自己的帳號送進 notify_fallback_chat (主迴圈每輪呼叫)。
-    只在聊天室視窗已經開著時才送 (不為了送紀錄去動你的主視窗)；最多每 FALLBACK_MIN_INTERVAL 秒送一則合併的訊息；
-    送完照 close_window_after_send 放回去。送不進去 (輸入框有草稿、焦點被搶走、讀回不一致) 就保留，
+    聊天室視窗沒開時照 auto_open_chat_window 自動從主視窗開出來 (開出來的不登記成「用完要關」，會一直留著，最小化)；
+    最多每 FALLBACK_MIN_INTERVAL 秒送一則合併的訊息；送完照 close_window_after_send 放回去。送不進去 (輸入框有草稿、焦點被搶走、讀回不一致) 就保留，
     間隔拉長到 FALLBACK_FAILURE_INTERVAL 再試，而且改送去掉表情符號的版本。
     force 為 True (程式結束前最後一次) 時不看間隔，把最後的通知 (例如「已停止」) 盡量送出去。
     """
@@ -404,8 +405,18 @@ def flush_fallback_notices(config, force=False):
     if not force and (now - _FALLBACK["last"] < FALLBACK_MIN_INTERVAL or now - _FALLBACK["window_checked"] < FALLBACK_WINDOW_RECHECK):
         return
     matched = find_target_chat_window(chat)
+    if (not matched and not force and config.get("auto_open_chat_window", True)       # 結束前的最後一次不再去動主視窗
+            and now - _FALLBACK.get("open_tried", -1e9) >= FALLBACK_OPEN_RETRY):
+        _FALLBACK["open_tried"] = now
+        opened = open_missing_chat_window(chat, config)
+    else:
+        opened = False
+    if opened:
+        matched = find_target_chat_window(chat)
+        for w in matched:
+            _BOT_OPENED_HWNDS.pop(w[0], None)           # 備援聊天室要一直留著 (停止指令偵測也要有這個視窗)，不登記成「用完要關」
     if not matched:
-        _FALLBACK["window_checked"] = now               # 視窗沒開：通知只留在 logs/ 檔案，稍後才再找
+        _FALLBACK["window_checked"] = now               # 視窗沒開、也開不起來：通知只留在 logs/ 檔案，稍後才再找
         return
     _FALLBACK["window_checked"] = 0.0
     _FALLBACK["last"] = now

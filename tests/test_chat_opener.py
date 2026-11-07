@@ -201,6 +201,45 @@ class TestFindResultRows(unittest.TestCase):
         self.assertEqual(chat_opener.find_result_rows([("理財幼幼班_ (142)", (1, 300))], "理財幼幼班_Z", 0, allow_count=True), [(1, 300)])
         self.assertEqual(chat_opener.find_result_rows([("理財幼幼班_ (142)", (1, 300))], "理財幼幼班_Z", 0), [])
 
+    WENG = "翁彦臻(公羽)凱基人壽/信託咨詢"
+    # 真機 (2026-11-07) 搜尋整串名稱的實際 OCR 結果：中間的「壽」被吃掉、名稱被截成「…基人/..」，第二行是最後一則訊息的預覽
+    WENG_BOXES = [("翁彦臻(公羽)凱基人壽/信託咨詢", (200, 120)),                     # 搜尋欄裡的回聲 (在 min_y 以上)
+                  ("聊天 1", (60, 183)), ("翁彦臻(公羽)凱基人/..", (200, 223)), ("星期四", (480, 224)),
+                  ("翁彦臻(公羽)凱基人/信咨詢", (200, 251)), ("傅送了圆片", (150, 275)),
+                  ("訊息 1", (60, 342)), ("Notify Bot", (200, 396)), ("找到6则訊息", (200, 425))]
+
+    def test_real_search_where_ocr_ate_a_middle_character_trusts_the_single_chat_result(self):
+        # 名稱行才是要點的：不是同一行右邊的時間 (480)，也不是下一行的預覽 (251)
+        self.assertEqual(chat_opener.find_result_rows(self.WENG_BOXES, self.WENG, min_y=151), [(200, 223)])
+
+    def test_the_section_row_needs_exactly_one_chat_result(self):
+        two = [("聊天 2" if t == "聊天 1" else t, pos) for t, pos in self.WENG_BOXES]
+        self.assertEqual(chat_opener.find_result_rows(two, self.WENG, min_y=151), [])
+
+    def test_a_person_without_a_chat_has_no_chat_section_so_nothing_is_clicked(self):
+        # 真機：「陳惠萱」沒有聊天記錄，搜尋結果只有「訊息」區塊 (Notify Bot 裡的 6 則訊息)
+        boxes = [("陳惠萱", (200, 120)), ("訊息 1", (60, 183)), ("Notify Bot", (200, 237)), ("找到6則訊息", (200, 267))]
+        self.assertEqual(chat_opener.find_result_rows(boxes, "陳惠萱（米妮）(南山人壽)", min_y=151), [])
+
+    def test_the_section_row_must_look_like_the_name(self):
+        boxes = [("聊天 1", (60, 183)), ("完全不相干的聊天室", (200, 223)), ("昨天", (480, 224))]
+        self.assertEqual(chat_opener.find_result_rows(boxes, self.WENG, min_y=151), [])
+
+    def test_a_short_name_never_uses_the_section_fallback(self):
+        # 「媽媽」搜尋會冒出「媽媽的朋友」之類的別的聊天室；短名稱不信任子字串搜尋
+        boxes = [("聊天 1", (60, 183)), ("媽媽的朋友", (200, 223))]
+        self.assertEqual(chat_opener.find_result_rows(boxes, "媽媽", min_y=151), [])
+
+    def test_an_empty_chat_section_never_borrows_a_row_from_the_message_section(self):
+        boxes = [("聊天 1", (60, 183)), ("訊息 1", (60, 230)), ("翁彦臻(公羽)凱基人/..", (200, 280))]
+        self.assertEqual(chat_opener.find_result_rows(boxes, self.WENG, min_y=151), [])
+
+    def test_exact_and_truncated_matches_still_win_over_the_section_fallback(self):
+        boxes = [("聊天 1", (60, 183)), ("別的名字 昨天", (200, 223)), ("翁彦臻(公羽)凱基人壽/信託咨詢", (200, 300))]
+        self.assertEqual(chat_opener.find_result_rows(boxes, self.WENG, min_y=151), [(200, 300)])
+        two = [("聊天 1", (60, 183)), ("翁彦臻(公羽)凱基人壽/信..", (200, 223)), ("翁彦臻(公羽)凱基人壽/..", (200, 300))]
+        self.assertEqual(chat_opener.find_result_rows(two, self.WENG, min_y=151), [])           # 兩列截斷符合：分不出，不走備援
+
     def test_sorted_top_down_and_empty(self):
         boxes = [("Mom", (1, 400)), ("Mom", (1, 250))]
         self.assertEqual(chat_opener.find_result_rows(boxes, "Mom", 0), [(1, 250), (1, 400)])
