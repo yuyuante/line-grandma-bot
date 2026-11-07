@@ -36,5 +36,6 @@
   "group_max_replies_per_day": 1,
   "group_cooldown_seconds": 600,
   "auto_open_chat_window": true,
-  "auto_bind_by_viewing": true
+  "auto_bind_by_viewing": true,
+  "close_opened_windows": true
 }

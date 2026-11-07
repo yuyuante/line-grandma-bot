@@ -282,6 +282,7 @@ DEFAULT_CONFIG = {
     "group_targets": [],                # 要回覆的群組名單 (名稱同 targets 的寫法，不含人數)；群組另有更保守的規則，只能手動綁定快取頻道 (--bind-view)
     "group_max_replies_per_day": 1,     # 每個群組每天最多回覆幾次 (0 = 不限次數)
     "group_cooldown_seconds": 600,      # 同一個群組兩次回覆之間至少間隔幾秒 (多人連續傳圖時只回一次)
+    "close_opened_windows": True,       # 機器人自己從主視窗開出來的聊天視窗，回覆完或綁定完直接關閉 (不碰你本來就開著的視窗，也不碰文字偵測正在監看的視窗)
     "auto_bind_by_viewing": True,       # 未綁定的好友/群組傳新圖時，自動開他的視窗、點開一張照片，確認快取頻道後綁定，再把視窗放回去 (關閉則維持手動 --bind-view)
     "auto_open_chat_window": True,      # 好友的獨立聊天視窗不見時，自動從 LINE 主視窗的搜尋欄開回來 (關閉則找不到視窗就略過該則訊息)
     "log_to_file": True,                # 程式自己寫紀錄檔：logs/auto_reply_日期.log，每天一個檔，內容與畫面相同 (不含聊天內容)
@@ -504,7 +505,7 @@ def load_config():
                 except Exception:
                     pass
         for k in ("replace_after_send", "collect_incoming_images", "auto_crawl_images", "close_window_after_send", "time_aware_images",
-                  "require_grandma_image", "auto_neutral_images", "auto_open_chat_window", "auto_bind_by_viewing", "reply_to_text", "reply_to_sticker_text", "log_to_file"):
+                  "require_grandma_image", "auto_neutral_images", "auto_open_chat_window", "close_opened_windows", "auto_bind_by_viewing", "reply_to_text", "reply_to_sticker_text", "log_to_file"):
             if k in cfg and isinstance(cfg[k], bool):
                 sanitized[k] = cfg[k]
         if not isinstance(cfg.get("reply_to_sticker_text"), bool):
@@ -2161,7 +2162,13 @@ def open_missing_chat_window(name, config):
         log_v(f" -> 「{name}」不是沒有視窗，而是桌面上有重複的同名視窗；請關掉多餘的，不去搶 LINE 主視窗開窗。")
         return False
     log_v(f" -> 找不到「{name}」的獨立聊天視窗，嘗試從 LINE 主視窗開啟...")
-    return chat_opener.open_chat_window(name, LineMainUi(), log=log_v, allow_member_count=is_group_target(name))
+    before = {w[0] for w in get_all_line_windows()}         # 開窗前桌面上所有 LINE 視窗：只有「新出現」的才算我們開的
+    opened = chat_opener.open_chat_window(name, LineMainUi(), log=log_v, allow_member_count=is_group_target(name))
+    if opened:
+        wins = find_target_chat_window(name)
+        if wins and wins[0][0] not in before:
+            _BOT_OPENED_HWNDS[wins[0][0]] = (time.time(), name)      # 記下：這個視窗是我們開出來的，用完可以關
+    return opened
 
 OPEN_ATTEMPT_MIN_INTERVAL = 60.0           # 同一個對象，偵測階段最短隔多久才再從主視窗開窗一次
 _LAST_OPEN_ATTEMPT = {}
@@ -2279,6 +2286,38 @@ def _send_to_background(hwnd):
                           win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE)
 
 
+_BOT_OPENED_HWNDS = {}          # {視窗 hwnd: 開出來的時間}：機器人自己從主視窗開出來的聊天視窗 (使用者本來就開著的不會在這裡)
+BOT_OPENED_MAX_AGE = 3600.0     # 登記超過這麼久就不關了 (可能已經是使用者在用，也避免 hwnd 被別的視窗重用)
+
+
+def _close_if_bot_opened(hwnd, config, log_target=None):
+    """
+    只關「機器人自己開出來的」聊天視窗 (close_opened_windows)：本來就開著的視窗、文字偵測正在監看的視窗 (關掉就偵測不到下一則)、
+    登記太久的視窗、標題已經不是登記時那個對象的視窗一律不碰。用 WM_CLOSE 關單一視窗，確認視窗真的消失了才算數。
+    關了回傳 True；沒關成 (LINE 沒理、跳確認視窗) 回傳 False 並保留登記，呼叫端照常最小化。
+    """
+    entry = _BOT_OPENED_HWNDS.get(hwnd)
+    if entry is None or not config.get("close_opened_windows", True) or hwnd in _BACKGROUND_WINDOWS:
+        return False
+    opened_at, name = entry
+    try:
+        if (time.time() - opened_at > BOT_OPENED_MAX_AGE or not win32gui.IsWindow(hwnd)
+                or not title_matches_target(win32gui.GetWindowText(hwnd), name)):
+            _BOT_OPENED_HWNDS.pop(hwnd, None)           # 過期、視窗不見、或 hwnd 被別的視窗重用 (標題對不上)：不動它
+            return False
+        win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+        for _ in range(5):
+            time.sleep(0.2)
+            if not win32gui.IsWindow(hwnd):
+                _BOT_OPENED_HWNDS.pop(hwnd, None)
+                log_v(f" -> 已關閉機器人自己開出來的「{log_target or name}」視窗。")
+                return True
+        log_v(f"[警告] 關閉「{log_target or name}」視窗後視窗還在 (LINE 沒有關掉它)，改為最小化。")
+        return False
+    except Exception:
+        return False
+
+
 def _minimize_if_configured(hwnd, config, log_target=None):
     """安全將視窗最小化以維持後續未讀狀態；文字偵測在看的視窗改放到最底層 (維持展開才偵測得到下一則)"""
     if config.get("close_window_after_send", True) and hwnd:
@@ -2293,6 +2332,16 @@ def _minimize_if_configured(hwnd, config, log_target=None):
                 log_v(f" -> 已自動將「{log_target}」視窗最小化，維持後續未讀狀態。")
         except Exception:
             pass
+
+def _finish_with_window(hwnd, config, log_target=None):
+    """
+    這個視窗的事辦完了、不會再重試 (送出成功、確定略過、自動綁定結束)：機器人自己開的就關掉，其餘照 _minimize_if_configured 放回去。
+    要重試的路徑 (NOT_SENT) 與「看一眼」那一步不用這個：關掉的話重試時得重新開窗。
+    """
+    if hwnd and _close_if_bot_opened(hwnd, config, log_target):
+        return
+    _minimize_if_configured(hwnd, config, log_target)
+
 
 # 全域發送時間、時間窗、快取差集快照與斷路器
 last_global_reply_time = 0
@@ -3965,6 +4014,7 @@ def _peek_incoming_text(target_name, config, info=None):
         return None, None, ""
     hwnd = matched[0][0]
     try:
+        was_viewing = _user_is_viewing(hwnd)            # 在我們把視窗帶到前景之前量：你有沒有正在看它
         if win32gui.IsIconic(hwnd):
             win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
             time.sleep(0.3)
@@ -3972,6 +4022,7 @@ def _peek_incoming_text(target_name, config, info=None):
         time.sleep(0.4)
         if win32gui.GetForegroundWindow() != hwnd:
             return None, None, ""
+        _scroll_chat_to_bottom(hwnd, was_viewing)
         if is_last_message_from_self_in_chat(hwnd):
             return False, None, ""                      # 最底部是自己發的：沒有新訊息要回
         max_chars = config.get("text_reply_max_chars", image_kind.TEXT_MESSAGE_MAX_CHARS)
@@ -3991,7 +4042,7 @@ def _peek_incoming_text(target_name, config, info=None):
         _minimize_if_configured(hwnd, config)
 
 
-def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_file=None, text_trigger=False):
+def _send_grandma_image_impl(target_name, config, triggered_by_photo=True, triggered_file=None, text_trigger=False):
     """執行長輩圖發送"""
     global last_global_reply_time
     # 每日上限：每個聊天室一天最多回覆 max_replies_per_day 次 (本機午夜重置，只計實際送出的)
@@ -4094,11 +4145,13 @@ def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_f
         return "NOT_SENT"
 
     chat_hwnd = matched[0][0]
+    was_viewing = _user_is_viewing(chat_hwnd)           # 在我們把視窗帶到前景之前量：你有沒有正在看它
     if win32gui.IsIconic(chat_hwnd):
         win32gui.ShowWindow(chat_hwnd, win32con.SW_RESTORE)
         time.sleep(0.3)
     activate_window(chat_hwnd)
     time.sleep(0.3)
+    _scroll_chat_to_bottom(chat_hwnd, was_viewing)
     if not focus_chat_input(chat_hwnd, target_name):
         log_v(f"[安全攔截] 無法聚焦「{target_name}」視窗之輸入框，為防誤操作終止發送！")
         _minimize_if_configured(chat_hwnd, config)
@@ -4151,11 +4204,11 @@ def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_f
             else:
                 # 被「文字」觸發，但最底部其實是圖片 (或貼圖而且 reply_to_sticker_text 關著)：圖片是快取路徑的事，這裡不當文字處理
                 log_v(f"[文字訊息略過]「{target_name}」最後一則訊息是圖片或貼圖，不是文字。")
-                _minimize_if_configured(chat_hwnd, config)
+                _finish_with_window(chat_hwnd, config)
                 return "SKIPPED_TEXT"
         if not is_media and not deferred_text:
             log_v(f"[文字訊息略過]「{target_name}」最後一則訊息為文字，不需回應。")
-            _minimize_if_configured(chat_hwnd, config)
+            _finish_with_window(chat_hwnd, config)
             return "SKIPPED_TEXT"
 
     # 延後的識別：視窗此時已在前景，用截圖辨識對方那張圖的性質 (Fail-Closed)，再挑回覆圖
@@ -4173,7 +4226,7 @@ def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_f
                 log_v(f"[貼圖略過]「{target_name}」傳來的貼圖上沒有短問候或祝福 (沒字、字不是問候、太長或競選相關)，不回覆。")
             else:
                 log_v(f"[文字訊息略過]「{target_name}」最後一則文字不是短問候或祝福 (太長、不是問候、競選相關或讀不到字)，不回覆。")
-            _minimize_if_configured(chat_hwnd, config)
+            _finish_with_window(chat_hwnd, config)
             return "SKIPPED_TEXT"
         if incoming_is_sticker:
             log_v(f" -> [貼圖識別]「{target_name}」傳來的貼圖寫著問候或祝福，性質：{incoming_kind.label}。")
@@ -4184,13 +4237,13 @@ def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_f
             log_v(f" -> 對方傳來的是生日祝福，只回一句「{reply_text}」，不回圖。")
         elif not config.get("reply_to_text", True) and not incoming_is_sticker:
             log_v(f"[文字訊息略過]「{target_name}」傳來的文字不是生日祝福，而且 reply_to_text 已關閉，不回覆。")
-            _minimize_if_configured(chat_hwnd, config)
+            _finish_with_window(chat_hwnd, config)
             return "SKIPPED_TEXT"
         else:
             selected_image = choose_reply_image(target_name, incoming_kind, incoming_text, config)
             if not selected_image:
                 log_v(f"[無合適圖片]「{target_name}」傳來 {incoming_kind.label} 的文字，圖庫與即時抓圖都找不到合適的回覆圖，本次不回覆。")
-                _minimize_if_configured(chat_hwnd, config)
+                _finish_with_window(chat_hwnd, config)
                 return "SKIPPED_NO_IMAGE"
             log_v(f" -> 挑選回覆圖片: {os.path.basename(selected_image)}")
     elif deferred_identify:
@@ -4200,7 +4253,7 @@ def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_f
             _minimize_if_configured(chat_hwnd, config)
             return "NOT_SENT"
         if not state:
-            _minimize_if_configured(chat_hwnd, config)
+            _finish_with_window(chat_hwnd, config)
             return _skip_not_grandma(target_name, triggered_file, config, incoming_text)
         log_v(f" -> [長輩圖識別]「{target_name}」傳來的圖通過識別 (視窗截圖)，性質：{incoming_kind.label}。")
         if thanks_enabled and image_kind.is_birthday(incoming_kind) and image_kind.is_birthday_wish(incoming_text):
@@ -4210,7 +4263,7 @@ def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_f
             selected_image = choose_reply_image(target_name, incoming_kind, incoming_text, config)
             if not selected_image:
                 log_v(f"[無合適圖片]「{target_name}」傳來 {incoming_kind.label}，圖庫與即時抓圖都找不到合適的回覆圖，本次不回覆。")
-                _minimize_if_configured(chat_hwnd, config)
+                _finish_with_window(chat_hwnd, config)
                 return "SKIPPED_NO_IMAGE"
             log_v(f" -> 挑選回覆圖片: {os.path.basename(selected_image)}")
 
@@ -4278,9 +4331,9 @@ def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_f
             log_v(f" -> [差集快照] 成功辨識 {new_count} 個本機發送快取檔案，加入黑名單！")
 
         # 安全最小化 (避免維持在前景導致後續持續秒已讀)
-        if config.get("close_window_after_send", True):
+        if config.get("close_window_after_send", True) or chat_hwnd in _BOT_OPENED_HWNDS:
             time.sleep(1.5)
-            _minimize_if_configured(chat_hwnd, config, log_target=target_name)
+            _finish_with_window(chat_hwnd, config, log_target=target_name)
 
         # Enter 已按下：無論氣泡是否延遲渲染，一律寫入百輪記憶庫，杜絕未來重複挑選同一張發送 (只回文字時沒有圖)
         if not reply_text:
@@ -4323,6 +4376,26 @@ def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_f
                     record_contact_sent(target_name, sent_md5, max_rounds=config.get("history_rounds", 100))
                 history_recorded = True
             return "SENT_UNCERTAIN"
+
+def send_grandma_image(target_name, config, triggered_by_photo=True, triggered_file=None, text_trigger=False):
+    """
+    送出流程 (見 _send_grandma_image_impl)。結果不是「稍後重試」(NOT_SENT) 時，順手把機器人自己為這位對象開出來的視窗關掉：
+    不論是送出成功，或在「看一眼」、每日上限、沒有合適圖片等提早結束的路徑，不然那個視窗會一直留在桌面上。
+    出例外時不關 (視窗留著方便查)。
+    """
+    result = None
+    try:
+        result = _send_grandma_image_impl(target_name, config, triggered_by_photo, triggered_file, text_trigger)
+        return result
+    finally:
+        if result is not None and result != "NOT_SENT" and _BOT_OPENED_HWNDS:
+            try:
+                wins = find_target_chat_window(target_name)
+                if wins:
+                    _close_if_bot_opened(wins[0][0], config, target_name)
+            except Exception:
+                pass
+
 
 def check_for_incoming_messages(config):
     """
@@ -4933,6 +5006,53 @@ def _history_photo_centers(chat_hwnd, side="left", limit=6):
     return centers
 
 
+def _scroll_chat(hwnd, notches):
+    """把滑鼠移到訊息列表中央，滾輪捲 notches 格 (正數往上、負數往下)；列表找不到或中央被別的視窗蓋住就不捲，回傳有沒有捲"""
+    try:
+        import uiautomation as auto
+        win = auto.ControlFromHandle(hwnd)
+        view = win.ListControl(ClassName="LcListView") if win and win.Exists(0, 0) else None
+        if not view or not view.Exists(0, 0):
+            return False
+        vr = view.BoundingRectangle
+        cx, cy = (vr.left + vr.right) // 2, (vr.top + vr.bottom) // 2
+        if _root_window_at(cx, cy) != hwnd:
+            return False
+        pyautogui.moveTo(cx, cy)
+        pyautogui.scroll(120 * notches)             # Windows 的滾輪單位：一格 = 120
+        return True
+    except Exception:
+        return False
+
+
+SCROLL_TO_BOTTOM_NOTCHES = 20       # 捲到最下面：每輪往下捲幾格
+SCROLL_TO_BOTTOM_MAX_ROUNDS = 12    # 最多捲幾輪 (歷史再長也到得了；正常到底了就會提早停)
+
+
+def _scroll_chat_to_bottom(hwnd, was_viewing):
+    """
+    讀最底部那一則之前，先把聊天視窗捲到最下面 (視窗若停在你捲過的舊位置，讀到的會是舊訊息)。
+    **只對你沒在看的視窗做**：was_viewing 要在「我們把視窗帶到前景之前」量好 (_user_is_viewing)，你正在看就完全不動。
+    LINE 的捲動有動畫、歷史長短不一，所以不捲固定的格數：一輪一輪往下捲，每輪等畫面穩定，捲了畫面也不再變就是到底了。
+    """
+    if was_viewing:
+        return
+    previous = None
+    for round_no in range(SCROLL_TO_BOTTOM_MAX_ROUNDS):
+        if not _scroll_chat(hwnd, -SCROLL_TO_BOTTOM_NOTCHES):
+            if round_no == 0:
+                log_v(" -> [捲到最下面] 找不到訊息列表或列表被別的視窗蓋住，沒有捲動，照目前畫面讀取。")
+            break
+        settled = _wait_until_chat_settled(hwnd)
+        try:
+            current = _chat_signature(hwnd)
+        except Exception:
+            break
+        if settled and previous is not None and ImageStat.Stat(ImageChops.difference(previous, current)).mean[0] < CHAT_SETTLE_TOLERANCE:
+            break                               # 又捲了一輪、畫面穩定而且沒動：已經在最底部 (畫面還在動就不算)
+        previous = current
+
+
 class _ViewBindIo:
     """把 view_binder 要用的動作接到實際的 LINE 視窗與快取目錄"""
 
@@ -4965,22 +5085,8 @@ class _ViewBindIo:
             return []
 
     def scroll(self, hwnd, up):
-        """把滑鼠移到訊息列表中央捲一頁；列表中央被別的視窗蓋住就不捲"""
-        try:
-            import uiautomation as auto
-            win = auto.ControlFromHandle(hwnd)
-            view = win.ListControl(ClassName="LcListView") if win and win.Exists(0, 0) else None
-            if not view or not view.Exists(0, 0):
-                return False
-            vr = view.BoundingRectangle
-            cx, cy = (vr.left + vr.right) // 2, (vr.top + vr.bottom) // 2
-            if _root_window_at(cx, cy) != hwnd:
-                return False
-            pyautogui.moveTo(cx, cy)
-            pyautogui.scroll(120 * (VIEW_BIND_SCROLL_NOTCHES if up else -VIEW_BIND_SCROLL_NOTCHES))     # Windows 的滾輪單位：一格 = 120
-            return True
-        except Exception:
-            return False
+        """捲一頁 (找照片用)；列表找不到或中央被別的視窗蓋住就不捲"""
+        return _scroll_chat(hwnd, VIEW_BIND_SCROLL_NOTCHES if up else -VIEW_BIND_SCROLL_NOTCHES)
 
     def click(self, hwnd, x, y):
         if _root_window_at(x, y) != hwnd:
@@ -5002,7 +5108,7 @@ class _ViewBindIo:
 
     def finish(self, hwnd, opened_by_us):
         if opened_by_us:
-            _minimize_if_configured(hwnd, self.config, self.name)
+            _finish_with_window(hwnd, self.config, self.name)
 
 
 def _view_bind_wait(name):
