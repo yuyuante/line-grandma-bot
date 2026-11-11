@@ -5601,5 +5601,33 @@ def main():
             suspend_computer()
         sys.exit(STOP_EXIT_CODE)
 
+
+@contextlib.contextmanager
+def keep_system_awake():
+    """Keep Windows awake for this process without changing the power plan."""
+    continuous = 0x80000000
+    system_required = 0x00000001
+    set_state = ctypes.windll.kernel32.SetThreadExecutionState
+    set_state.argtypes = [ctypes.c_uint32]
+    set_state.restype = ctypes.c_uint32
+    if not set_state(continuous | system_required):
+        message = "無法啟用防止自動休眠，機器人未啟動。"
+        # 此時 main 尚未設定日誌；隱藏啟動也必須留下失敗原因。
+        try:
+            os.makedirs(LOG_DIR, exist_ok=True)
+            with open(os.path.join(LOG_DIR, "startup_errors.log"), "a", encoding="utf-8") as f:
+                f.write(f"[{datetime.now().isoformat(timespec='seconds')}] {message}\n")
+        except OSError:
+            logging.exception("[電源] 無法寫入啟動失敗紀錄")
+        raise OSError(message)
+    try:
+        log_v("[電源] 執行期間防止電腦自動休眠；螢幕仍依原設定關閉。")
+        yield
+    finally:
+        if not set_state(continuous):
+            logging.warning("[電源] 解除防止自動休眠失敗；處理程序結束後由 Windows 釋放。")
+
+
 if __name__ == "__main__":
-    main()
+    with keep_system_awake():
+        main()

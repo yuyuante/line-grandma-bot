@@ -221,6 +221,8 @@ copy config.example.json config.json
 
 ## 🛠 開發流程：commit 前的審查關卡（Claude Code hook）
 
+所有開發工具均須遵守 [專案開發規範](AGENTS.md)：本專案的程式碼、測試、設定及文件產出，必須交由另一個合適的 AI 開發工具獨立審查，收到結果並處理問題後才能宣告完成、提交、推送或部署。審查範圍、工具、結論及處理結果記入 `REVIEW_LOG.md`；以下 Claude Code hook 是額外檢查，不能取代跨工具審查。
+
 用 Claude Code 開發這個專案時，`git commit` 之前一定要先跑過三個審查：`/simplify`（整理重複與可簡化之處）、`/code-review`（找 bug 與邏輯問題）、`/security-review`（找安全問題）。hook 只能執行 shell 指令、沒辦法直接呼叫 slash 技能，所以做成「關卡」：
 
 | hook | 時機 | 做什麼 |
@@ -239,6 +241,8 @@ copy config.example.json config.json
 
 ### 一鍵啟動（最推薦） 想完全不顯示視窗，改雙擊 **`run_auto_reply_hidden.vbs`**（紀錄照樣寫在 `logs/`；停止請用遠端停止指令，或在工作管理員結束執行 `auto_reply.py` 的 python.exe）。
 直接雙擊執行目錄下的 **`run_auto_reply.bat`** 即可在背景常駐監聽。
+
+機器人執行期間會防止 Windows 因閒置自動休眠，停止後恢復原本的休眠行為，不修改電源計畫。螢幕仍可依原設定關閉；手動睡眠、蓋上筆電或原有「回覆 N 則後睡眠」功能仍會生效。若無法啟用防休眠，機器人會停止啟動，並嘗試將原因寫入 `logs/startup_errors.log`。
 
 ### 命令列常用指令
 ```powershell
