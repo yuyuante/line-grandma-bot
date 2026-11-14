@@ -423,6 +423,100 @@ class TestOpenChatWindow(unittest.TestCase):
         self.assertEqual(ui.names().count("screenshot"), 1)
         self.assertNotIn("double_click", ui.names())                                      # 雙擊會點到別的視窗：絕不點
 
+    def test_focus_lost_while_searching_is_recovered_and_search_is_retyped(self):
+        ui = FakeUi(tab=0)
+        states = iter([True, False, True, True, True, True, True, True])                 # 搜尋時被搶走，帶回前景後成功
+
+        ui.is_front = lambda hwnd: next(states, True)
+        ok, logs = run(ui, [RESULT_TOP])
+        self.assertTrue(ok)
+        self.assertGreaterEqual(ui.names().count("bring_to_front"), 2)                   # 進場一次 + 重新帶回一次
+        self.assertEqual(ui.names().count("set_search_text"), 3)                         # 原本一次 + 重打 (先清空再寫入)
+        self.assertIn("double_click", ui.names())
+        self.assertTrue(any("重新帶回前景" in l for l in logs))
+
+    def test_focus_lost_before_double_click_is_recovered_and_rows_are_refound(self):
+        ui = FakeUi(tab=0)
+        states = iter([True, True, False, True, True, True])                             # 雙擊前被搶走，帶回前景後重新找列
+
+        ui.is_front = lambda hwnd: next(states, True)
+        ok, _ = run(ui, [RESULT_TOP])
+        self.assertTrue(ok)
+        self.assertEqual(ui.names().count("screenshot"), 2)                              # 重新截圖找列，不沿用舊座標
+        self.assertEqual(ui.names().count("set_search_text"), 3)
+        self.assertIn("double_click", ui.names())
+
+    def test_recovery_rereads_the_search_box_position(self):
+        ui = FakeUi(tab=0)
+        calls = []
+        orig = ui.search_box_rect
+        ui.search_box_rect = lambda hwnd: (calls.append(1), orig(hwnd))[1]
+        states = iter([True, False, True, True, True, True])
+        ui.is_front = lambda hwnd: next(states, True)
+        ok, _ = run(ui, [RESULT_TOP])
+        self.assertTrue(ok)
+        self.assertGreaterEqual(len(calls), 2)                                           # 進場一次 + 帶回前景後再讀一次
+
+    def test_focus_lost_again_after_recovery_means_no_click(self):
+        ui = FakeUi(tab=0)
+        states = iter([True, True, False, True, False, False, False])                    # 帶回前景後重打搜尋字時又被搶走
+
+        ui.is_front = lambda hwnd: next(states, False)
+        ok, logs = run(ui, [RESULT_TOP])
+        self.assertFalse(ok)
+        self.assertNotIn("double_click", ui.names())
+        self.assertTrue(any("又被搶走" in l for l in logs))
+
+    def test_focus_lost_during_second_find_means_no_click(self):
+        ui = FakeUi(tab=0)
+        states = iter([True, True, False, True, True, False])                            # 重新找列期間又被搶走；用完後一律 False
+
+        ui.is_front = lambda hwnd: next(states, False)
+        ok, logs = run(ui, [RESULT_TOP])
+        self.assertFalse(ok)
+        self.assertEqual(ui.names().count("screenshot"), 2)
+        self.assertNotIn("double_click", ui.names())
+        self.assertTrue(any("又不在前景" in l for l in logs))
+
+    def test_retype_failure_during_recovery_returns_false_without_raising(self):
+        ui = FakeUi(tab=0)
+        states = iter([True, False, True])
+        ui.is_front = lambda hwnd: next(states, False)
+        calls = []
+
+        def flaky(text):
+            calls.append(text)
+            if len(calls) >= 2:
+                raise AttributeError("search edit gone")
+
+        ui.set_search_text = flaky
+        ok, logs = run(ui, [RESULT_TOP])
+        self.assertFalse(ok)
+        self.assertNotIn("double_click", ui.names())
+        self.assertTrue(any("重打搜尋字失敗" in l for l in logs))
+
+    def test_cannot_bring_back_to_front_means_no_click(self):
+        ui = FakeUi(tab=0)
+        states = iter([True, True, False])                                               # 雙擊前被搶走，bring_to_front 沒用
+
+        ui.is_front = lambda hwnd: next(states, False)
+        ok, logs = run(ui, [RESULT_TOP])
+        self.assertFalse(ok)
+        self.assertNotIn("double_click", ui.names())
+        self.assertTrue(any("無法帶回前景" in l for l in logs))
+
+    def test_recovery_waits_for_repaint_and_search_results(self):
+        ui = FakeUi(tab=0)
+        states = iter([True, False, True, True, True, True])
+        ui.is_front = lambda hwnd: next(states, True)
+        sleeps = []
+        with mock.patch.object(chat_opener.time, "time", side_effect=iter(range(0, 1000))):
+            ok = chat_opener.open_chat_window("Notify Bot", ui, read_boxes=lambda shot: [RESULT_TOP],
+                                              log=lambda m: None, sleep=sleeps.append)
+        self.assertTrue(ok)
+        self.assertIn(chat_opener.REFRONT_SETTLE_WAIT, sleeps)                           # 等重繪
+        self.assertGreaterEqual(sleeps.count(chat_opener.SEARCH_RESULT_WAIT), 2)         # 重打搜尋字後再等結果
+
     def test_focus_lost_after_switching_to_all_means_no_click(self):
         ui = FakeUi(tab=1)
         states = iter([True, False, False, False])                                       # 切到「全部」並寫完搜尋字後被搶走

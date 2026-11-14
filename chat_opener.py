@@ -21,6 +21,7 @@ import ocr_engine
 
 SEARCH_RESULT_WAIT = 1.5        # 寫入搜尋文字後等結果出現的秒數
 WINDOW_APPEAR_TIMEOUT = 8.0     # 雙擊後等獨立聊天視窗出現的秒數
+REFRONT_SETTLE_WAIT = 0.5       # 前景被搶走、重新帶回主視窗後，等畫面重繪的秒數
 ALL_TAB_INDEX = 0              # 「全部」永遠是第一個分頁；官方帳號不在「好友」分頁，搜尋只找目前分頁
 
 
@@ -155,6 +156,31 @@ def _switch_tab(ui, main, index):
                 pass
 
 
+def _refront(ui, main, name, box, log, sleep, stage):
+    """
+    前景被搶走時重新帶回主視窗一次：等重繪、重讀搜尋欄位置、清掉再重打搜尋字 (不假設搜尋結果還在)。
+    成功回傳新的搜尋欄位置；帶不回來、或重打搜尋字後又被搶走，回傳 None (呼叫端放棄，不點任何東西)。
+    """
+    log(f"[開啟聊天視窗] {stage}主視窗不在前景，重新帶回前景。")
+    ui.bring_to_front(main)
+    if not ui.is_front(main):
+        log(f"[開啟聊天視窗] {stage}主視窗無法帶回前景，放棄。")
+        return None
+    sleep(REFRONT_SETTLE_WAIT)
+    try:
+        box = ui.search_box_rect(main) or box
+        ui.set_search_text("")
+        ui.set_search_text(name)
+    except Exception as e:                                  # 重繪中找不到搜尋欄之類：當作帶不回來，不讓例外跑出去
+        log(f"[開啟聊天視窗] {stage}重新帶回前景後重打搜尋字失敗 ({e})，放棄。")
+        return None
+    sleep(SEARCH_RESULT_WAIT)
+    if not ui.is_front(main):
+        log(f"[開啟聊天視窗] {stage}重新帶回前景後又被搶走，放棄。")
+        return None
+    return box
+
+
 def open_chat_window(name, ui, read_boxes=ocr_engine.read_boxes, log=lambda msg: None, sleep=time.sleep, allow_member_count=False):
     """
     開啟名稱為 name 的好友的獨立聊天視窗，成功 (視窗已存在或已開好) 回傳 True，任何一步沒把握回傳 False。
@@ -193,15 +219,25 @@ def open_chat_window(name, ui, read_boxes=ocr_engine.read_boxes, log=lambda msg:
         ui.set_search_text(name)
         sleep(SEARCH_RESULT_WAIT)
         if not ui.is_front(main):
-            log("[開啟聊天視窗] 搜尋時主視窗不在前景，放棄。")
-            return False
+            # 搜尋等待期間前景被別的視窗搶走：重新帶回前景並重打一次搜尋字，仍不在才放棄
+            box = _refront(ui, main, name, box, log, sleep, "搜尋時")
+            if box is None:
+                return False
         rows = _find_rows(ui, main, box, name, read_boxes, allow_member_count)
         if not rows:
             log(f"[開啟聊天視窗] 搜尋結果裡找不到「{name}」(名稱必須完全相符)，放棄。")
             return False
         if not ui.is_front(main):
-            log("[開啟聊天視窗] 雙擊前主視窗不在前景，放棄。")
-            return False
+            box = _refront(ui, main, name, box, log, sleep, "雙擊前")
+            if box is None:
+                return False
+            rows = _find_rows(ui, main, box, name, read_boxes, allow_member_count)      # 畫面可能變過：重新找列再點，不用舊座標
+            if not rows:
+                log(f"[開啟聊天視窗] 重新帶回前景後找不到「{name}」，放棄。")
+                return False
+            if not ui.is_front(main):                       # 重新截圖、辨識這段時間又被搶走：雙擊會點到別的視窗，絕不點
+                log("[開啟聊天視窗] 重新找列後主視窗又不在前景，放棄。")
+                return False
         ui.double_click(*rows[0])
         deadline = time.time() + WINDOW_APPEAR_TIMEOUT
         while time.time() < deadline:
